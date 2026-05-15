@@ -8,6 +8,12 @@ export type MessageCommandExecuteResult = {
   recipientUserIds: string[]
 }
 
+export type MessageSendDraftResult = {
+  ok: true
+  id: string
+  recipientUserIds: string[]
+}
+
 export type MessageScopeInput = {
   tenantId: string
   organizationId: string | null

@@ -5,6 +5,7 @@ import { Message } from '../../../data/entities'
 import { updateDraftSchema } from '../../../data/validators'
 import { attachOperationMetadataHeader } from '../../../lib/operationMetadata'
 import { canUseMessageEmailFeature, hasOrganizationAccess, resolveMessageContext } from '../../../lib/routeHelpers'
+import type { MessageSendDraftResult } from '../../../commands/shared'
 import { errorResponseSchema, okResponseSchema, updateDraftSchema as updateDraftOpenApiSchema } from '../../openapi'
 
 export const metadata = {
@@ -49,7 +50,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
   }
 
   try {
-    const { result, logEntry } = await commandBus.execute('messages.messages.send_draft', {
+    const { result, logEntry } = await commandBus.execute<unknown, MessageSendDraftResult>('messages.messages.send_draft', {
       input: {
         ...input,
         messageId: params.id,
@@ -67,7 +68,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       },
     })
 
-    const { id } = result as { ok: boolean; id: string }
+    const { id } = result
     const response = Response.json({ ok: true, id })
     attachOperationMetadataHeader(response, logEntry, {
       resourceKind: 'messages.message',
