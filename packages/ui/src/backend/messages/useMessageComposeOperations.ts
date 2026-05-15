@@ -16,6 +16,7 @@ type MessageRecipient = {
 
 type SubmitRequest = {
   endpoint: string
+  method?: 'POST' | 'PATCH'
   payload: Record<string, unknown>
 }
 
@@ -253,6 +254,68 @@ export function useForwardSubmitOperation(params: ForwardOperationParams): BaseO
     }),
     successMessage: params.t('messages.flash.forwardSuccess', 'Message forwarded.'),
     requiresAttachmentRefresh: false,
+  }), [params])
+}
+
+type SendDraftOperationParams = ComposeOperationParams & {
+  messageId: string
+}
+
+export function useSendDraftOperation(params: SendDraftOperationParams): BaseOperation {
+  return React.useMemo(() => ({
+    validate: () => {
+      if (params.visibility !== 'public' && params.recipientIds.length === 0) {
+        return params.t('messages.errors.noRecipients', 'Please add at least one recipient.')
+      }
+      if (params.visibility === 'public' && !isValidEmailAddress(params.externalEmail.trim())) {
+        return params.t('messages.errors.noExternalEmail', 'Please enter a valid external email.')
+      }
+      if (!params.subject.trim()) {
+        return params.t('messages.errors.noSubject', 'Please enter a subject.')
+      }
+      if (!params.body.trim()) {
+        return params.t('messages.errors.noBody', 'Please enter a message.')
+      }
+      if (
+        params.shouldShowContextActions
+        && params.normalizedRequiredActionMode === 'required'
+        && !params.contextActionType
+      ) {
+        return params.t('messages.composer.objectPicker.errors.actionRequired', 'Select an action.')
+      }
+      if (
+        params.shouldShowContextActions
+        && params.normalizedRequiredActionMode === 'optional'
+        && params.contextActionRequired
+        && !params.contextActionType
+      ) {
+        return params.t('messages.composer.objectPicker.errors.actionRequired', 'Select an action.')
+      }
+      return null
+    },
+    buildRequest: ({ attachmentIds }) => ({
+      endpoint: `/api/messages/${encodeURIComponent(params.messageId)}/send`,
+      payload: buildComposePayload(params, { attachmentIds, isDraft: false }),
+    }),
+    successMessage: params.t('messages.flash.sentSuccess', 'Message sent.'),
+    requiresAttachmentRefresh: true,
+  }), [params])
+}
+
+type UpdateDraftOperationParams = DraftOperationParams & {
+  messageId: string
+}
+
+export function useUpdateDraftOperation(params: UpdateDraftOperationParams): BaseOperation {
+  return React.useMemo(() => ({
+    validate: () => null,
+    buildRequest: ({ attachmentIds }) => ({
+      endpoint: `/api/messages/${encodeURIComponent(params.messageId)}`,
+      method: 'PATCH' as const,
+      payload: buildComposePayload(params, { attachmentIds, isDraft: true }),
+    }),
+    successMessage: params.t('messages.flash.draftSaved', 'Draft saved.'),
+    requiresAttachmentRefresh: true,
   }), [params])
 }
 
