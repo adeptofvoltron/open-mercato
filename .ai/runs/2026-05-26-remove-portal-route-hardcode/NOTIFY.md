@@ -2,6 +2,11 @@
 
 > Append-only log. Every entry is UTC-timestamped. Never rewrite prior entries.
 
+## 2026-05-26T12:20:00Z — run complete
+- PR opened: https://github.com/adeptofvoltron/open-mercato/pull/4
+- All 3 steps done, final gate clear, comprehensive summary posted
+- Labels: review, refactor, skip-qa applied
+
 ## 2026-05-26T12:05:00Z — checkpoint 1 (steps 1.1..3.1)
 - Steps covered: 1.1 (d3d184e0f), 2.1 (d724249c4), 3.1 (cbfb88f80)
 - Typecheck: PASS; api.test.ts 11/11: PASS
