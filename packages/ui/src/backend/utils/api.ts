@@ -52,13 +52,46 @@ export class UnauthorizedError extends Error {
   }
 }
 
+export class ForbiddenError extends Error {
+  readonly status = 403
+  constructor(message = 'Forbidden') {
+    super(message)
+    this.name = 'ForbiddenError'
+  }
+}
+
+let DEFAULT_FORBIDDEN_ROLES: string[] = ['admin']
+let SKIP_AUTH_REDIRECT_PATTERNS: Array<RegExp | string> = []
+
+function isSkippedAuthRedirectRoute(pathname: string): boolean {
+  return SKIP_AUTH_REDIRECT_PATTERNS.some((pattern) =>
+    typeof pattern === 'string' ? pathname.startsWith(pattern) : pattern.test(pathname),
+  )
+}
+
+export function _resetAuthRedirectConfig() {
+  DEFAULT_FORBIDDEN_ROLES = ['admin']
+  SKIP_AUTH_REDIRECT_PATTERNS = []
+}
+
+export function setAuthRedirectConfig(cfg: {
+  defaultForbiddenRoles?: readonly string[]
+  skipAuthRedirectPatterns?: ReadonlyArray<RegExp | string>
+}) {
+  if (cfg?.defaultForbiddenRoles && cfg.defaultForbiddenRoles.length) {
+    DEFAULT_FORBIDDEN_ROLES = [...cfg.defaultForbiddenRoles].map(String)
+  }
+  if (cfg?.skipAuthRedirectPatterns && cfg.skipAuthRedirectPatterns.length) {
+    SKIP_AUTH_REDIRECT_PATTERNS = [...SKIP_AUTH_REDIRECT_PATTERNS, ...cfg.skipAuthRedirectPatterns]
+  }
+}
+
 export function redirectToSessionRefresh() {
   if (typeof window === 'undefined') return
   const current = window.location.pathname + window.location.search
   // Avoid redirect loops if already on an auth/session route
   if (window.location.pathname.startsWith('/api/auth')) return
-  // Portal routes have their own customer auth — never redirect to staff login
-  if (/\/[^/]+\/portal(\/|$)/.test(window.location.pathname)) return
+  if (isSkippedAuthRedirectRoute(window.location.pathname)) return
   try {
     flash('Session expired. Redirecting to sign in…', 'warning')
     setTimeout(() => {
@@ -69,27 +102,10 @@ export function redirectToSessionRefresh() {
   }
 }
 
-export class ForbiddenError extends Error {
-  readonly status = 403
-  constructor(message = 'Forbidden') {
-    super(message)
-    this.name = 'ForbiddenError'
-  }
-}
-
-let DEFAULT_FORBIDDEN_ROLES: string[] = ['admin']
-
-export function setAuthRedirectConfig(cfg: { defaultForbiddenRoles?: readonly string[] }) {
-  if (cfg?.defaultForbiddenRoles && cfg.defaultForbiddenRoles.length) {
-    DEFAULT_FORBIDDEN_ROLES = [...cfg.defaultForbiddenRoles].map(String)
-  }
-}
-
 export function redirectToForbiddenLogin(options?: { requiredRoles?: string[] | null; requiredFeatures?: string[] | null }) {
   if (typeof window === 'undefined') return
   if (window.location.pathname.startsWith('/login')) return
-  // Portal routes have their own customer auth — never redirect to staff login
-  if (/\/[^/]+\/portal(\/|$)/.test(window.location.pathname)) return
+  if (isSkippedAuthRedirectRoute(window.location.pathname)) return
   try {
     const current = window.location.pathname + window.location.search
     const features = options?.requiredFeatures?.filter(Boolean) ?? []
@@ -143,11 +159,11 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
   const res = await baseFetch(input, mergedInit)
   const pathname = typeof window !== 'undefined' ? window.location.pathname : ''
   const onLoginPage = pathname.startsWith('/login')
-  const onPortalRoute = /\/[^/]+\/portal(\/|$)/.test(pathname)
+  const onSkippedRoute = isSkippedAuthRedirectRoute(pathname)
   if (res.status === 401) {
     // Trigger same redirect flow as protected pages
-    // Skip for staff login page and all portal routes (portal has its own auth)
-    if (!onLoginPage && !onPortalRoute && !disableUnauthorizedRedirect) {
+    // Skip for staff login page and routes registered in SKIP_AUTH_REDIRECT_PATTERNS
+    if (!onLoginPage && !onSkippedRoute && !disableUnauthorizedRedirect) {
       redirectToSessionRefresh()
       // Throw a typed error for callers that might still handle it
       throw new UnauthorizedError(await res.text().catch(() => 'Unauthorized'))
@@ -169,8 +185,8 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
       }
       payload = aclData
     }
-    // Only redirect if not already on login page or a portal route
-    if (!onLoginPage && !onPortalRoute && !disableForbiddenRedirect) {
+    // Only redirect if not already on login page or a skipped route
+    if (!onLoginPage && !onSkippedRoute && !disableForbiddenRedirect) {
       const target =
         typeof input === 'string'
           ? input
