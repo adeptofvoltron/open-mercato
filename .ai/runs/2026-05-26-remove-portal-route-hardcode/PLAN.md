@@ -12,9 +12,9 @@ branch: feat/remove-portal-route-hardcode
 
 | Phase | Step | Title | Status | Commit |
 |-------|------|-------|--------|--------|
-| 1 | 1.1 | Extend api.ts: add registry, helper, test-reset export, update setAuthRedirectConfig, remove hardcoded checks | todo | — |
-| 2 | 2.1 | Register portal pattern at module scope in PortalShell.tsx | todo | — |
-| 3 | 3.1 | Add test teardown hooks and 6 new test cases to api.test.ts | todo | — |
+| 1 | 1.1 | Extend api.ts: add registry, helper, test-reset export, update setAuthRedirectConfig, remove hardcoded checks | done | d3d184e0f |
+| 2 | 2.1 | Register portal pattern at module scope in PortalShell.tsx | done | d724249c4 |
+| 3 | 3.1 | Add test teardown hooks and 6 new test cases to api.test.ts | done | cbfb88f80 |
 
 ## Goal
 

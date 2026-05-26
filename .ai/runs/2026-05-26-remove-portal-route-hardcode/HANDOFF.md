@@ -1,25 +1,27 @@
 # Handoff — 2026-05-26-remove-portal-route-hardcode
 
-**Last updated:** 2026-05-26T11:30:00Z
+**Last updated:** 2026-05-26T12:00:00Z
 **Branch:** feat/remove-portal-route-hardcode
 **PR:** not yet opened
-**Current phase/step:** Phase 1 Step 1.1
-**Last commit:** — (run folder seed commit, no code yet)
+**Current phase/step:** All steps done — at final gate
+**Last commit:** cbfb88f80 — test(ui): add skipAuthRedirectPatterns coverage and teardown to api.test.ts
 
 ## What just happened
-- Run folder created with PLAN.md, HANDOFF.md, NOTIFY.md
-- Isolated worktree created at `.ai/tmp/auto-create-pr/remove-portal-route-hardcode-20260526-112845/`
+- All 3 code steps implemented and pushed to fork
+- Checkpoint 1 checks: typecheck PASS, api.test.ts 11/11 PASS
+- Final gate checks written
+- Ready to open PR
 
 ## Next concrete action
-- Implement Step 1.1: extend `api.ts` with registry, helper, `_resetAuthRedirectConfig`, append-semantics `setAuthRedirectConfig`, remove hardcoded regex checks
+- Open PR against `adeptofvoltron/open-mercato` main branch
 
 ## Blockers / open questions
 - None
 
 ## Environment caveats
-- Dev runtime runnable: unknown
-- Playwright / browser checks: skipped — no UI changes, pure utility/logic change
-- Database/migration state: N/A — no entity or DB changes
+- Dev runtime runnable: yes (docker running)
+- Playwright / browser checks: skipped — no UI surface changes
+- Database/migration state: N/A
 
 ## Worktree
 - Path: /home/bernard/workspace/OpenMercatoTest/.ai/tmp/auto-create-pr/remove-portal-route-hardcode-20260526-112845
