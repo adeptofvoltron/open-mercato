@@ -10,6 +10,8 @@ import {
   ForbiddenError,
   UnauthorizedError,
   apiFetch,
+  _resetAuthRedirectConfig,
+  setAuthRedirectConfig,
 } from '../../utils/api'
 
 function createMockResponse(
@@ -46,6 +48,7 @@ describe('apiFetch', () => {
     jest.useFakeTimers()
     window.history.pushState({}, '', '/backend/sales/documents')
     ;(window as unknown as Record<string, unknown>).__omOriginalFetch = undefined
+    _resetAuthRedirectConfig()
   })
 
   afterEach(() => {
@@ -53,6 +56,7 @@ describe('apiFetch', () => {
     jest.clearAllTimers()
     jest.useRealTimers()
     jest.restoreAllMocks()
+    _resetAuthRedirectConfig()
   })
 
   it('throws ForbiddenError when backend returns ACL hints', async () => {
@@ -120,5 +124,87 @@ describe('apiFetch', () => {
       'Session expired. Redirecting to sign in…',
       'warning',
     )
+  })
+
+  it('returns 401 response without redirect when RegExp portal pattern is registered', async () => {
+    setAuthRedirectConfig({ skipAuthRedirectPatterns: [/\/[^/]+\/portal(\/|$)/] })
+    window.history.pushState({}, '', '/acme/portal/dashboard')
+    const response = createMockResponse(401, { error: 'Unauthorized' })
+    ;(window as unknown as Record<string, unknown>).__omOriginalFetch = jest.fn(async () => response)
+
+    const result = await apiFetch('/api/customer_accounts/portal/nav')
+    expect(result).toBe(response)
+    expect(flash).not.toHaveBeenCalled()
+  })
+
+  it('throws UnauthorizedError for portal 401 when no pattern is registered', async () => {
+    window.history.pushState({}, '', '/acme/portal/dashboard')
+    ;(window as unknown as Record<string, unknown>).__omOriginalFetch = jest.fn(async () =>
+      createMockResponse(401, { error: 'Unauthorized' }),
+    )
+
+    await expect(apiFetch('/api/customer_accounts/portal/nav')).rejects.toBeInstanceOf(UnauthorizedError)
+    expect(flash).toHaveBeenCalledWith(
+      'Session expired. Redirecting to sign in…',
+      'warning',
+    )
+  })
+
+  it('still throws UnauthorizedError for backoffice 401 after portal pattern is registered', async () => {
+    setAuthRedirectConfig({ skipAuthRedirectPatterns: [/\/[^/]+\/portal(\/|$)/] })
+    window.history.pushState({}, '', '/backend/sales')
+    ;(window as unknown as Record<string, unknown>).__omOriginalFetch = jest.fn(async () =>
+      createMockResponse(401, { error: 'Unauthorized' }),
+    )
+
+    await expect(apiFetch('/api/sales')).rejects.toBeInstanceOf(UnauthorizedError)
+    expect(flash).toHaveBeenCalledWith(
+      'Session expired. Redirecting to sign in…',
+      'warning',
+    )
+  })
+
+  it('returns 401 response without redirect when string pattern matches via startsWith', async () => {
+    setAuthRedirectConfig({ skipAuthRedirectPatterns: ['/acme/portal'] })
+    window.history.pushState({}, '', '/acme/portal/dashboard')
+    const response = createMockResponse(401, { error: 'Unauthorized' })
+    ;(window as unknown as Record<string, unknown>).__omOriginalFetch = jest.fn(async () => response)
+
+    const result = await apiFetch('/api/customer_accounts/portal/nav')
+    expect(result).toBe(response)
+    expect(flash).not.toHaveBeenCalled()
+  })
+
+  it('accumulates patterns across two setAuthRedirectConfig calls (append semantics)', async () => {
+    setAuthRedirectConfig({ skipAuthRedirectPatterns: ['/acme/portal'] })
+    setAuthRedirectConfig({ skipAuthRedirectPatterns: ['/partner/portal'] })
+
+    window.history.pushState({}, '', '/acme/portal/orders')
+    const responseA = createMockResponse(401, { error: 'Unauthorized' })
+    ;(window as unknown as Record<string, unknown>).__omOriginalFetch = jest.fn(async () => responseA)
+    const resultA = await apiFetch('/api/orders')
+    expect(resultA).toBe(responseA)
+
+    window.history.pushState({}, '', '/partner/portal/orders')
+    const responseB = createMockResponse(401, { error: 'Unauthorized' })
+    ;(window as unknown as Record<string, unknown>).__omOriginalFetch = jest.fn(async () => responseB)
+    const resultB = await apiFetch('/api/orders')
+    expect(resultB).toBe(responseB)
+
+    expect(flash).not.toHaveBeenCalled()
+  })
+
+  it('returns 403 response without flash or redirect when portal pattern is registered', async () => {
+    setAuthRedirectConfig({ skipAuthRedirectPatterns: [/\/[^/]+\/portal(\/|$)/] })
+    window.history.pushState({}, '', '/acme/portal/dashboard')
+    const response = createMockResponse(403, {
+      error: 'Forbidden',
+      requiredFeatures: ['portal.orders.view'],
+    })
+    ;(window as unknown as Record<string, unknown>).__omOriginalFetch = jest.fn(async () => response)
+
+    const result = await apiFetch('/api/customer_accounts/portal/nav')
+    expect(result).toBe(response)
+    expect(flash).not.toHaveBeenCalled()
   })
 })
