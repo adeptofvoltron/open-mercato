@@ -13,7 +13,13 @@ import type { MergedMenuItem } from '../backend/injection/mergeMenuItems'
 import { PortalNotificationBell } from './components/PortalNotificationBell'
 import { usePortalContext } from './PortalContext'
 import { apiCall } from '../backend/utils/apiCall'
+import { setAuthRedirectConfig } from '../backend/utils/api'
 import type { PortalNavGroup } from './utils/nav'
+
+// Register portal URL pattern at module scope so it fires synchronously at import time,
+// before any React lifecycle. This prevents portal 401 responses from incorrectly
+// triggering staff login redirects.
+setAuthRedirectConfig({ skipAuthRedirectPatterns: [/\/[^/]+\/portal(\/|$)/] })
 
 // Component replacement handle IDs (FROZEN once shipped)
 export const PORTAL_SHELL_HANDLE = 'page:portal:layout'
