@@ -109,6 +109,33 @@ describe('data_sync run route', () => {
     expect(mockStartDataSyncRun).not.toHaveBeenCalled()
   })
 
+  it('does not leak error message or stack in the 500 response body', async () => {
+    const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {})
+    const secretError = new Error('connection to postgres://user:secret@db failed')
+    mockStartDataSyncRun.mockRejectedValueOnce(secretError)
+
+    const response = await postHandler(new Request('http://localhost/api/data_sync/run', {
+      method: 'POST',
+      body: JSON.stringify({
+        integrationId: 'generic_sync',
+        entityType: 'customers.person',
+        direction: 'import',
+      }),
+    }))
+
+    expect(response.status).toBe(500)
+    const body = await response.json()
+    expect(body).toEqual({ error: 'Failed to start data sync run.' })
+    expect(body).not.toHaveProperty('message')
+    expect(body).not.toHaveProperty('stack')
+    expect(consoleErrorSpy).toHaveBeenCalledWith('[data_sync.run] unhandled error', expect.objectContaining({
+      message: secretError.message,
+      stack: secretError.stack,
+    }))
+
+    consoleErrorSpy.mockRestore()
+  })
+
   it('starts generic adapters normally', async () => {
     const response = await postHandler(new Request('http://localhost/api/data_sync/run', {
       method: 'POST',

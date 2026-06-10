@@ -219,6 +219,30 @@ describe('sync_excel import route', () => {
     await expect(response.json()).resolves.toEqual({ error: 'Select a concrete organization before importing CSV.' })
   })
 
+  it('does not leak error message or stack in the 500 response body', async () => {
+    const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {})
+    const secretError = new Error('connection to postgres://user:secret@db failed')
+    mockStartDataSyncRun.mockRejectedValueOnce(secretError)
+
+    const response = await postHandler(new Request('http://localhost/api/sync_excel/import', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ok: true }),
+    }))
+
+    expect(response.status).toBe(500)
+    const body = await response.json()
+    expect(body).toEqual({ error: 'Failed to start sync_excel import.' })
+    expect(body).not.toHaveProperty('message')
+    expect(body).not.toHaveProperty('stack')
+    expect(consoleErrorSpy).toHaveBeenCalledWith('[sync_excel.import] unhandled error', expect.objectContaining({
+      message: secretError.message,
+      stack: secretError.stack,
+    }))
+
+    consoleErrorSpy.mockRestore()
+  })
+
   it('returns 404 when upload is missing', async () => {
     mockFindOneWithDecryption.mockResolvedValueOnce(null)
 
