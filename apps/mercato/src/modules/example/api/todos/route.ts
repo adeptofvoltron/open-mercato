@@ -11,6 +11,7 @@ const tenant_id = 'tenant_id'
 const organization_id = 'organization_id'
 const is_done = 'is_done'
 const created_at = 'created_at'
+const updated_at = 'updated_at'
 import type { Where, WhereValue } from '@open-mercato/shared/lib/query/types'
 import type { TodoListItem } from '../../types'
 import ceEntities from '../../ce'
@@ -60,8 +61,8 @@ if (todoEntity?.fields?.length) {
 
 const cfSel = buildCustomFieldSelectorsForEntity(ENTITY_ID, baseFieldSets)
 let dynamicCfKeys: string[] = [...cfSel.keys]
-let listFields: any[] = [id, title, tenant_id, organization_id, is_done, created_at, ...cfSel.selectors]
-const sortFieldMapRef: Record<string, unknown> = { id, title, tenant_id, organization_id, is_done, created_at }
+let listFields: any[] = [id, title, tenant_id, organization_id, is_done, created_at, updated_at, ...cfSel.selectors]
+const sortFieldMapRef: Record<string, unknown> = { id, title, tenant_id, organization_id, is_done, created_at, updatedAt: updated_at }
 for (const k of dynamicCfKeys) sortFieldMapRef[`cf_${k}`] = `cf:${k}`
 
 type BaseFields = {
@@ -71,6 +72,7 @@ type BaseFields = {
   tenant_id: string | null
   organization_id: string | null
   created_at: Date
+  updated_at: Date
 } & Record<`cf:${string}` | `cf_${string}`, unknown>
 
 export const { metadata, GET, POST, PUT, DELETE } = makeCrudRoute({
@@ -127,12 +129,16 @@ export const { metadata, GET, POST, PUT, DELETE } = makeCrudRoute({
       return filters
     },
     transformItem: (item: BaseFields): TodoListItem => {
+      const updatedAtValue = item.updated_at
       const base = {
         id: String(item.id),
         title: String(item.title),
         tenant_id: (item.tenant_id as string | null) ?? null,
         organization_id: (item.organization_id as string | null) ?? null,
         is_done: Boolean(item.is_done),
+        updatedAt: updatedAtValue instanceof Date
+          ? updatedAtValue.toISOString()
+          : (typeof updatedAtValue === 'string' ? updatedAtValue : null),
       }
       const cf = extractCustomFieldsFromItem(item as any, dynamicCfKeys)
       return { ...base, ...(cf as any) } as TodoListItem
@@ -234,7 +240,7 @@ export const { metadata, GET, POST, PUT, DELETE } = makeCrudRoute({
           dynamicCfKeys = Array.from(new Set([ ...cfSel.keys, ...keysFromDefs ]))
         }
         const selectors = dynamicCfKeys.map((k) => `cf:${k}`)
-        listFields = [id, title, tenant_id, organization_id, is_done, ...selectors]
+        listFields = [id, title, tenant_id, organization_id, is_done, updated_at, ...selectors]
         // Reset the shared sort field map object in place to propagate changes
         for (const key of Object.keys(sortFieldMapRef)) delete sortFieldMapRef[key]
         sortFieldMapRef.id = id
@@ -242,6 +248,7 @@ export const { metadata, GET, POST, PUT, DELETE } = makeCrudRoute({
         ;(sortFieldMapRef as any).tenant_id = tenant_id
         ;(sortFieldMapRef as any).organization_id = organization_id
         ;(sortFieldMapRef as any).is_done = is_done
+        ;(sortFieldMapRef as any).updatedAt = updated_at
         for (const k of dynamicCfKeys) sortFieldMapRef[`cf_${k}`] = `cf:${k}`
       } catch {
         // ignore; fall back to code-declared selectors

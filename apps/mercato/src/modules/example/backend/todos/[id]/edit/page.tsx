@@ -17,6 +17,7 @@ type TodoFormValues = {
   id: string
   title: string
   is_done: boolean
+  updatedAt?: string | null
 } & TodoCustomFieldValues
 
 export default function EditTodoPage({ params }: { params?: { id?: string } }) {
@@ -93,6 +94,7 @@ export default function EditTodoPage({ params }: { params?: { id?: string } }) {
           id: item.id,
           title: item.title,
           is_done: Boolean(item.is_done),
+          updatedAt: item.updatedAt ?? null,
           ...(cfInit as TodoCustomFieldValues),
           cf_priority: extended.cf_priority ?? cfInit.cf_priority,
           cf_severity: extended.cf_severity ?? cfInit.cf_severity,

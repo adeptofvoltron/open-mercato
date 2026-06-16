@@ -5,6 +5,7 @@ export type TodoListItem = {
   id: string
   title: string
   is_done?: boolean
+  updatedAt?: string | null
   tenant_id?: string | null
   organization_id?: string | null
   cf_priority?: number | null
