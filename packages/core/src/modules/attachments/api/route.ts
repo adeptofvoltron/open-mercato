@@ -13,6 +13,7 @@ import { StorageDriverFactory } from '../lib/drivers'
 import { OcrService, shouldUseLlmOcr } from '../lib/ocrService'
 import { clearAttachmentThumbnailCache } from '../lib/thumbnailCache'
 import { assertAttachmentScopeInvariant } from '../lib/access'
+import { resolveAttachmentOrganizationId } from '../lib/requestScope'
 import {
   mergeAttachmentMetadata,
   normalizeAttachmentAssignments,
@@ -195,10 +196,11 @@ export async function GET(req: Request) {
   }
   const { entityId, recordId, page, pageSize } = parsedQuery.data
 
-  const { resolve } = await createRequestContainer()
-  const em = resolve('em') as EntityManager
+  const container = await createRequestContainer()
+  const em = container.resolve('em') as EntityManager
+  const orgId = await resolveAttachmentOrganizationId(container, auth, req)
   const filter: Record<string, unknown> = { entityId, recordId, tenantId: auth.tenantId! }
-  if (auth.orgId) filter.organizationId = auth.orgId
+  if (orgId) filter.organizationId = orgId
   const orderBy: Record<string, 'ASC' | 'DESC'> = { createdAt: 'DESC' }
   const usePaging = typeof page === 'number' && typeof pageSize === 'number'
   const total = usePaging ? await em.count(Attachment, filter) : null
@@ -221,7 +223,7 @@ export async function GET(req: Request) {
     },
     {
       tenantId: auth.tenantId ?? null,
-      organizationId: auth.orgId ?? null,
+      organizationId: orgId ?? null,
     },
   )
   return NextResponse.json({
@@ -261,7 +263,6 @@ export async function POST(req: Request) {
   const auth = await getAuthFromRequest(req)
   if (!auth || !auth.tenantId || !auth.orgId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   const tenantId = auth.tenantId
-  const orgId = auth.orgId
 
   const contentType = req.headers.get('content-type') || ''
   if (!contentType.toLowerCase().includes('multipart/form-data')) {
@@ -287,11 +288,13 @@ export async function POST(req: Request) {
   const tags = parseFormTags(form.get('tags'))
   const assignmentsFromForm = parseFormAssignments(form.get('assignments'))
 
-  const { resolve } = await createRequestContainer()
-  const em = resolve('em') as EntityManager
-  const dataEngine = resolve('dataEngine')
+  const container = await createRequestContainer()
+  const em = container.resolve('em') as EntityManager
+  const dataEngine = container.resolve('dataEngine')
   const storageDriverFactory =
-    (resolve('storageDriverFactory') as StorageDriverFactory | null) ?? new StorageDriverFactory(em)
+    (container.resolve('storageDriverFactory') as StorageDriverFactory | null) ?? new StorageDriverFactory(em)
+  const orgId = await resolveAttachmentOrganizationId(container, auth, req)
+  if (!orgId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   await ensureDefaultPartitions(em)
   // Optional per-field validations
   let partitionFromField: string | null = null
@@ -422,12 +425,12 @@ export async function POST(req: Request) {
   }
   const metadata = mergeAttachmentMetadata(null, { assignments, tags })
   const attachmentId = randomUUID()
-  assertAttachmentScopeInvariant({ tenantId: auth.tenantId, organizationId: auth.orgId })
+  assertAttachmentScopeInvariant({ tenantId: auth.tenantId, organizationId: orgId })
   const att = em.create(Attachment, {
     id: attachmentId,
     entityId,
     recordId,
-    organizationId: auth.orgId!,
+    organizationId: orgId,
     tenantId: auth.tenantId!,
     fileName: safeName,
     mimeType: fileMimeType,
@@ -531,12 +534,14 @@ export async function DELETE(req: Request) {
   const url = new URL(req.url)
   const id = url.searchParams.get('id') || ''
   if (!id) return NextResponse.json({ error: 'Attachment id is required' }, { status: 400 })
-  const { resolve } = await createRequestContainer()
-  const em = resolve('em') as EntityManager
-  const dataEngine = resolve('dataEngine')
+  const container = await createRequestContainer()
+  const em = container.resolve('em') as EntityManager
+  const dataEngine = container.resolve('dataEngine')
   const storageDriverFactory =
-    (resolve('storageDriverFactory') as StorageDriverFactory | null) ?? new StorageDriverFactory(em)
-  const deleteFilter: Record<string, unknown> = { id, tenantId: auth.tenantId!, organizationId: auth.orgId }
+    (container.resolve('storageDriverFactory') as StorageDriverFactory | null) ?? new StorageDriverFactory(em)
+  const orgId = await resolveAttachmentOrganizationId(container, auth, req)
+  if (!orgId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  const deleteFilter: Record<string, unknown> = { id, tenantId: auth.tenantId!, organizationId: orgId }
   const record = await em.findOne(Attachment, deleteFilter)
   if (!record) return NextResponse.json({ error: 'Attachment not found' }, { status: 404 })
   await em.remove(record).flush()
@@ -546,7 +551,7 @@ export async function DELETE(req: Request) {
   if (record.storagePath) {
     const delDriver = await storageDriverFactory.resolveForPartition(record.partitionCode, {
       tenantId: record.tenantId ?? auth.tenantId!,
-      organizationId: record.organizationId ?? auth.orgId,
+      organizationId: record.organizationId ?? orgId,
     })
     await delDriver.delete(record.partitionCode, record.storagePath)
   }
