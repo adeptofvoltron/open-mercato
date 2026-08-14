@@ -150,6 +150,7 @@ docker/opencode/opencode.jsonc
 # entrypoint scripts om-prepare-test-env compiles are bound to the machine that
 # generated them (shell, ports, process tools) — keep them local, never commit
 .ai/scripts/test-env-*
+.agents
 .agents/
 
 apps/mercato/data/
