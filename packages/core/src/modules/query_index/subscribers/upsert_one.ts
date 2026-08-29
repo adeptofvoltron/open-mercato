@@ -93,9 +93,11 @@ export default async function handle(payload: any, ctx: { resolve: <T=any>(name:
           })
           if (adjustments.length) {
             // Stays inside the transaction: `alwaysConsistent` exists to make the read
-            // projection and its coverage counters commit together, and the adjustment is a
-            // single incrementing UPSERT (see `applyCoverageAdjustments`), so it holds the
-            // coverage row's lock only for that statement.
+            // projection and its coverage counters commit together, and in steady state the
+            // adjustment is a single incrementing `UPDATE` (see `applyCoverageAdjustments`), so
+            // it holds the coverage row's lock only for that statement. The first adjustment for
+            // a scope additionally takes a scope-keyed advisory lock to create the row, which is
+            // then held until this transaction commits.
             await applyCoverageAdjustments(em, adjustments, { trx })
           }
         }
