@@ -26,6 +26,7 @@ import { applyCoverageAdjustments, createCoverageAdjustments } from '../lib/cove
  */
 function createRecordingDb() {
   const statements: string[] = []
+  const executed: Array<{ sql: string; parameters: readonly unknown[] }> = []
   const db = new Kysely<any>({
     dialect: {
       createAdapter: () => new PostgresAdapter(),
@@ -34,10 +35,12 @@ function createRecordingDb() {
       createQueryCompiler: () => new PostgresQueryCompiler(),
     },
     log: (event) => {
-      if (event.level === 'query') statements.push(event.query.sql)
+      if (event.level !== 'query') return
+      statements.push(event.query.sql)
+      executed.push({ sql: event.query.sql, parameters: event.query.parameters })
     },
   })
-  return { db, statements }
+  return { db, statements, executed }
 }
 
 function createEm(db: Kysely<any>) {
@@ -86,6 +89,9 @@ describe('applyCoverageAdjustments (#5604)', () => {
     expect(update).toContain('"base_count" +')
   })
 
+  // The scope-initialization lock is a `select pg_advisory_xact_lock(…)`, but it names no
+  // column of the coverage row — it takes the scope key as a bound parameter — so it does not
+  // reintroduce the read this design removed.
   it('does not read the coverage row before writing it', async () => {
     const { db, statements } = createRecordingDb()
 
@@ -100,8 +106,8 @@ describe('applyCoverageAdjustments (#5604)', () => {
     expect(readsCoverage).toBe(false)
   })
 
-  it('sends one incrementing statement per scope when adjustments are aggregated', async () => {
-    const { db, statements } = createRecordingDb()
+  it('aggregates adjustments for one scope into a single delta rather than one write each', async () => {
+    const { db, executed } = createRecordingDb()
 
     await applyCoverageAdjustments(createEm(db), [
       ...createCoverageAdjustments({ ...scope, baseDelta: 1, indexDelta: 1 }),
@@ -109,26 +115,46 @@ describe('applyCoverageAdjustments (#5604)', () => {
       ...createCoverageAdjustments({ ...scope, baseDelta: 1, indexDelta: 1 }),
     ])
 
-    const updates = statements.filter((sql) => sql.startsWith('update "entity_index_coverage"'))
-    expect(updates).toHaveLength(1)
+    // The three `+1`s must reach the database as one `+3`. The delta is the first bound
+    // parameter of the incrementing UPDATE.
+    const increments = executed.filter((entry) => entry.sql.startsWith('update "entity_index_coverage"'))
+    expect(increments.length).toBeGreaterThan(0)
+    for (const increment of increments) {
+      expect(increment.parameters[0]).toBe(3)
+    }
+    // One scope, so at most one row is ever created for it.
+    const inserts = executed.filter((entry) => entry.sql.startsWith('insert into "entity_index_coverage"'))
+    expect(inserts).toHaveLength(1)
   })
 
-  it('falls back to an incrementing insert when the scope has no row yet', async () => {
+  it('serializes creating a scope that has no row instead of racing two inserts', async () => {
     const { db, statements } = createRecordingDb()
 
-    // `DummyDriver` returns no rows for the update, which is exactly the "scope not stored yet"
-    // case: the insert then has to seed the row and still increment on conflict, so a racing
-    // first adjustment for a scope the constraint *can* see is not lost either.
+    // `DummyDriver` answers every statement with no rows, so the increment always reports "this
+    // scope does not exist yet" — the branch a NULL-distinct unique constraint cannot protect,
+    // where two concurrent callers would otherwise both insert and one delta would be dropped.
     await applyCoverageAdjustments(
       createEm(db),
-      createCoverageAdjustments({ ...scope, baseDelta: 1, indexDelta: 1 })
+      createCoverageAdjustments({ ...scope, tenantId: null, baseDelta: 1, indexDelta: 1 })
     )
 
-    const insert = statements.find((sql) => sql.startsWith('insert into "entity_index_coverage"'))
-    expect(insert).toBeDefined()
-    expect(insert).toContain('on conflict')
-    expect(insert).toContain('"entity_index_coverage"."base_count" +')
-    expect(insert).toContain('greatest')
+    // Creating a scope must take the scope lock.
+    const lockIndex = statements.findIndex((sql) => sql.includes('pg_advisory_xact_lock'))
+    expect(lockIndex).toBeGreaterThanOrEqual(0)
+
+    // Re-checking inside the lock is what makes it work: the caller that loses the race must
+    // see the winner's committed row and increment it rather than insert a rival.
+    const recheckIndex = statements.findIndex(
+      (sql, index) => index > lockIndex && sql.startsWith('update "entity_index_coverage"')
+    )
+    expect(recheckIndex).toBeGreaterThan(lockIndex)
+
+    const insertIndex = statements.findIndex((sql) => sql.startsWith('insert into "entity_index_coverage"'))
+    // The insert only ever follows the re-check, never replaces it.
+    expect(insertIndex).toBeGreaterThan(recheckIndex)
+    // Holding the lock proves the scope is empty, so the insert seeds rather than increments;
+    // the conflict clause is only a backstop against a writer that bypasses this path.
+    expect(statements[insertIndex]).toContain('do nothing')
   })
 
   it('skips the database entirely when every delta cancels out', async () => {

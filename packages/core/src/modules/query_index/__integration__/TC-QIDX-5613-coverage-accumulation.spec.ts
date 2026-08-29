@@ -28,6 +28,7 @@ import { resolveIntegrationDatabaseUrl } from '@open-mercato/core/helpers/integr
 const TENANT = '5613a5a1-0000-4000-8000-000000000001'
 const ORGANIZATION = '5613a5a1-0000-4000-8000-000000000002'
 const ORGANIZATION_CONCURRENT = '5613a5a1-0000-4000-8000-000000000003'
+const ORGANIZATION_FIRST_CREATE = '5613a5a1-0000-4000-8000-000000000004'
 const ORG_PLACEHOLDER = '00000000-0000-0000-0000-000000000000'
 
 type CountsRow = { base_count: number; indexed_count: number; row_count: number }
@@ -95,9 +96,9 @@ test.describe('TC-QIDX-5613: coverage counters accumulate in every scope', () =>
   test('composes overlapping adjustments instead of letting one overwrite the other', async () => {
     const scope = { tenantId: null, organizationId: ORGANIZATION_CONCURRENT }
 
-    // Create the row first. The insert branch is the one window the unique constraint cannot
-    // close for a NULL tenant, and it is not what this assertion is about — the claim under
-    // test is that adjustments to an existing counter compose.
+    // Seed the row first, so this case measures only the steady-state increment. Concurrent
+    // creation from no row at all is a different branch with a different mechanism, and it gets
+    // its own test below rather than riding along here.
     await adjust(scope)
     const before = await read(scope)
 
@@ -109,5 +110,25 @@ test.describe('TC-QIDX-5613: coverage counters accumulate in every scope', () =>
       'five overlapping +1 adjustments must add 5, not collapse to the last one'
     ).toBe(5)
     expect(after.row_count, 'overlapping adjustments must not fan out into duplicate rows').toBe(1)
+  })
+
+  test('does not lose a delta when concurrent adjustments create a null-tenant scope at once', async () => {
+    // The branch a NULL-distinct unique constraint cannot protect. `entity_index_coverage_scope_idx`
+    // treats `tenant_id IS NULL` rows as never conflicting, so without serialization every caller
+    // here misses the UPDATE, every insert succeeds, and collapsing the duplicates has to throw
+    // deltas away. Nothing is seeded on purpose: starting from no row is the whole point.
+    const scope = { tenantId: null, organizationId: ORGANIZATION_FIRST_CREATE }
+    expect((await read(scope)).row_count, 'the scope must start with no row').toBe(0)
+
+    const writers = 6
+    await Promise.all(Array.from({ length: writers }, () => adjust(scope)))
+
+    const counts = await read(scope)
+    expect(
+      counts.base_count,
+      `${writers} concurrent first adjustments must all be counted, not collapsed to the survivor`
+    ).toBe(writers)
+    expect(counts.indexed_count, 'the index counter must survive the same race').toBe(writers)
+    expect(counts.row_count, 'concurrent creation must settle on exactly one row').toBe(1)
   })
 })

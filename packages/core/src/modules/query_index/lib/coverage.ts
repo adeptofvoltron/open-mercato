@@ -63,6 +63,10 @@ const COLUMN_CACHE = new Map<string, boolean>()
 const COLUMN_CACHE_PENDING = new Map<string, Promise<boolean>>()
 const GLOBAL_ORGANIZATION_PLACEHOLDER = '00000000-0000-0000-0000-000000000000'
 export const COVERAGE_ORG_PLACEHOLDER = GLOBAL_ORGANIZATION_PLACEHOLDER
+// Namespace for this module's advisory locks, so a `hashtext` collision with another
+// subsystem's key cannot serialize unrelated work. The number is #5604, the issue this
+// coverage work belongs to.
+const COVERAGE_LOCK_NAMESPACE = 5604
 
 function toCount(value: unknown): number {
   if (typeof value === 'number') return Number.isFinite(value) ? value : 0
@@ -121,23 +125,113 @@ async function fetchCoverageRow(
   return row ?? null
 }
 
+function buildScopeCondition<QB extends { where: (...args: any[]) => QB }>(
+  query: QB,
+  scope: CoverageScope,
+): QB {
+  let scoped = query
+    .where('entity_type' as any, '=', scope.entityType)
+    .where('with_deleted' as any, '=', scope.withDeleted === true)
+  scoped = scope.tenantId == null
+    ? scoped.where('tenant_id' as any, 'is', null as any)
+    : scoped.where('tenant_id' as any, '=', scope.tenantId)
+  return applyOrganizationCondition(scoped, 'organization_id', scope.organizationId ?? null)
+}
+
 async function pruneDuplicateCoverageRows(
   db: CoverageExecutor,
   scope: CoverageScope,
   keepId: string | null
 ): Promise<void> {
-  let query = db
-    .deleteFrom('entity_index_coverage' as any)
-    .where('entity_type' as any, '=', scope.entityType)
-    .where('with_deleted' as any, '=', scope.withDeleted === true)
-  query = scope.tenantId == null
-    ? query.where('tenant_id' as any, 'is', null as any)
-    : query.where('tenant_id' as any, '=', scope.tenantId)
-  query = applyOrganizationCondition(query as any, 'organization_id', scope.organizationId ?? null)
+  let query = buildScopeCondition(db.deleteFrom('entity_index_coverage' as any) as any, scope)
   if (keepId) {
     query = query.where('id' as any, '!=', keepId)
   }
   await query.execute()
+}
+
+// Collapses a scope that holds more than one row down to `keepId`, adding the deleted rows'
+// counters to it instead of discarding them. `pruneDuplicateCoverageRows` deletes outright,
+// which is right for `upsertCoverageRow` (it writes absolute totals, so a duplicate carries no
+// information the keeper lacks) but wrong on the incrementing path: there a duplicate *is* an
+// accumulated total, and dropping it silently loses every adjustment that landed on it. Any
+// duplicate reaching this function pre-dates the serialized initialization below — it comes
+// from a database that ran the NULL-distinct upsert — so this also repairs that history rather
+// than compounding it.
+async function foldDuplicateCoverageRows(
+  db: CoverageExecutor,
+  scope: CoverageScope,
+  keepId: string,
+): Promise<void> {
+  const folded = await buildScopeCondition(db.deleteFrom('entity_index_coverage' as any) as any, scope)
+    .where('id' as any, '!=', keepId)
+    .returning(['base_count' as any, 'indexed_count' as any, 'vector_indexed_count' as any])
+    .execute() as Array<CoverageRow>
+  if (!folded?.length) return
+
+  let deltaBase = 0
+  let deltaIndex = 0
+  let deltaVector = 0
+  for (const row of folded) {
+    deltaBase += toCount(row.base_count)
+    deltaIndex += toCount(row.indexed_count)
+    deltaVector += toCount(row.vector_indexed_count)
+  }
+  if (deltaBase === 0 && deltaIndex === 0 && deltaVector === 0) return
+
+  await db
+    .updateTable('entity_index_coverage' as any)
+    .set({
+      base_count: sql`greatest(${sql.ref('base_count')} + ${deltaBase}, 0)`,
+      indexed_count: sql`greatest(${sql.ref('indexed_count')} + ${deltaIndex}, 0)`,
+      vector_indexed_count: sql`greatest(${sql.ref('vector_indexed_count')} + ${deltaVector}, 0)`,
+    } as any)
+    .where('id' as any, '=', keepId)
+    .execute()
+}
+
+function buildCoverageIncrement(
+  db: CoverageExecutor,
+  scope: CoverageScope,
+  deltas: { deltaBase: number; deltaIndex: number; deltaVector: number },
+) {
+  const update = db
+    .updateTable('entity_index_coverage' as any)
+    .set({
+      base_count: sql`greatest(${sql.ref('base_count')} + ${deltas.deltaBase}, 0)`,
+      indexed_count: sql`greatest(${sql.ref('indexed_count')} + ${deltas.deltaIndex}, 0)`,
+      vector_indexed_count: sql`greatest(${sql.ref('vector_indexed_count')} + ${deltas.deltaVector}, 0)`,
+      refreshed_at: sql`now()`,
+    } as any)
+  return buildScopeCondition(update as any, scope)
+}
+
+// Serializes the one branch a NULL-distinct unique constraint cannot make safe: creating the
+// row for a scope that has none. Two concurrent first adjustments on a NULL-tenant scope would
+// both miss the `UPDATE`, both insert without ever conflicting, and the collapse would then
+// have to throw one of the two deltas away. Holding a scope-keyed lock across "re-check, then
+// insert" turns that into "the second caller waits, then finds the row and increments it".
+//
+// `pg_advisory_xact_lock` releases when the surrounding transaction ends, so it cannot leak the
+// way a session lock does if a caller throws mid-flight. When the caller already supplied a
+// transaction the lock is taken on it and held until that transaction commits — which is
+// exactly the window during which its uncommitted row is invisible to everyone else.
+async function withCoverageInitializationLock(
+  db: CoverageExecutor,
+  scope: CoverageScope,
+  run: (executor: CoverageExecutor) => Promise<void>,
+): Promise<void> {
+  const key = scopeKey(scope)
+  const locked = async (executor: CoverageExecutor) => {
+    await sql`select pg_advisory_xact_lock(${COVERAGE_LOCK_NAMESPACE}::int4, hashtext(${key}::text))`
+      .execute(executor as Kysely<any>)
+    await run(executor)
+  }
+  if ((db as Kysely<any>).isTransaction) {
+    await locked(db)
+    return
+  }
+  await (db as Kysely<any>).transaction().execute(async (trx) => { await locked(trx) })
 }
 
 // Applies a coverage delta by incrementing the stored columns in SQL (#5604). The obvious
@@ -149,17 +243,18 @@ async function pruneDuplicateCoverageRows(
 //
 // In steady state that is one statement. The extra statements are recovery paths that do not
 // fire once a scope has settled: the legacy NULL-organization fold below runs only for
-// global-organization scopes, the insert only until the scope's row exists, and the duplicate
-// prune only when the scope somehow holds more than one row.
+// global-organization scopes, the locked initialization only until the scope's row exists, and
+// the duplicate fold only when the scope somehow holds more than one row.
 //
 // The statement is an `UPDATE` rather than an `INSERT … ON CONFLICT DO UPDATE`, because the
 // conflict target cannot see every scope this table stores: `entity_index_coverage_scope_idx`
 // is a plain `UNIQUE` constraint, and Postgres treats NULLs in one as distinct. For a scope
 // whose tenant is NULL — `resolveQueryIndexRecordScope`'s `global` branch, or any source row
 // with a NULL tenant column — the conflict branch would never fire, so every adjustment would
-// insert a fresh row carrying only its own delta and `pruneDuplicateCoverageRows` would then
-// delete the accumulated one. A NULL-aware `UPDATE` matches those rows, and it still adds the
-// delta to the column's own value, so it composes exactly the way the conflict branch does.
+// insert a fresh row carrying only its own delta and the collapse would then delete the
+// accumulated one. A NULL-aware `UPDATE` matches those rows, and it still adds the delta to the
+// column's own value, so it composes exactly the way the conflict branch does. The same
+// NULL-distinctness is why creating the row is serialized rather than left to `ON CONFLICT`.
 async function incrementCoverageRow(
   db: CoverageExecutor,
   scope: CoverageScope,
@@ -193,62 +288,50 @@ async function incrementCoverageRow(
     }
   }
 
-  let update = db
-    .updateTable('entity_index_coverage' as any)
-    .set({
-      base_count: sql`greatest(${sql.ref('base_count')} + ${deltaBase}, 0)`,
-      indexed_count: sql`greatest(${sql.ref('indexed_count')} + ${deltaIndex}, 0)`,
-      vector_indexed_count: sql`greatest(${sql.ref('vector_indexed_count')} + ${deltaVector}, 0)`,
-      refreshed_at: sql`now()`,
-    } as any)
-    .where('entity_type' as any, '=', scope.entityType)
-    .where('with_deleted' as any, '=', scope.withDeleted === true)
-  update = scope.tenantId == null
-    ? update.where('tenant_id' as any, 'is', null as any)
-    : update.where('tenant_id' as any, '=', scope.tenantId)
-  update = applyOrganizationCondition(update as any, 'organization_id', scope.organizationId ?? null)
-  const updated = await update
-    .returning(['id' as any])
-    .execute() as Array<{ id: string }>
-
-  if (updated.length > 0) {
+  const resolved = { deltaBase, deltaIndex, deltaVector }
+  const applyIncrement = async (executor: CoverageExecutor): Promise<boolean> => {
+    const updated = await buildCoverageIncrement(executor, scope, resolved)
+      .returning(['id' as any])
+      .execute() as Array<{ id: string }>
+    if (updated.length === 0) return false
     // In steady state the scope holds exactly the row just incremented, so the adjustment is
-    // the single statement it is described as. Only a scope that somehow accumulated more than
-    // one row — a legacy import, or a concurrent first insert on a NULL-tenant scope, which the
-    // unique constraint cannot prevent — pays for the collapse, and only until it is collapsed.
-    if (updated.length > 1) await pruneDuplicateCoverageRows(db, scope, updated[0]!.id)
-    return
+    // the single statement it is described as. A scope that carries duplicates from before the
+    // initialization was serialized is collapsed here — losslessly, since each duplicate is an
+    // accumulated total — and pays for it only until it is collapsed.
+    if (updated.length > 1) await foldDuplicateCoverageRows(executor, scope, updated[0]!.id)
+    return true
   }
 
-  // No row for this scope yet. `ON CONFLICT` still closes the insert race for every scope the
-  // unique constraint can actually see; a NULL-tenant scope can still end up with a sibling row
-  // when two first adjustments race, which the prune collapses and the `UPDATE` above keeps
-  // accumulating into from then on.
-  const rows = await db
-    .insertInto('entity_index_coverage' as any)
-    .values({
-      entity_type: scope.entityType,
-      tenant_id: scope.tenantId ?? null,
-      organization_id: storedOrgId,
-      with_deleted: scope.withDeleted === true,
-      base_count: Math.max(deltaBase, 0),
-      indexed_count: Math.max(deltaIndex, 0),
-      vector_indexed_count: Math.max(deltaVector, 0),
-      refreshed_at: sql`now()`,
-    } as any)
-    .onConflict((oc: any) => oc
-      .columns(['entity_type', 'tenant_id', 'organization_id', 'with_deleted'])
-      .doUpdateSet({
-        base_count: sql`greatest(${sql.ref('entity_index_coverage.base_count')} + ${deltaBase}, 0)`,
-        indexed_count: sql`greatest(${sql.ref('entity_index_coverage.indexed_count')} + ${deltaIndex}, 0)`,
-        vector_indexed_count: sql`greatest(${sql.ref('entity_index_coverage.vector_indexed_count')} + ${deltaVector}, 0)`,
-        refreshed_at: sql`now()`,
-      } as any))
-    .returning(['id' as any])
-    .execute() as Array<{ id: string }>
+  if (await applyIncrement(db)) return
 
-  const keepId = rows?.[0]?.id ?? null
-  await pruneDuplicateCoverageRows(db, scope, keepId)
+  // No row for this scope yet, and this is the branch the unique constraint cannot close:
+  // `tenant_id IS NULL` never conflicts under `entity_index_coverage_scope_idx`, so two callers
+  // arriving here at once would both insert and one delta would have to be discarded. Take the
+  // scope lock, then re-run the increment inside it — whoever loses the race now sees the
+  // winner's committed row and adds to it instead of creating a rival.
+  await withCoverageInitializationLock(db, scope, async (executor) => {
+    if (await applyIncrement(executor)) return
+    await executor
+      .insertInto('entity_index_coverage' as any)
+      .values({
+        entity_type: scope.entityType,
+        tenant_id: scope.tenantId ?? null,
+        organization_id: storedOrgId,
+        with_deleted: scope.withDeleted === true,
+        base_count: Math.max(deltaBase, 0),
+        indexed_count: Math.max(deltaIndex, 0),
+        vector_indexed_count: Math.max(deltaVector, 0),
+        refreshed_at: sql`now()`,
+      } as any)
+      // Holding the lock and having just proved the scope is empty makes a duplicate
+      // impossible, so no collapse follows the insert. `ON CONFLICT DO NOTHING` remains as a
+      // cheap backstop for a writer that bypasses this path entirely; the increment above
+      // would fold its row in on the next adjustment either way.
+      .onConflict((oc: any) => oc
+        .columns(['entity_type', 'tenant_id', 'organization_id', 'with_deleted'])
+        .doNothing())
+      .execute()
+  })
 }
 
 async function upsertCoverageRow(
@@ -378,7 +461,12 @@ export async function applyCoverageAdjustments(
 ): Promise<void> {
   if (!adjustments.length) return
   const db = options?.trx ?? ((em as any).getKysely() as Kysely<any>)
-  const aggregated = aggregateAdjustments(adjustments)
+  // Sorted by scope key so every caller takes the per-scope initialization locks in the same
+  // order. Two transactions each adjusting the same pair of new scopes could otherwise grab
+  // them in opposite orders and deadlock.
+  const aggregated = aggregateAdjustments(adjustments).sort((left, right) =>
+    scopeKey(left.scope) < scopeKey(right.scope) ? -1 : scopeKey(left.scope) > scopeKey(right.scope) ? 1 : 0
+  )
   for (const entry of aggregated) {
     await incrementCoverageRow(db, entry.scope, {
       deltaBase: entry.deltaBase,
