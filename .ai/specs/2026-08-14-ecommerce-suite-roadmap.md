@@ -14,13 +14,13 @@
 
 **Key Points:**
 - Open Mercato has the back-office half of commerce (`catalog`, `sales`, `wms`, `payment_gateways`, `shipping_carriers`, `customers`, `customer_accounts`) but no selling channel. SPEC-029 tried to close the gap with one 1892-line spec covering a backend module, a public API, a checkout state machine and a complete Next.js application at once.
-- This roadmap replaces that monolith with **nine scoped specs across six new modules**, fixes the ownership boundaries between them, and records the architecture decisions that the individual specs must not re-litigate.
+- This roadmap replaces that monolith with **twelve scoped specs across seven new modules**, fixes the ownership boundaries between them, and records the architecture decisions that the individual specs must not re-litigate.
 - The load-bearing correction: **the cart is a first-class, channel-agnostic module** (`cart`), not a status on a checkout session. Storefront, POS, pay links and AI agents all mutate the same cart contract; checkout consumes a cart and turns it into a `SalesOrder`.
 - **B2B is in scope from v1.** Catalog pricing already resolves `customer_id` / `customer_group_id` / quantity tiers / validity windows — the missing pieces are the `CustomerGroup` entity itself (today a dangling UUID column), credit limits, and buyer approval flow.
 
 **Scope:**
 - Module inventory, ownership boundaries and dependency direction for the ecommerce suite
-- Nine specs: what each owns, what it must not own, and in which order they land
+- Twelve specs: what each owns, what it must not own, and in which order they land
 - Eight architecture decisions (ADR-1 … ADR-8) binding on every downstream spec
 - Phasing with explicit gating criteria
 
@@ -86,6 +86,7 @@ All new modules live in `packages/core/src/modules/<module>/` and follow the sta
 | `customer_groups` | `CustomerGroup`, group membership, group-scoped commercial terms, credit limit and exposure, buyer approval policy | Price rows (owned by `catalog`), tax rates (owned by `sales`) |
 | `merchandising` | Storefront navigation menus, homepage/landing blocks, banners, category enrichment, curated product sets, cross/upsell rules | Product domain model, CMS pages (owned by `content`) |
 | `availability` | The `availabilityService` DI contract and its catalog-only fallback implementation | Stock movements, lots, reservations (owned by `wms`) |
+| `pricing` (optional) | A resolver registered into `catalog`'s existing resolver chain, taking over price resolution when installed | Price rows and the base resolver (both owned by `catalog`); discount effects (`promotions`); totals (`sales`) |
 
 ### 3.2 Extended existing modules
 
@@ -96,6 +97,7 @@ All new modules live in `packages/core/src/modules/<module>/` and follow the sta
 | `wms` | Registers the concrete `availabilityService` implementation backed by `InventoryBalance` / `InventoryReservation` |
 | `catalog` | Admin UI for customer/group/quantity-scoped price rows (the data model already supports them) |
 | `sales` | Order creation entrypoint used by checkout; purchase-on-account payment method |
+| `packages/shared` | Two dependency-free contracts consumed across the suite: `lib/availability/` (base availability query/result types, provider registry, catalog-only fallback) and `lib/catalog-visibility/` (`AssortmentScope`, `EffectiveAssortmentScope`, and the pure `matchesOne`/`matchesScope`/`unionScopes`/`intersectScopes` combinators) |
 
 ### 3.3 New application
 
@@ -194,26 +196,31 @@ All new modules live in `packages/core/src/modules/<module>/` and follow the sta
 
 ### ADR-4 — Availability is a contract, `wms` is one implementation
 
-**Decision.** A thin `availability` module declares `availabilityService` in DI:
+**Decision.** The suite depends on an `availabilityService` contract, not on `wms`:
 
 ```typescript
 type AvailabilityQuery = {
-  items: Array<{ productId: string; variantId?: string | null; quantity: number }>
+  tenantId: string
+  organizationId: string
+  items: Array<{ catalogProductId: string; catalogVariantId?: string | null; quantity: number }>
   channelId?: string | null
   locationIds?: string[] | null
 }
 
 type AvailabilityResult = {
   byItem: Record<string, {
-    state: 'in_stock' | 'low_stock' | 'out_of_stock' | 'backorder' | 'preorder'
+    state: 'in_stock' | 'low_stock' | 'out_of_stock' | 'backorder' | 'preorder' | 'not_tracked'
     availableQuantity: number | null   // null = not tracked
     leadTimeDays: number | null
     canFulfil: boolean
+    isAuthoritative: boolean           // false for a cached browse-time read
   }>
 }
 ```
 
-`wms` registers the authoritative implementation (`InventoryBalance` minus open `InventoryReservation`). The `availability` module itself ships a catalog-only fallback that reports `not tracked` so a storefront works without `wms` installed.
+Field names are `catalogProductId` / `catalogVariantId`, matching the `catalog_product_id` / `catalog_variant_id` convention `wms`'s own entities already use. `isAuthoritative` is required because a browse-time read may be up to 60s stale and no caller may treat it as a stock guarantee — only the reservation call is authoritative.
+
+`wms` registers the authoritative implementation (`InventoryBalance` minus open `InventoryReservation`) into an explicit provider registry, by id, rather than relying on module load order. A built-in catalog-only fallback reports `not_tracked` so a storefront works without `wms` installed, and the `availability` module owns the sell-policy layer (`AvailabilityPolicy`) and the reservation lifecycle on top. **Spec 2 owns the canonical shape and location of these types**; this ADR fixes the decision, not the definition.
 
 **Rationale.** Storefront and cart must not query WMS entities directly — that would be a hard dependency on a module many tenants do not run, and a cross-module ORM coupling.
 
@@ -294,11 +301,15 @@ type BuyerContext = {
 | 8 | `2026-08-14-storefront-merchandising.md` | to write | `merchandising` | 3, 4 |
 | 9 | `2026-08-14-storefront-customer-account.md` | to write | `customer_accounts` | 1, 5, 7 |
 | 10 | `2026-08-14-storefront-app.md` | to write | `apps/storefront`, `@open-mercato/storefront-ui` | 4, 5, 7, 8 |
+| 11 | `2026-08-21-pricing-engine.md` | written | `catalog` (admin UI + resolver hardening), `pricing` (new, optional) | — (Phase 2 is a prerequisite for its own Phase 3 only) |
+| 12 | `2026-08-21-buyer-scoped-catalog-visibility.md` | written | `packages/shared`, `customer_groups`, `ecommerce`, `cart` | 1, 3, 5 (amends all three) |
 
 ### 6.1 What each spec must contain beyond the standard checklist
 
 | Spec | Non-obvious required content |
 |---|---|
+| 11 — Pricing engine | Owns the `PricingContext` **type shape** (`customerGroupIds`, `currencyCode`, the `globalThis` registry fix); spec 1 §3.2 owns the group **tie-break semantics** those ids resolve under. The split is stated in both documents |
+| 12 — Buyer-scoped visibility | Amends specs 1, 3 and 5 rather than defining a module of its own; its amendments are **applied in those documents**, not left pending. Owns the multi-group union algebra (a disjunction of conjunctions, not a merged scope object) and the write-side enforcement `cart` otherwise lacked |
 | 1 — Customer groups | Migration strategy for orphaned `customer_group_id` values; credit exposure calculation and its concurrency guarantee; approval policy model |
 | 2 — Availability | Fallback semantics when `wms` is absent; caching and staleness budget; the oversell window and who owns it |
 | 3 — `ecommerce` | Two-hop hostname resolution and its cache invalidation; `BuyerContext` resolver; branding SSR without FOUC |
@@ -331,7 +342,7 @@ Specs 3 and 4. Store, hostname binding, buyer-context resolver, branding, and th
 ### Phase 2 — Write side
 Specs 5 and 6. Cart with line management, price snapshots, promotion effects and `salesCalculationService` totals.
 
-**Gate:** cart totals are byte-identical to the totals of the `SalesOrder` the same cart produces; promotions apply identically on the product page and in the cart.
+**Gate:** cart totals are byte-identical to the totals of the `SalesOrder` the same cart produces; promotions apply identically on the product page and in the cart; a product outside the buyer's assortment is rejected by `cart.lines.add` as well as by the read API (spec 12 §6a).
 
 ### Phase 3 — Conversion
 Spec 7. Checkout funnel: addresses, delivery selection with live rates, payment, order or quote creation, purchase-on-account.
@@ -342,6 +353,13 @@ Spec 7. Checkout funnel: addresses, delivery selection with live rates, payment,
 Specs 8, 9 and 10. Merchandising, customer account area, and the storefront application.
 
 **Gate:** WCAG 2.2 AA audit passes; performance targets met; integration tests cover every API path and key UI path per `.ai/qa/AGENTS.md`.
+
+### Cross-cutting — specs 11 and 12
+
+Neither fits a single phase, because each amends work in several.
+
+- **Spec 11 (pricing engine)** — Phase 1 (the `catalog` price-rule admin UI) is independently shippable at any time and has no suite dependency. Phase 2 (resolver-contract hardening: `customerGroupIds`, `currencyCode`, the `globalThis` registry fix) MUST land **before or with Phase 0's spec 1**, since spec 1 §7.1's consumer change depends on the widened `PricingContext`. Phase 3 (the optional `pricing` module) may land any time after Phase 2.
+- **Spec 12 (buyer-scoped catalog visibility)** — its Phase 1 (the `packages/shared` visibility algebra and `customerGroupsService.resolveAssortmentScope()`) belongs with **Phase 0**, since spec 1 ships the group-terms column it operates on. Its Phase 2 belongs with **Phase 1** (`ecommerce` buyer-context composition), and its Phase 3 — the `cart` write-side enforcement — belongs with **Phase 2** and is the highest-priority of the three: without it, a product hidden from browsing is still purchasable through the cart API, so Phase 2's gate below does not pass without it.
 
 ---
 
@@ -389,7 +407,7 @@ Every public namespace MUST be rate limited and MUST include the buyer-context d
 | R4 | Two checkout models diverge | **High** | `checkout`, `ecommerce` | SPEC-029 §19 is implemented by one team while Simple Checkout is implemented by another; two order-creation paths with different idempotency guarantees produce duplicate orders. | ADR-3 withdraws §19 explicitly; the SPEC-029 rewrite must state the withdrawal in its changelog | Low |
 | R5 | Oversell between browse and submit | Medium | `availability`, `cart`, `wms` | Availability is read without reservation; two buyers check out the last unit concurrently. | Availability at browse time is advisory; the authoritative check plus reservation happens at checkout submit inside the order transaction; the child specs define the reservation window | Medium — inherent to non-reserving carts; accepted, and the oversell window must be documented, not hidden |
 | R6 | Credit limit overshoot | **High** | `customer_groups`, `checkout` | Concurrent purchase-on-account orders each pass an optimistic credit check and jointly exceed the limit. | Credit exposure update inside a serializable transaction at submit, mirroring SPEC-055's budget-cap approach | Low |
-| R7 | Suite scope exceeds delivery capacity | Medium | all | Ten specs, six new modules. Partial delivery leaves a storefront that browses but cannot sell. | Phase gating; Phases 0–3 are the minimum shippable set; Phase 4 spec 10 can slip without invalidating the API contract | Medium |
+| R7 | Suite scope exceeds delivery capacity | Medium | all | Twelve specs, seven new modules. Partial delivery leaves a storefront that browses but cannot sell. | Phase gating; Phases 0–3 are the minimum shippable set; Phase 4 spec 10 can slip without invalidating the API contract | Medium |
 | R8 | `packages/core` bundle growth | Low | `core` | Six new modules in core means every tenant, including non-commerce ones, carries them. | Modules are opt-in via `modules.ts`; measure and report bundle delta at each phase gate | Low — revisit as a package split if the delta is material |
 
 ---
@@ -419,6 +437,13 @@ Every public namespace MUST be rate limited and MUST include the buyer-context d
 ---
 
 ## 13) Changelog
+
+### 2026-09-06
+- Added specs 11 (`2026-08-21-pricing-engine.md`) and 12 (`2026-08-21-buyer-scoped-catalog-visibility.md`) to §3.1, §3.2, §6 and §7. Both were written after this document and both deviate from it materially — spec 11 introduces a new optional `pricing` module and changes a `catalog` contract; spec 12 introduces a new `packages/shared` contract and amends specs 1, 3 and 5 — so §1's rule that a deviating child spec "MUST amend this document first" applies to both, and neither had. An implementer using this roadmap as the suite's index would not have found the write-side visibility control spec 12 rates Critical.
+- Added `packages/shared` to §3.2's extended-modules table: the suite now places two dependency-free contracts there (`lib/availability/`, `lib/catalog-visibility/`), which the ownership tables never acknowledged.
+- Corrected the spec count: TLDR and Scope said "nine", §6's table listed ten and R7 said "Ten". Now twelve throughout, matching §6.
+- ADR-4's contract shape updated to match the availability spec it governs (field rename, `isAuthoritative`) — see below.
+- Phase 2's gate now includes the cart-side assortment check, which is what makes spec 12 Phase 3 a gating deliverable rather than a follow-up.
 
 ### 2026-08-14
 - Initial umbrella specification.

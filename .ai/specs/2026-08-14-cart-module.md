@@ -2,12 +2,12 @@
 
 | Field | Value |
 |-------|-------|
-| **Status** | Specification (rev 2 — pre-implementation fixes) |
+| **Status** | Specification (rev 3 — sibling amendments applied) |
 | **Created** | 2026-08-14 |
 | **Suite** | [Ecommerce Suite Roadmap](./2026-08-14-ecommerce-suite-roadmap.md) — spec 5, Phase 2 |
 | **Modules** | `cart` (new) |
 | **Depends on** | [Customer Groups & B2B Terms](./2026-08-14-customer-groups-and-b2b-terms.md), [Availability Contract](./2026-08-14-availability-contract.md), [SPEC-029 Ecommerce Store Module](./SPEC-029-2026-02-17-ecommerce-storefront-module.md) |
-| **Related** | [SPEC-055 Promotions](./SPEC-055-2026-02-23-promotions-module.md), [ADR-1](./2026-08-14-ecommerce-suite-roadmap.md#adr-1--the-cart-is-a-module-not-a-checkout-status), [ADR-2](./2026-08-14-ecommerce-suite-roadmap.md#adr-2--cart-never-computes-tax-or-totals-itself) |
+| **Related** | [SPEC-055 Promotions](./SPEC-055-2026-02-23-promotions-module.md), [Buyer-Scoped Catalog Visibility](./2026-08-21-buyer-scoped-catalog-visibility.md), [ADR-1](./2026-08-14-ecommerce-suite-roadmap.md#adr-1--the-cart-is-a-module-not-a-checkout-status), [ADR-2](./2026-08-14-ecommerce-suite-roadmap.md#adr-2--cart-never-computes-tax-or-totals-itself) |
 
 ---
 
@@ -276,6 +276,57 @@ Spec 6 aligns SPEC-055's cart interaction API to these calls.
 
 ---
 
+## 6a) Assortment Visibility (added 2026-09-06)
+
+Applies the amendments [Buyer-Scoped Catalog Visibility](./2026-08-21-buyer-scoped-catalog-visibility.md) §0 records against this document. Without them, the cart is the hole in an otherwise-enforced control: `storefront-public-api.md` §3.3 gates every product-returning **read** behind `buildStorefrontProductScope`, and nothing here gated the **write**. A buyer, script or AI purchasing agent holding any product id could add a restricted product straight to a cart, and cart lines flow into `checkout` and `SalesOrder` creation per ADR-1/ADR-2 — so an invisible product was fully purchasable. That is R11 below, and it is the reason this section exists.
+
+### 6a.1 Per-line check on add, update and bulk add
+
+`cart.lines.add`, `cart.lines.update` and `cart.lines.bulkAdd` gain one input field:
+
+```typescript
+assortmentScope?: EffectiveAssortmentScope   // packages/shared/src/lib/catalog-visibility/
+```
+
+After loading the product for its existing name/sku snapshot (§4.2) and before persisting the line:
+
+```typescript
+if (cart.channel === 'storefront') {
+  if (input.assortmentScope === undefined) {
+    throw new ValidationError('assortment_scope_required_for_storefront_channel')   // 400
+  }
+  const scoped = { id: product.id, categoryIds: product.categoryIds, tagIds: product.tagIds }
+  if (!matchesScope(scoped, input.assortmentScope)) {
+    return rejectLine({ code: 'product_unavailable', lineId: existingLineId ?? null })
+  }
+}
+```
+
+The caller **supplies** the scope rather than `cart` re-deriving it: the storefront route that proxies here has already called `storeContextService.resolve()` for pricing, so it passes the same `buyer.assortmentScope` through unchanged. This matches ADR-7 ("resolved once, at the edge") and keeps `cart` free of any new dependency on `ecommerce` or `customer_groups` beyond the `resolveTerms()` edge §3.1 already declares. Making the field **required when `channel === 'storefront'`** — validated, not merely optional — turns "the route layer forgot to pass it" into a `400` here rather than a silent bypass.
+
+Rejection is a **non-fatal warning**, matching §10.1's existing convention for an out-of-stock line: the line is not added (or, for `.update`, the change is rejected and the line stays at its prior state), the request itself does not error, and `warnings` carries the code — which is what lets `bulkAdd` succeed partially across 50 lines.
+
+### 6a.2 Whole-cart re-visibility pass at triggers 2 and 5
+
+A per-line check alone leaves a time-of-check/time-of-use window: `CustomerGroupMembership.valid_until` is a first-class feature (spec 1 §5.2), so a buyer can legitimately add a Wholesale-only product while a member, have the membership lapse, and reach checkout with a line that was never re-checked.
+
+So the re-pricing triggers in §5.2 that already run **whole-cart** carry a parallel re-*visibility* pass against the freshly-resolved scope:
+
+- **Trigger 2** (buyer identity changes: login, logout, group membership change) — the case that produces the drift.
+- **Trigger 5** (checkout requests a lock; "mandatory, never skipped") — the backstop.
+
+A line that fails is **not deleted**. Deleting a buyer's line without disclosure is the failure class R2 and R4 already exist to prevent, and this does not add a third instance of it. The line is flagged `product_unavailable` in `warnings`, exactly as an out-of-stock line already is, and **the `active → locked` transition is refused while any line carries that flag** (§9) — mirroring the existing precedent that an over-`approval_required_above` cart cannot lock. The buyer removes or replaces the line, or regains access and re-triggers a re-price, before checkout proceeds.
+
+### 6a.3 No write-side enumeration oracle
+
+A restricted product and a nonexistent or deleted product id produce the **identical** `product_unavailable` warning — same body, same shape. This is `storefront-public-api.md` §4.2's handle-enumeration rule applied to a mutation: the read path goes to the trouble of collapsing "restricted" and "nonexistent" into one indistinguishable 404, and the write path must not hand that distinction back.
+
+### 6a.4 Non-storefront channels are exempt by construction
+
+The rule is keyed on **whether a scope was resolved**, not on an enumerated channel list: enforcement applies exactly to carts whose channel resolved a `StoreContext`, which today is `storefront` alone. `pos`, `pay_link`, `agent` and `api` carts have no channel binding and no buyer digest, so there is nothing to check against. A future channel that gains `StoreContext` resolution inherits enforcement automatically. An in-store POS sale by staff is a deliberately different trust boundary — assortment scope is a self-service merchandising control, not a sales permission.
+
+---
+
 ## 7) Guest → Customer Merge
 
 The hardest correctness question in the module, because every strategy is wrong for some buyer.
@@ -341,7 +392,7 @@ active ──lock (checkout)──► locked ──submit──► converted
 
 | Transition | Rule |
 |---|---|
-| `active → locked` | Requested by `checkout`; forces a whole-cart re-price first; rejects mutation while locked |
+| `active → locked` | Requested by `checkout`; forces a whole-cart re-price **and a whole-cart re-visibility pass** (§6a.2) first; **rejected while any line carries an unresolved `product_unavailable` warning**; rejects mutation while locked |
 | `locked → active` | Explicit unlock, or a lock timeout (default 30 min) |
 | `active → abandoned` | No activity for 24 h (configurable); emits an event for recovery flows |
 | `abandoned → active` | Any mutation; extends `expires_at` |
@@ -354,7 +405,7 @@ A `locked` cart that a client tries to mutate returns `423 Locked` with the chec
 
 ## 10) API Contracts
 
-Base `/api/cart`. Token-bound, public with an optional buyer session. Every mutating route accepts the expected `updatedAt` (via the standard optimistic-lock header or a typed body field — §8.1) and `Idempotency-Key`.
+Base `/api/cart`. Token-bound, public with an optional buyer session. Every mutating route accepts the expected `updatedAt` (via the standard optimistic-lock header or a typed body field — §8.1) and `Idempotency-Key`. The three line-mutating routes additionally carry `assortmentScope`, required for storefront-channel carts (§6a.1).
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -425,7 +476,10 @@ export const features = [
 'cart.price.changed'          // payload: per-line old/new and reason
 'cart.approval.requested'
 'cart.lock.acquired' | '.released' | '.timed_out'
+'cart.line.visibility_rejected'   // added 2026-09-06 — §6a
 ```
+
+`cart.line.visibility_rejected` carries `{ cartId, productId, variantId, reason: 'not_in_assortment', triggeredBy: 'add' | 'update' | 'bulkAdd' | 'reprice' | 'checkout_lock' }` and is emitted by both enforcement points (§6a.1, §6a.2). It is **not** `clientBroadcast` — the buyer already sees the `product_unavailable` warning in the response body; this is the operator-facing signal, so a merchant who narrows a group's `assortment_scope` too far, or misconfigures a channel's `require_authentication`, sees a trend instead of scattered support tickets. Same reasoning as `availability.shortfall.detected` and `customer_groups.credit.limit_exceeded`.
 
 `cart.cart.abandoned` is the hook for recovery flows (out of scope here). `cart.price.changed` feeds analytics on how often snapshots go stale, which is how the staleness budget gets tuned with evidence.
 
@@ -458,6 +512,8 @@ export const features = [
 | R8 | Orphaned promotion code reservations | Medium | `cart`, `promotions` | Abandoned carts hold single-use code reservations; a limited campaign exhausts against baskets nobody bought. | Expiry sweeper releases reservations; abandonment releases them ahead of full expiry; reservation TTL is independent of and shorter than cart TTL | Low |
 | R9 | Silent quantity rounding | Medium | `cart` | A pack-size increment of 6 silently rounds a request for 7 up to 12; the buyer receives and is billed for twice what they wanted. | Rejected with nearest valid values offered, never rounded (§5.5) | Low |
 | R10 | Unbounded cart growth | Low | `cart` | A script adds 100 000 lines; promotion evaluation and totals become a denial of service. | 200 lines per cart, 10 000 units per line; per-token rate limit; batch endpoint capped at 100 lines per call | Low |
+| R11 | Write path bypasses read-side assortment visibility | **Critical** | `cart` | A product hidden from browsing is still purchasable: a buyer, script or AI agent holding a product id (a stale link, a scraped sitemap, an id from an unrelated source) `POST`s it to `/carts/:token/lines`, and the line flows through `checkout` into a `SalesOrder`. A read-side 404 that a cart mutation ignores is a suggestion, not a control. | §6a.1: `assortmentScope` is a validated, required input on `lines.add`/`.update`/`.bulkAdd` for storefront-channel carts — omission is a `400`, not a silent pass-through; §6a.2's whole-cart pass at triggers 2 and 5 closes the time-of-check/time-of-use window a lapsing membership opens, with the checkout lock refused while a line is flagged | Low once shipped — the residual is a future cart mutation forgetting the same check, mitigated by §6a.4's channel-keyed rule rather than an enumerated list |
+| R12 | Write-side rejection becomes its own enumeration oracle | Medium | `cart` | A distinguishable "restricted" vs "not found" response lets a script map a private assortment through cart-add attempts — the write-side analogue of `storefront-public-api.md` R4. | §6a.3: identical `product_unavailable` warning for both cases, asserted by test | Low |
 
 ---
 
@@ -496,6 +552,17 @@ export const features = [
 - Below `minOrderQuantity` rejected; above `maxOrderQuantity` capped with a warning
 - Over `approval_required_above` sets `requiresApproval` and blocks the checkout lock
 - Net tax mode from group terms reflected in totals
+
+**Assortment visibility (R11/R12 regression suite, §6a):**
+- `lines.add` with a restricted product and a correctly-supplied `assortmentScope`: rejected with `product_unavailable`; totals unaffected
+- `lines.add` on a `storefront`-channel cart with `assortmentScope` omitted: `400 assortment_scope_required_for_storefront_channel`, no line added
+- `lines.bulkAdd` mixing visible and restricted products: visible ones added, restricted ones reported per-line in `warnings`, no whole-batch failure
+- `lines.update` on a line whose product has since become restricted: rejected, the existing line untouched and **not** deleted, `lineId` populated in the warning
+- `pos`/`pay_link`/`agent`/`api` carts: no `assortmentScope` required, no rejection regardless of storefront assortment status (§6a.4)
+- **The TOCTOU fixture:** add a line while the buyer is a member of a scoped group, expire the membership, request the checkout lock (trigger 5) — the lock is refused while the line is flagged, and the line is still present
+- A membership change mid-session (trigger 2) runs the same whole-cart pass without waiting for checkout
+- A restricted and a nonexistent product id produce identical `lines.add` responses in body and timing (R12)
+- `cart.line.visibility_rejected` emitted from both enforcement points with the correct `triggeredBy`
 
 **Lifecycle:**
 - Lock forces a re-price; mutation while locked returns 423 with the session id
@@ -562,6 +629,18 @@ Approval routing, bulk lines, admin cart list, abandonment events.
 ---
 
 ## 18) Changelog
+
+### 2026-09-06 (rev 3 — sibling amendments applied)
+
+Applied the amendments [Buyer-Scoped Catalog Visibility](./2026-08-21-buyer-scoped-catalog-visibility.md) §0 records against this document. Leaving them pending in a sibling file would have meant this spec — the one that actually owns the `cart` module, and reads as complete — specifying the write path with no visibility check at all, which is the Critical hole that document exists to close.
+
+- Added **§6a Assortment Visibility**: the per-line check on `lines.add`/`.update`/`.bulkAdd` with a validated, storefront-required `assortmentScope` input (§6a.1); the whole-cart re-visibility pass at re-pricing triggers 2 and 5 closing the membership-lapse TOCTOU window (§6a.2); the no-enumeration-oracle rejection shape (§6a.3); and the channel-keyed exemption rule for `pos`/`pay_link`/`agent`/`api` (§6a.4).
+- §9: the `active → locked` transition now runs the re-visibility pass and is **refused** while any line carries an unresolved `product_unavailable` warning — mirroring the existing `requiresApproval`-blocks-lock precedent.
+- §11: added `cart.line.visibility_rejected`, operator-facing, not `clientBroadcast`.
+- §13: added R11 (write path bypasses read-side visibility, **Critical**) and R12 (write-side enumeration oracle, Medium).
+- §14: added the R11/R12 regression suite, including the membership-expiry-then-checkout-lock fixture.
+
+No entity or column changes to `cart`. The new command input is an additive field on an unimplemented command signature.
 
 ### 2026-08-17 (rev 2 — pre-implementation fixes)
 

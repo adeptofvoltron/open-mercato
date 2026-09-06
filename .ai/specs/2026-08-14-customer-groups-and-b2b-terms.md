@@ -172,7 +172,7 @@ One row per group. Absent row means "inherit from parent group, then tenant defa
 | `credit_currency_code` | text, nullable | |
 | `approval_required_above` | numeric(16,2), nullable | Order gross above this routes to approval; null = never |
 | `min_order_value` | numeric(16,2), nullable | Rejected below this at checkout |
-| `assortment_scope` | jsonb, nullable | `{ categoryIds?, tagIds?, excludeProductIds? }` — same shape as the channel binding scope |
+| `assortment_scope` | jsonb, nullable | `AssortmentScope \| null` — `{ categoryIds?, tagIds?, excludeProductIds?, excludeCategoryIds?, excludeTagIds? }`, the shared type from `packages/shared/src/lib/catalog-visibility/` ([Buyer-Scoped Catalog Visibility](./2026-08-21-buyer-scoped-catalog-visibility.md) §3.3). Same shape as the channel binding scope. `excludeCategoryIds`/`excludeTagIds` added 2026-09-06 for symmetry with `excludeProductIds`; additive jsonb keys, no migration. Resolved by `resolveAssortmentScope()`, **not** by `resolveTerms()` — §6.4 |
 | `metadata` | jsonb, nullable | |
 
 ### 5.4 `CustomerCreditAccount` (`customer_credit_accounts`)
@@ -250,8 +250,9 @@ type ResolvedTerms = {
   allowPurchaseOnAccount: boolean
   approvalRequiredAbove: number | null
   minOrderValue: number | null
-  assortmentScope: AssortmentScope | null
   sourceGroupId: string | null    // which group each value came from, for admin explainability
+  // NOTE: no `assortmentScope` field — withdrawn 2026-09-06, see §6.4. Assortment scope is a
+  // visibility grant, not a scalar term, so it cannot follow §6.1's highest-priority-wins rule.
 }
 
 type CreditCheck = {
@@ -267,6 +268,12 @@ interface CustomerGroupsService {
   resolveGroups(input: { customerId: string | null; at?: Date }): Promise<GroupResolution>
 
   resolveTerms(input: { customerId: string | null; groupIds?: string[] }): Promise<ResolvedTerms>
+
+  // Assortment scope resolves separately from the scalar terms above — §6.4.
+  resolveAssortmentScope(input: { customerId: string | null; at?: Date }): Promise<{
+    scope: EffectiveAssortmentScope   // union across every matching group; no matching groups → null (unrestricted)
+    sourceGroupIds: string[]          // every group that contributed, for the explain-terms panel
+  }>
 
   checkCredit(input: {
     customerId: string
@@ -316,15 +323,34 @@ Fixed: `resolveTerms` resolves only `priceKindId` (§5.3). The consumer that nee
 - **Do not treat "mirrors SPEC-055"** (this repo's promotions spec, which proposes the identical pattern for budget caps) **as precedent** — SPEC-055 is itself unimplemented spec-only text, not working code. Whichever of the two specs implements this helper first should be the one the other references.
 - The N=20-parallel-reservation integration test (§13) is the acceptance gate for this helper, not for `reserveCredit` itself — write and merge the helper with its own concurrency test before Phase 3 begins.
 
+### 6.4 Assortment scope resolves separately from the scalar terms (amended 2026-09-06)
+
+`ResolvedTerms` originally carried an `assortmentScope` field resolved by §6.1's generic per-field algorithm. That is wrong, and [Buyer-Scoped Catalog Visibility](./2026-08-21-buyer-scoped-catalog-visibility.md) §1.1 shows why: §6.1's rule picks the highest-`priority` group's value and discards the rest, which is correct for a scalar setting (exactly one payment term must win) and incorrect for a **visibility grant**. A buyer in both "Wholesale" (scoped to a bulk-goods category) and "Q3 Preview" (scoped to a launch tag) would see only whichever group happens to carry the higher `priority` integer — a number the operator set to tie-break price rows, not to rank visibility. Adding a second, more permissive group would silently be a no-op.
+
+Fixed: the `assortmentScope` field is **withdrawn** from `ResolvedTerms`, and `resolveAssortmentScope()` (§6) replaces it. It returns an `EffectiveAssortmentScope` — an OR-list of AND-scopes, one branch per contributing group — so grants combine additively regardless of priority. The type and its pure combinators (`matchesOne`, `matchesScope`, `unionScopes`, `intersectScopes`) live in `packages/shared/src/lib/catalog-visibility/`; that spec owns their definition and this one consumes it. Every other `ResolvedTerms` field is untouched and keeps resolving via §6.1 exactly as before — this is a single-field exception, stated once, not a change to the algorithm.
+
+`customerId: null` (anonymous, or no matching groups) returns `{ scope: null, sourceGroupIds: [] }` — `null` meaning unrestricted, consistent with §6.2's rule that absence of a group MUST NOT be an error.
+
 ---
 
 ## 7) Consumer Changes
 
 ### 7.1 `catalog` pricing
 
-`PricingContext.customerGroupId?: string | null` becomes `customerGroupIds?: string[]`. The matcher at `catalog/lib/pricing.ts:66` changes from equality to set membership; the specificity score at line 84 stays +3, and among several matching group rows the one whose group has the highest priority wins.
+`PricingContext.customerGroupId?: string | null` becomes `customerGroupIds?: string[]`, and the matcher at `catalog/lib/pricing.ts:66` changes from equality to set membership.
 
-**Backward compatibility.** `customerGroupId` is retained as a deprecated optional field for at least one minor version, normalized internally to `[customerGroupId]`. Marked `@deprecated` with a pointer to the replacement, per the deprecation protocol in `BACKWARD_COMPATIBILITY.md`. `PricingContext` is a public type consumed by third-party modules; this is an additive change plus a deprecation, not a break.
+**Ownership split with [Pricing Engine](./2026-08-21-pricing-engine.md) (resolved 2026-09-06).** Both specs touch this type; each owns one half, and neither restates the other's:
+
+| Concern | Owner |
+|---|---|
+| The `PricingContext` **type shape** — adding `customerGroupIds`, deprecating `customerGroupId`, adding `currencyCode`, and hardening `registerCatalogPricingResolver`'s registry | `2026-08-21-pricing-engine.md` Phase 2. It is `catalog`-internal infrastructure work in the module that owns the resolver. |
+| The **group tie-break semantics** those ids resolve under | This spec, §3.2. Group precedence is the `customer_groups` domain rule. |
+
+Pricing Engine's Edge Cases table names its tie-break a *provisional* default *"pending that sibling spec"* — this is that sibling spec, so the rule below is the one to implement, and Pricing Engine's provisional wording is superseded rather than contradicted.
+
+**Tie-break, authoritative.** Resolution is unchanged at first order: `scorePrice`'s specificity score decides, and a matching group row still scores +3 at `catalog/lib/pricing.ts:84`. The second-order rule is what this spec adds — when two or more **equally-scored** rows match by way of *different* groups the buyer belongs to, the row whose group carries the highest `CustomerGroup.priority` wins (§3.2), ties broken by the most recently created membership. This is additive to `scorePrice`'s existing weights; it does **not** reorder them, and per `catalog/AGENTS.md` § Ask First, changing resolver priority semantics is explicitly out of scope for both specs.
+
+**Backward compatibility.** `customerGroupId` is retained as a deprecated optional field for at least one minor version, normalized internally to `[customerGroupId]`. Marked `@deprecated` with a pointer to the replacement, per the deprecation protocol in `BACKWARD_COMPATIBILITY.md`. `PricingContext` is a public type consumed by third-party modules; this is an additive change plus a deprecation, not a break. The `UPGRADE_NOTES.md` entry is authored once, by whichever of the two specs' phases lands first.
 
 ### 7.2 `sales` tax resolution
 
@@ -559,7 +585,8 @@ Operator sets, and support explains, the per-group buying terms.
   - AC: `assortment_scope` uses the same category/tag/exclude picker pattern as the channel-binding scope elsewhere in the app — do not invent a new picker.
 
 - **US-C2** — As a support agent, I want an "explain terms" panel on the customer detail page, so that when a buyer asks "why do I have net-30 instead of net-60" I can answer without guessing across four overlapping groups (R5).
-  - AC: each resolved field (`priceKindId`, `paymentTermsDays`, `allowPurchaseOnAccount`, `approvalRequiredAbove`, `minOrderValue`, `assortmentScope`) shows its value and the group it came from (`sourceGroupId`).
+  - AC: each resolved scalar field (`priceKindId`, `paymentTermsDays`, `allowPurchaseOnAccount`, `approvalRequiredAbove`, `minOrderValue`) shows its value and the group it came from (`sourceGroupId`).
+  - AC: assortment scope is shown in its own row, sourced from `resolveAssortmentScope()` rather than `resolveTerms()` (§6.4), and names **every** contributing group (`sourceGroupIds`, plural) — it is a union across groups, not a single highest-priority winner, so a single-source label would misrepresent it.
   - AC: a field with `sourceGroupId: null` is labeled "tenant default", not left blank.
   - AC: the trace is a visible ancestor path (child → parent → tenant), not a tooltip that must be discovered.
 
@@ -601,6 +628,16 @@ Approver/account manager reviews over-threshold purchase requests.
 ---
 
 ## 18) Changelog
+
+### 2026-09-06 (sibling amendments applied)
+
+Applied the amendments [Buyer-Scoped Catalog Visibility](./2026-08-21-buyer-scoped-catalog-visibility.md) §0 records against this document, rather than leaving them pending in a sibling file — both documents ship together, so a deferred amendment would have left an implementer building from §6 alone shipping a field a neighbouring spec calls withdrawn.
+
+- **`ResolvedTerms.assortmentScope` withdrawn** (§6), replaced by `resolveAssortmentScope()` returning an `EffectiveAssortmentScope` plus `sourceGroupIds`. Added §6.4 stating why a visibility grant cannot follow §6.1's highest-priority-wins rule. Every other `ResolvedTerms` field is unchanged.
+- **`CustomerGroupTerms.assortment_scope`** (§5.3) retyped to the shared `AssortmentScope` from `packages/shared/src/lib/catalog-visibility/`, gaining `excludeCategoryIds` / `excludeTagIds`. Additive jsonb keys inside an already-planned column — no migration change.
+- §17 US-C2 updated: the explain-terms panel shows assortment scope in its own row naming every contributing group, not as a `sourceGroupId` scalar.
+
+Also recorded the `PricingContext` ownership split with [Pricing Engine](./2026-08-21-pricing-engine.md) — see §7.1.
 
 ### 2026-08-31 (story map)
 - Added §17 User Story Map to support the `om-mockup-prototype` backend click-through: 6 epics, 8 stories, UX acceptance criteria (empty/permission/error/optimistic-lock/keyboard/default-value states) derived from §13's UI-path list and §5–§9's data/API contracts. No scope change.

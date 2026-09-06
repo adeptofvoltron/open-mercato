@@ -22,7 +22,15 @@ The parallel `open-mercato` upstream repo independently designed the same contra
 - The fallback's `not_tracked` state and `canFulfil: true` default (§3.2 below) is unchanged and was in fact adopted upstream into `wms-roadmap.md` rev 11 as the more correct choice over an earlier draft that defaulted to `in_stock` — no change needed here.
 - `reserve`/`release`/`commit` (§4.1) MUST be implemented as undoable commands per root `AGENTS.md` — either by delegating directly to `wms`'s existing `reserveInventory`/`releaseReservation` commands (already command-driven, already undoable) or by registering their own commands with `extractUndoPayload()`. The original draft specified them as plain async interface methods with no stated command binding; this is fixed in §4.1 below.
 
-See `wms-roadmap.md` §"Cross-Module Availability Contract" for the canonical shared-side design this document now defers to for the base contract.
+### Status of the deferral (2026-09-06) — read this before implementing
+
+**The section this note defers to is not present in this repository.** `.ai/specs/2026-04-15-wms-roadmap.md` exists here and contains no "Cross-Module Availability Contract" section; neither "rev 10" nor "rev 11" appears in it. `packages/shared/src/lib/availability/` does not exist either. So as written, the deferral pointed at nothing an implementer could open, and §4.1's `AvailabilityItemQuery` / `AvailabilityItemResult` were named but defined nowhere.
+
+Deferring a contract to an unreachable document is worse than either alternative, because two teams starting Phase 1 and Phase 2 in parallel each re-derive the shape and land two incompatible interfaces — the exact collision this reconciliation exists to prevent, since a DI/type contract can only be frozen once (`BACKWARD_COMPATIBILITY.md` categories 2 and 9).
+
+**Resolution, stated as an assumption rather than a new decision.** §4.1a below now carries the complete base contract, written down from what this document already specifies piecemeal across §3.2 (the state union), §4.1 (the query/result outline), §4.2 (the sellable computation), §6 (`isAuthoritative`) and the roadmap's ADR-4 — plus the four changes this reconciliation already agreed (shared location, explicit registry, per-tenant provider selection, `catalogProductId`/`catalogVariantId` naming). It is a transcription of the agreed design, not a competing one.
+
+**If the upstream `wms-roadmap.md` § "Cross-Module Availability Contract" lands in this repository, it wins** and §4.1a is superseded — that priority is unchanged from the original reconciliation. Until it does, §4.1a is what Phase 1 builds against, so the phase is not blocked on a document that may never arrive. Whoever lands that section MUST diff it against §4.1a and reconcile in one direction explicitly.
 
 ---
 
@@ -135,7 +143,7 @@ type AvailabilityState =
 
 ### 4.1 Contract
 
-The base query/result shape (`AvailabilityQuery` = `{ tenantId, organizationId, items: AvailabilityItemQuery[] }`, `AvailabilityResult` = `{ byItem: Record<string, AvailabilityItemResult> }`, the `AvailabilityProvider` interface) is defined once in `packages/shared/src/lib/availability/types.ts` per the Reconciliation note — not repeated here as a competing definition. This module's own surface is the **reservation lifecycle**, which the shared contract deliberately excludes (availability there is read-only):
+The base query/result shape and the `AvailabilityProvider` interface live in `packages/shared/src/lib/availability/types.ts` per the Reconciliation note — **§4.1a writes them out**, because the document they were deferred to does not exist in this repository (see "Status of the deferral" above). This module's own surface is the **reservation lifecycle**, which the shared contract deliberately excludes (availability there is read-only):
 
 ```typescript
 // packages/core/src/modules/availability/lib/reservationCommands.ts
@@ -184,6 +192,71 @@ export async function commitAvailability(input: { idempotencyKey: string; orderI
 ```
 
 **`resolveAvailability()` (shared) is advisory. `reserveAvailability()` (this module) is authoritative.** No caller may treat a `resolveAvailability()` result as a guarantee. This is stated here because it is the single most likely misuse.
+
+### 4.1a The base contract (`packages/shared/src/lib/availability/`)
+
+Zero module dependencies, so `ecommerce`, `cart`, `checkout` and `catalog` consume it without a `requires` edge on either `availability` or `wms`.
+
+```typescript
+// packages/shared/src/lib/availability/types.ts
+
+export type AvailabilityState =
+  | 'in_stock' | 'low_stock' | 'out_of_stock' | 'backorder' | 'preorder' | 'not_tracked'
+
+export type AvailabilityItemQuery = {
+  catalogProductId: string
+  catalogVariantId?: string | null   // null → product-level rollup over active variants (§4.2)
+  quantity: number                   // the quantity being asked about; state is relative to it
+}
+
+export type AvailabilityQuery = {
+  tenantId: string
+  organizationId: string
+  items: AvailabilityItemQuery[]
+  storeId?: string | null            // selects the policy chain (§5.2)
+  channelId?: string | null
+  locationIds?: string[] | null      // null → every in-scope location (Open Question 2)
+}
+
+export type AvailabilityItemResult = {
+  state: AvailabilityState
+  availableQuantity: number | null   // sellable, per §4.2; null = not tracked
+  canFulfil: boolean                 // the requested quantity can be met, incl. a backorder/preorder path
+  leadTimeDays: number | null        // set for 'backorder'
+  releaseAt: string | null           // ISO-8601; set for 'preorder'
+  isAuthoritative: boolean           // false for a cached browse-time read (§6) — never a guarantee
+  policySourceId: string | null      // the AvailabilityPolicy row that decided, or null for a module default
+}
+
+export type AvailabilityResult = {
+  byItem: Record<string, AvailabilityItemResult>   // key: `${catalogProductId}:${catalogVariantId ?? ''}`
+}
+
+export interface AvailabilityProvider {
+  id: string
+  getAvailability(query: AvailabilityQuery): Promise<AvailabilityResult>
+}
+```
+
+```typescript
+// packages/shared/src/lib/availability/registry.ts
+// Mirrors packages/shared/src/lib/ai/llm-provider-registry.ts.
+
+export const availabilityProviderRegistry: {
+  register(provider: AvailabilityProvider): void   // idempotent, replace-by-id — never order-dependent
+  get(id: string): AvailabilityProvider | null
+  list(): AvailabilityProvider[]
+}
+
+/** The entry point every read-side consumer calls. Advisory — see §4.1. */
+export function resolveAvailability(query: AvailabilityQuery): Promise<AvailabilityResult>
+```
+
+`resolveAvailability()` picks the provider from `ModuleConfigService('availability', 'selectedProvider')` — `auto` | `wms` | `catalog-only`, per tenant, falling back safely to `catalog-only` when the selected id is not currently registered. `auto` means "the highest-precedence registered provider", which is `wms` when installed. The built-in `catalog-only` provider is always registered and returns `not_tracked` with `canFulfil: true` and `isAuthoritative: true` (nothing to be stale about) for every item, unless `availability` is installed and a policy says otherwise (§4.3).
+
+The result key is stable and derivable by the caller, so a batched response maps back onto the request without positional matching.
+
+**Not in the shared contract, deliberately:** reservations. `reserve`/`release`/`commit` are transactional writes owned by this module (§4.1), not read-side helpers, and putting them in `packages/shared` would give a dependency-free package a transaction boundary.
 
 ### 4.2 The `wms` implementation
 
@@ -396,8 +469,12 @@ The one-minute cadence on expiry is deliberate: held stock that nobody is buying
 
 ## 13) Implementation Phases
 
-### Phase 1 — Contract and fallback
-`availability` module, `contract.ts`, `AvailabilityPolicy`, policy resolution, fallback implementation, admin CRUD.
+### Phase 1 — Base contract, fallback and policy
+
+Two deliverables with different homes, per the Reconciliation note — an earlier revision of this list still named a `contract.ts` inside this module and a fallback owned by it, both of which that note had already relocated:
+
+- **`packages/shared/src/lib/availability/`** — `AvailabilityQuery` / `AvailabilityResult` / `AvailabilityProvider` types, the `availabilityProviderRegistry`, and the built-in `catalog-only` fallback provider. Dependency-free, so it works even when this module is ejected.
+- **`packages/core/src/modules/availability/`** — `AvailabilityPolicy`, `lib/policyResolution.ts`, admin CRUD, `acl.ts`, `events.ts`. No `contract.ts`; this module consumes the shared types rather than defining them (§3.1).
 
 **Gate:** a storefront-shaped consumer gets coherent states with `wms` disabled; policy resolution correct at all six levels.
 
@@ -426,7 +503,7 @@ Phases 1 and 2 unblock spec 4 (public API). Phase 3 is required only by spec 7 (
 
 ## 15) Migration & Backward Compatibility
 
-- This spec introduces a brand-new DI/type contract. Per the Reconciliation note, the base contract's canonical location and shape are decided by `wms-roadmap.md` rev 11 in the upstream repo, not by this document alone — implementers MUST build against that shape, not re-derive it from this file's original 2026-08-14 draft.
+- This spec introduces a brand-new DI/type contract, written out in §4.1a. The Reconciliation note originally deferred its canonical shape to `wms-roadmap.md` rev 11; that section is not present in this repository (see "Status of the deferral"), so §4.1a stands as the shape Phase 1 builds against. If that upstream section lands here it supersedes §4.1a, and whoever lands it MUST diff the two and reconcile explicitly in one direction — a DI/type contract can only be frozen once (`BACKWARD_COMPATIBILITY.md` categories 2 and 9). Implementers MUST NOT re-derive the shape from this file's original 2026-08-14 draft either way.
 - `InventoryReservationSourceType` gains `'checkout'` — additive per `BACKWARD_COMPATIBILITY.md` category 8 (Database Schema, additive-only); any exhaustive `switch` over the union needs a new branch, a compile-time failure caught by `yarn typecheck`, documented in `UPGRADE_NOTES.md`.
 - New ACL features (`availability.policies.view/.manage`, `availability.check`) are additive; `setup.ts` MUST declare `defaultRoleFeatures` for `admin`/`employee` so existing tenants receive them via `yarn mercato auth sync-role-acls`, not only new tenants via `onTenantCreated`.
 - No consumer (`catalog`, `sales`, `wms`) gets a hard `requires: ['availability']` — `availability` remains fully ejectable, matching `wms`'s own `ejectable: true` precedent. `wms`'s optional dependency on `availability`'s policy resolution is soft (`tryResolve`), never a hard `requires`.
@@ -525,6 +602,11 @@ Ops/support keep abandoned holds from locking up stock.
 
 ### 2026-08-31 (story map)
 - Added §17 User Story Map to support the `om-mockup-prototype` backend click-through: 4 epics, 9 stories, UX acceptance criteria (empty/permission/error/optimistic-lock/keyboard/default-value states applied only where genuinely applicable — Epics C/D are internal service-contract journeys, not end-user screens). No scope change.
+
+### 2026-09-06
+- **The 2026-08-17 deferral pointed at a section that does not exist in this repository.** `.ai/specs/2026-04-15-wms-roadmap.md` is present and carries no "Cross-Module Availability Contract" section; `packages/shared/src/lib/availability/` does not exist; and §4.1's `AvailabilityItemQuery` / `AvailabilityItemResult` were named but defined nowhere, leaving the module's central contract unreachable and Phase 1 unimplementable. Added a "Status of the deferral" note stating this plainly, and **§4.1a**, which writes out the base contract from what this document already specified across §3.2, §4.1, §4.2 and §6 plus the four changes the reconciliation itself agreed — a transcription of the agreed design, not a competing one. The upstream section still wins if it lands; until then §4.1a is what Phase 1 builds against, so the phase is not blocked on a document that may never arrive.
+- §13 Phase 1's deliverable list still named a `contract.ts` inside this module and a fallback owned by it — both relocated to `packages/shared` by the 2026-08-17 reconciliation, and neither present in §3.1's own module tree. Split into the two real deliverables with their actual homes.
+- §15 updated to match.
 
 ### 2026-08-17
 - Reconciled with the independently-approved `wms-roadmap.md` rev 10/11 design for the same contract, found by a joint `/om-pre-implement-spec` audit (see Reconciliation note at the top of this document). Base contract, registry, and catalog-only fallback move to `packages/shared`; this module is re-scoped to `AvailabilityPolicy` + the reservation lifecycle; `AvailabilityItemRef.productId`/`.variantId` renamed to `catalogProductId`/`catalogVariantId`; `reserve`/`release`/`commit` specified as undoable commands wrapping `wms`'s existing reservation commands; added §15 Migration & Backward Compatibility (previously missing).

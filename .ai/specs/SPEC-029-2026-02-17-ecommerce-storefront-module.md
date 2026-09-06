@@ -2,14 +2,14 @@
 
 | Field | Value |
 |-------|-------|
-| **Status** | Specification (v4.1 — rescoped, pre-implementation fixes) |
+| **Status** | Specification (v4.2 — rescoped, pre-implementation fixes, sibling amendments applied) |
 | **Created** | 2026-02-17 |
 | **Rescoped** | 2026-08-14 |
 | **Pre-implementation fixes** | 2026-08-17 — see §21 |
 | **Suite** | [Ecommerce Suite Roadmap](./2026-08-14-ecommerce-suite-roadmap.md) — spec 3, Phase 1 |
 | **Modules** | `ecommerce` (new) |
 | **Related Issues** | #289, #288 |
-| **Depends on** | [Customer Groups & B2B Terms](./2026-08-14-customer-groups-and-b2b-terms.md) |
+| **Depends on** | [Customer Groups & B2B Terms](./2026-08-14-customer-groups-and-b2b-terms.md), [Buyer-Scoped Catalog Visibility](./2026-08-21-buyer-scoped-catalog-visibility.md) |
 
 > **v4 rescope notice.** Versions 1–3 of this document specified a backend module, a public catalog API, a checkout state machine and a complete Next.js application in one spec. That scope is now split across the ecommerce suite. This document retains **only the `ecommerce` module**: store definition, hostname binding, channel binding, buyer-context resolution, branding and admin surface. See §14 for what moved where, and §15 for what was withdrawn outright.
 
@@ -95,13 +95,16 @@ GET https://firda.pl/products/czerwona-sukienka
   ├─ 4. EcommerceStore by id, status = 'active'
   │
   ├─ 5. EcommerceStoreChannelBinding, isDefault = true
-  │        → salesChannelId, priceKindId, assortmentScope
+  │        → salesChannelId, priceKindId, assortmentScope, requireAuthentication
   │
   ├─ 6. Buyer identity (optional portal session cookie)
   │        customer_accounts: CustomerUser → customers: CustomerEntity
   │        customer_groups: resolveGroups() → groupIds
-  │        customer_groups: resolveTerms()  → priceKind override,
-  │                                            assortment scope, credit flags
+  │        customer_groups: resolveTerms()  → priceKind override, credit flags
+  │        assortment: requireAuthentication && !authenticated
+  │                      ? [] (deny-all; customer_groups NOT called)
+  │                      : customer_groups.resolveAssortmentScope() → OR-list
+  │                    then intersectScopes(channel.assortmentScope, groupScope)
   │        catalog: CatalogPriceKind.displayMode of the resolved priceKindId
   │                 (group override, else channel default) → taxMode
   │                 ('excluding-tax' → 'net', 'including-tax' → 'gross') — §6.1a
@@ -210,10 +213,15 @@ Constraints: unique `(domain_mapping_id, path_prefix)` among non-deleted rows �
 | `store_id` | uuid | FK → `ecommerce_stores` |
 | `sales_channel_id` | uuid | `sales.SalesChannel.id` |
 | `price_kind_id` | uuid, nullable | `catalog.CatalogPriceKind.id`; anonymous default |
-| `assortment_scope` | jsonb, nullable | `{ categoryIds?, tagIds?, excludeProductIds? }` |
+| `assortment_scope` | jsonb, nullable | `AssortmentScope \| null` — `{ categoryIds?, tagIds?, excludeProductIds?, excludeCategoryIds?, excludeTagIds? }`, the shared type from `packages/shared/src/lib/catalog-visibility/`. `excludeCategoryIds`/`excludeTagIds` added 2026-09-06 |
+| `require_authentication` | boolean | **New 2026-09-06.** Default `false`. When `true` and the request has no authenticated buyer, `storeContextService.resolve()` short-circuits `buyer.assortmentScope` to `[]` — see below |
 | `is_default` | boolean | One per store |
 
 `assortment_scope` uses the same shape as `CustomerGroupTerms.assortment_scope`. When both are present they **intersect**: the buyer sees products allowed by the channel *and* by their group. Resolving Open Question 4 of the roadmap — channel scope is the store's assortment, group scope narrows it further for that buyer, and neither can widen the other.
+
+The intersection is computed by `intersectScopes(channelScope, buyerScope)` from `packages/shared/src/lib/catalog-visibility/`, not by ad hoc prose: a buyer's group-side scope is an **OR-list of AND-scopes**, one branch per contributing group ([Buyer-Scoped Catalog Visibility](./2026-08-21-buyer-scoped-catalog-visibility.md) §3.1, §3.3), so intersecting it with the channel's single scope distributes across the branches. Merging the arrays instead would compute a stronger, different condition.
+
+`require_authentication` exists because the alternative — configuring the anonymous/default group's scope defensively and hoping no code path bypasses it — is an indirect trick where BigCommerce and Shopify both ship an explicit switch. It gates **catalog visibility only**, not the whole storefront: branding, static pages and the login page itself are unaffected, and a full site-wide access wall is a `customer_accounts` portal-auth feature, out of scope here. `[]` is an ordinary value of `EffectiveAssortmentScope` meaning "matches nothing" (the vacuous OR), so it composes through `intersectScopes` and `matchesScope` with no special-casing downstream in `cart` or the public API.
 
 ---
 
@@ -232,7 +240,7 @@ export type BuyerContext = {
   priceKindId: string | null        // group terms override the channel default
   allowPurchaseOnAccount: boolean
   approvalRequiredAbove: number | null
-  assortmentScope: AssortmentScope | null   // channel ∩ group
+  assortmentScope: EffectiveAssortmentScope   // intersectScopes(channel, group union); null = unrestricted, [] = deny-all
 }
 
 export type StoreContext = {
@@ -719,6 +727,15 @@ Open:
 ---
 
 ## 21) Changelog
+
+### 2026-09-06 — v4.2 (sibling amendments applied)
+
+Applied the amendments [Buyer-Scoped Catalog Visibility](./2026-08-21-buyer-scoped-catalog-visibility.md) §0 records against this document, rather than leaving them pending in a sibling file that ships in the same change.
+
+- §5.3 `EcommerceStoreChannelBinding.assortment_scope` retyped to the shared `AssortmentScope` from `packages/shared/src/lib/catalog-visibility/`, gaining `excludeCategoryIds` / `excludeTagIds` (additive jsonb keys, no migration change).
+- §5.3 gains **`require_authentication: boolean`**, default `false` — the explicit login-required-to-view switch for an invitation-only B2B channel. Governs catalog visibility only, never the whole storefront.
+- §4.1 step 6 and §6 `BuyerContext.assortmentScope`: the channel ∩ group intersection is now computed by the shared `intersectScopes()` over an `EffectiveAssortmentScope` (an OR-list of AND-scopes) rather than described as prose intersection, and the `require_authentication` short-circuit resolves to `[]` **without calling `customer_groups` at all**. `null` = unrestricted, `[]` = deny-all; both are ordinary values of the shared type, needing no sentinel.
+- `assortmentScopeHash` (§6.1's digest) is unchanged — this supplies a correctly-computed value for the slot that already existed, and adds no new cache-key dimension.
 
 ### 2026-08-17 — v4.1 (pre-implementation fixes)
 
