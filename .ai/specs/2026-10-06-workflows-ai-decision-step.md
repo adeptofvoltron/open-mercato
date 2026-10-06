@@ -109,8 +109,9 @@ The step writes the decision into context together with the engine-owned outcome
    - `timeout` / `aborted` → `timeout`;
    - `payload_too_large` → `input_too_large`;
    - `invalid_response` → `invalid_output`;
-   - `auth` / `insufficient_credits` / `rate_limited` / `provider_error` / `invalid_request` → `provider_error`, with the port code kept in `providerErrorCode`.
-7. With a result: if `minProbability` is set and `probabilities[value] < minProbability` → fallback `low_confidence`, with `chosenOutcome = value`. If the chosen key has no wired transition → fallback `outcome_unwired`. Otherwise the outcome is `value`.
+   - `auth` / `insufficient_credits` / `rate_limited` / `provider_error` / `invalid_request` → `provider_error`, with the port code kept in `providerErrorCode`;
+   - **any other or future code** → `provider_error` (default branch: the port's error union is open).
+7. With a result, convert the port's ordered `probabilities` array into the envelope map (author keys are never integer-like, so the map keeps key order). If `minProbability` is set and the chosen key's probability `< minProbability` → fallback `low_confidence`, with `chosenOutcome = value`. If the chosen key has no wired transition → fallback `outcome_unwired`. Otherwise the outcome is `value`.
 
 **Step handler: `lib/step-handler.ts`, next to the `INVOKE_AGENT` branch (`:731-790`; today only that branch merges a `contextPatch`, `:783`).** When the step's activity is `AI_DECISION`:
 - merge the envelope into `instance.context[activityName]`;
@@ -240,7 +241,7 @@ Activity-level fields:
 ### `GET /api/workflows/ai-decision/availability` (new, Phase 2)
 
 - `metadata: { GET: { requireAuth: true, requireFeatures: ['workflows.definitions.view'] } }`, with `openApi` exported.
-- Response: `{ available: boolean, reason?: 'ai_assistant_missing' | 'not_configured' | 'unknown_provider' | 'fixture_in_production', provider?: string, model?: string }`.
+- Response: `{ available: boolean, reason?: 'ai_assistant_missing' | 'not_configured' | 'unknown_provider' | 'credentials_missing' | 'model_missing' | 'fixture_disabled', provider?: string, model?: string }`.
 - Implementation: a soft DI resolve of `decisionModelService`, then `getAvailability({ moduleId: 'workflows' })`. Not cached: an in-process env read.
 
 ### ACL (`acl.ts`, additive)
@@ -421,10 +422,10 @@ Phase 1 requires the decision model port to be merged. Phase 2 depends on Phase 
 5. **Outcome routing generalization.** `resolveStepOutcomeVocabulary`, refactor of the vocabulary-bound functions, route-kinds coercion made vocabulary-aware, and edge-reattachment node types. *Test:* the existing suites pass unchanged, plus new AI-decision routing tests and a definition → graph → definition round trip that keeps author keys.
 6. **Rerun reuse and override.** The `rerun` field threading, reuse logic pinned to the definition, `decisionOverride` on the rerun route (validation, `STEP_RERUN` audit, `openApi`), `__agentOutcome` added to `RESERVED_WORKFLOW_CONTEXT_KEYS`, and the `findReservedContextKeys` check on `contextPatch`. *Test:* route unit tests cover valid and invalid overrides and reserved-key rejection; executor tests cover reuse vs re-ask.
 7. **Output contract and ledger.** The `outputContract` resolver, a `stepContributions` branch and a new `LedgerSourceKind`, so later steps see `<activityName>.outcome|probability|source|reason`. *Test:* context-ledger unit tests.
-8. **Integration tests (API).** These run against the integration app with `OM_DECISION_PROVIDER=fixture` / `OM_DECISION_MODEL=fixture` (the port's non-production adapter). ⚠ Adding these env vars to the integration test environment is a CI configuration change, which needs maintainer approval.
+8. **Integration tests (API).** These run against the integration app with `OM_DECISION_FIXTURE_ENABLED=1`, `OM_DECISION_PROVIDER=fixture` and `OM_DECISION_MODEL=fixture` (the port's double opt-in, non-production adapter). ⚠ Adding these env vars to the integration test environment is a CI configuration change, which needs maintainer approval.
     - **TC-WF-063** [P1] (API): saving a definition with unwired fallback → 400 `AI_DECISION_FALLBACK_UNWIRED`; a valid one saves.
     - **TC-WF-064** [P1] (API): a run whose state contains `complaint` routes to the `complaint` transition; the envelope has `source: 'model'`; `AI_DECISION_MADE` and `OUTCOME_ROUTED` are logged.
-    - **TC-WF-065** [P1] (API): a run whose state matches no key with `minProbability: 0.8` takes fallback `low_confidence` (the fixture returns p = 0.5).
+    - **TC-WF-065** [P1] (API): a run whose state matches no key with `minProbability: 0.8` takes fallback `low_confidence` (the fixture returns a uniform distribution, p ≈ 0.33 for 3 outcomes).
     - **TC-WF-066** [P1] (API): rerun-step with `decisionOverride` routes to the chosen outcome (`source: 'override'`); an invalid override and a reserved `contextPatch` key each return 400.
     - **TC-WF-067** [P2] (API): a dry run takes fallback `simulated`.
 
@@ -483,7 +484,7 @@ Phase 1 requires the decision model port to be merged. Phase 2 depends on Phase 
 | root | No hard-coded user-facing strings | Compliant | i18n key plan |
 | root | Design system tokens only; dialog shortcuts | Compliant | `StatusBadge`; rerun dialog unchanged shortcuts |
 | root | Optimistic locking on new user-editable entities | N/A | No new entity |
-| root | Ask before changing pipeline / QA flow | **Flagged** | The integration env needs `OM_DECISION_*=fixture` (Phase 1 step 8) |
+| root | Ask before changing pipeline / QA flow | **Flagged** | The integration env needs `OM_DECISION_FIXTURE_ENABLED=1` + `OM_DECISION_*=fixture` (Phase 1 step 8) |
 | core → Cross-Module Coupling | Soft-optional resolve for optional peers | Compliant | DI resolve in try/catch → `unavailable` |
 | core → API Routes | `metadata` + `openApi` | Compliant | Availability route; rerun route updated |
 | core → Encryption | Sensitive fields via encryption maps | Compliant (no new columns) | Context plaintext residual documented (R4) |
