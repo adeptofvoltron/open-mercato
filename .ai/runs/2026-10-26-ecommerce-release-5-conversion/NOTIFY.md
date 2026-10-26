@@ -166,3 +166,12 @@
   before Phase 6. TC-CGRP-032's ledger rows are inserted through `pg` with plaintext notes (no
   ledger-writing route exists until Step 1.12), so ciphertext decryption on that route is first
   exercised end to end once `/adjust` writes notes through the ORM.
+
+## 2026-10-26T17:30:00Z — dispatcher: Step 1.11 rescue landed; one item deferred, not gap-filled
+- Step 1.11's rescue executor flagged the US-E2 "orphan banner" (customers whose resolved terms
+  allow purchase-on-account but have no credit account in the terms currency) as unbuilt. Unlike
+  the 1.11/1.12 provisioning gaps, nothing in Phases 2-6 depends on this banner existing — it is
+  an admin-UX nicety, not a functional blocker for on-account checkout (which only needs the
+  create route, now shipped, and `checkCredit`'s `no_account` refusal path, already correct).
+  Deferred to Phase 6 polish rather than appending a dedicated Step now; revisit only if the final
+  integration-coverage pass (Step 6.1) finds a spec test case that actually requires it.
