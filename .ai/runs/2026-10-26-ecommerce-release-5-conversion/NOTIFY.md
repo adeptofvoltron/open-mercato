@@ -480,3 +480,14 @@
   jest suite: 38/40 suites pass (428 tests; 2 suites skipped — 1 pg-gated suite intentionally run
   separately above then re-skipped by default, 1 pre-existing unrelated DB-dependent skip from
   Step 2.4), zero regressions. No UI touched — no browser verification needed.
+
+## 2026-10-26T20:30:00Z — dispatcher: tracked follow-up from Step 2.5
+- Step 2.5 found and fixed that `resolveTerms` never resolved `approvalPolicy` (added in Step 1.5
+  but never wired in). It fixed only that one field (needed for its own Step). `termsCurrencyCode`,
+  `allowQuoteRequests`, `requiresPoNumber` are STILL unresolved by `resolveTerms` as of `5db46425d1`.
+  Flagging for the Steps that need each one, so they check and fix `resolveTerms` rather than
+  re-deriving the value some other way:
+  - `termsCurrencyCode` — needed by Step 3.1 (cart approval gate, K1/D-R5-4 currency-match rule)
+    and by checkout's `min_order_value` check (Step 5.1).
+  - `allowQuoteRequests` — needed by checkout B.5 (Step 5.1, D-R5-20 request_quote method gating).
+  - `requiresPoNumber` — needed by checkout B.5 (Step 5.1, D-R5-28 PO-on-quote).
