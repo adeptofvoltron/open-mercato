@@ -43,3 +43,12 @@
 - Verified `customerCreditService.ts` (Step 1.6) never reads `hold_reason`/`note` back for business
   logic — only writes them — so no encryption-driven bug fix was needed there; added a doc comment
   only, no logic change.
+
+## 2026-10-26T13:30:00Z — dispatcher: appended Step 1.11 to close a real gap
+- Step 1.7's executor correctly scoped out account creation (not in its bullet list) but flagged
+  that without ANY provisioning route, `CustomerCreditAccount` can never be created (G13/D-R5-5
+  says "operator only", which presupposes an operator-facing create route exists). Left unfixed,
+  this blocks checkout B.4/B.5's on-account path (Phase 4/5) at the end of the release, far from
+  where the gap was introduced. Appended Step 1.11 (admin-create + ledger-listing routes) to the
+  end of Phase 1 rather than stopping the run — a same-module, additive, low-risk fix with an
+  unambiguous spec basis (G13/D-R5-5), not a scope change requiring the owner.

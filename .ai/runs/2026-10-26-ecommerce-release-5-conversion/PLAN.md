@@ -28,6 +28,7 @@
 | 1 | 1.8 | customer_groups: credit notifications + exposure-audit job + cancel-release subscriber (D-R5-2/G15/G21) | dispatch:standard | todo | — |
 | 1 | 1.9 | promotions: `revertCodeUse` + `sales.order.cancelled` subscriber (C5) | dispatch:standard | todo | — |
 | 1 | 1.10 | promotions: un-hide `delivery_method` rule + `DELIVERY_DISCOUNT` effect (D-R5-17) | dispatch:standard | todo | — |
+| 1 | 1.11 | customer_groups: admin credit-account provisioning route + ledger-listing read route (G13/D-R5-5 gap-fill) | dispatch:standard | todo | — |
 | 2 | 2.1 | availability: `AvailabilityReservation` entity + migration (A3) | dispatch:standard | todo | — |
 | 2 | 2.2 | availability: reserve/release/commit via `wmsReservationService`, CAS, per-line outcomes, allocation (A6/A7/A14/A15) | dispatch:standard | todo | — |
 | 2 | 2.3 | availability: expiry job + reconciliation job + events (A11/A12/A13) | dispatch:standard | todo | — |
@@ -171,6 +172,15 @@ re-paste them.
   SPEC-055.
 - **1.10** `promotions`: un-hide `delivery_method` rule + `DELIVERY_DISCOUNT` effect (D-R5-17,
   amending D-R4-14) — authorable once checkout exists as the evaluation source.
+- **1.11** `customer_groups`: gap-fill appended after Step 1.7 landed without it. G13/D-R5-5
+  ("Credit accounts are created by an operator only") requires an actual admin provisioning
+  route — without one, no `CustomerCreditAccount` can ever exist and the whole credit feature
+  (and checkout B.4/B.5's on-account path, Phase 4/5) is unreachable. Add: `POST
+  /api/customer_groups/customer-groups/credit-accounts` (admin-create, `customer_groups.credit.manage`,
+  `.strict()` body, `default_credit_limit` pre-fill semantics per D-R5-5) and a ledger-listing read
+  route (`GET .../credit-accounts/:id/ledger`, `customer_groups.credit.view`, decrypted `note`,
+  paginated) so the admin UI (1.7's widget) can show ledger history. No notification/job change —
+  that's 1.8's own scope.
 
 ### Phase 2 — wave 2 (depends on wave 1)
 
