@@ -59,6 +59,22 @@ export const customerGroupKindSchema = z.enum(customerGroupKindValues)
 export const customerGroupMembershipSourceValues = ['manual', 'import', 'rule', 'onboarding'] as const
 export const customerGroupMembershipSourceSchema = z.enum(customerGroupMembershipSourceValues)
 
+// Release 5 (D-R5-1): no `either` value — see `CustomerGroupTerms.approvalPolicy`.
+export const customerGroupApprovalPolicyValues = ['buyer', 'merchant', 'both'] as const
+export const customerGroupApprovalPolicySchema = z.enum(customerGroupApprovalPolicyValues)
+
+// Release 5 Phase 3 (§5.5) — kept alongside the entity's own TS unions in
+// `data/entities.ts` for the service layer (Step 1.6) and any future admin form to parse
+// against.
+export const customerCreditLedgerEntryTypeValues = ['reserve', 'release', 'settle', 'adjust'] as const
+export const customerCreditLedgerEntryTypeSchema = z.enum(customerCreditLedgerEntryTypeValues)
+
+export const customerCreditLedgerSourceTypeValues = ['checkout', 'order', 'invoice', 'payment', 'manual'] as const
+export const customerCreditLedgerSourceTypeSchema = z.enum(customerCreditLedgerSourceTypeValues)
+
+export const customerCreditLedgerActorTypeValues = ['staff_user', 'system'] as const
+export const customerCreditLedgerActorTypeSchema = z.enum(customerCreditLedgerActorTypeValues)
+
 // Default-free field set shared by the create and update schemas. Zod v4's `.partial()`
 // keeps an inner `.default()`, so deriving the update schema from the create schema
 // injected `isDefault: false` / `isActive: true` into every partial update and silently
@@ -223,6 +239,14 @@ const customerGroupTermsBaseShape = {
   creditCurrencyCode: currencyCodeSchema,
   approvalRequiredAbove: clearableNonNegativeNumberSchema,
   minOrderValue: clearableNonNegativeNumberSchema,
+  // Release 5 (D-R5-4): same clearable-string shape as `creditCurrencyCode` above —
+  // `null`/blank means "not set on this group, inherit."
+  termsCurrencyCode: currencyCodeSchema,
+  // Release 5 (D-R5-1): nullable to inherit, same shape as `allowPurchaseOnAccount`.
+  approvalPolicy: customerGroupApprovalPolicySchema.nullable().optional(),
+  // Release 5 (D-R5-20/D-R5-28): nullable booleans, same shape as `allowPurchaseOnAccount`.
+  allowQuoteRequests: z.boolean().nullable().optional(),
+  requiresPoNumber: z.boolean().nullable().optional(),
   assortmentScope: assortmentScopeSchema.optional(),
   metadata: clearableMetadataSchema,
 }
@@ -244,3 +268,61 @@ export const customerGroupTermsDeleteSchema = z.object({
 })
 
 export type CustomerGroupTermsDeleteInput = z.infer<typeof customerGroupTermsDeleteSchema>
+
+// Release 5 Phase 3 (§5.4): entity-shape validators for `CustomerCreditAccount`. The
+// admin create/edit routes and `CrudForm` wiring are Step 1.7's job — these exist now so
+// the entity itself has a validated input shape, matching this module's convention of a
+// create/update/delete trio per entity.
+const creditAccountHoldReasonRequiredWhenOnHold = (payload: {
+  isOnHold?: boolean
+  holdReason?: string | null
+}) => !payload.isOnHold || !!payload.holdReason
+
+const customerCreditAccountCreateBaseSchema = z.object({
+  organizationId: uuid(),
+  tenantId: uuid(),
+  customerId: uuid(),
+  currencyCode: z.string().trim().min(1).max(4),
+  creditLimit: z.coerce.number().min(0).max(NUMERIC_16_2_MAX),
+  isOnHold: z.boolean().optional().default(false),
+  // Spec §5.4: "Required when is_on_hold = true (validator)."
+  holdReason: clearableStringSchema(2000),
+  updatedByUserId: clearableUuidSchema,
+})
+
+export const customerCreditAccountCreateSchema = customerCreditAccountCreateBaseSchema.refine(
+  creditAccountHoldReasonRequiredWhenOnHold,
+  { message: 'holdReason is required when isOnHold is true', path: ['holdReason'] },
+)
+
+export type CustomerCreditAccountCreateInput = z.infer<typeof customerCreditAccountCreateSchema>
+
+const customerCreditAccountUpdateBaseSchema = z
+  .object({
+    id: uuid(),
+  })
+  .merge(
+    z.object({
+      organizationId: uuid().optional(),
+      tenantId: uuid().optional(),
+      customerId: uuid().optional(),
+      currencyCode: z.string().trim().min(1).max(4).optional(),
+      creditLimit: z.coerce.number().min(0).max(NUMERIC_16_2_MAX).optional(),
+      isOnHold: z.boolean().optional(),
+      holdReason: clearableStringSchema(2000),
+      updatedByUserId: clearableUuidSchema,
+    }),
+  )
+
+export const customerCreditAccountUpdateSchema = customerCreditAccountUpdateBaseSchema.refine(
+  creditAccountHoldReasonRequiredWhenOnHold,
+  { message: 'holdReason is required when isOnHold is true', path: ['holdReason'] },
+)
+
+export type CustomerCreditAccountUpdateInput = z.infer<typeof customerCreditAccountUpdateSchema>
+
+export const customerCreditAccountDeleteSchema = z.object({
+  id: uuid(),
+})
+
+export type CustomerCreditAccountDeleteInput = z.infer<typeof customerCreditAccountDeleteSchema>

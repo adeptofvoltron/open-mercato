@@ -22,7 +22,7 @@
 | 1 | 1.2 | ecommerce: `storeContextService.resolveForBuyer` (D-R5-22, SPEC-029) | dispatch:standard | done | 8ceb5e42ce |
 | 1 | 1.3 | wms: extract `wmsReservationService` (A1) | dispatch:standard | done | pending |
 | 1 | 1.4 | availability: Phase 2 alignment — shared sellable builder (A2) | dispatch:standard | done | pending |
-| 1 | 1.5 | customer_groups: credit entities + migration + new `CustomerGroupTerms` columns | dispatch:standard | todo | — |
+| 1 | 1.5 | customer_groups: credit entities + migration + new `CustomerGroupTerms` columns | dispatch:standard | done | pending |
 | 1 | 1.6 | customer_groups: credit service, row-lock reserve/release/settle + N=20 test (G1/G2/G12/G14) | dispatch:standard | todo | — |
 | 1 | 1.7 | customer_groups: credit admin API + UI + ACL + encryption.ts (G13/G16/G22) | dispatch:standard | todo | — |
 | 1 | 1.8 | customer_groups: credit notifications + exposure-audit job + cancel-release subscriber (D-R5-2/G15/G21) | dispatch:standard | todo | — |
