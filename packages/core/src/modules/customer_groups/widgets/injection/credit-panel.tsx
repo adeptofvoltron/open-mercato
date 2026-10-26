@@ -1,9 +1,9 @@
 "use client"
 
 import * as React from 'react'
-import { CreditCard, History, Pencil, Plus } from 'lucide-react'
+import { CreditCard, History, Pencil, Plus, Receipt } from 'lucide-react'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
-import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
+import { apiCall, apiCallOrThrow } from '@open-mercato/ui/backend/utils/apiCall'
 import { createCrud, updateCrud } from '@open-mercato/ui/backend/utils/crud'
 import { createCrudFormError } from '@open-mercato/ui/backend/utils/serverErrors'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
@@ -21,6 +21,8 @@ import type { InjectionWidgetComponentProps } from '@open-mercato/shared/modules
 
 const CREDIT_PANEL_RESOURCE_KINDS = new Set(['customers.person', 'customers.company'])
 const CREDIT_MANAGE_FEATURE = 'customer_groups.credit.manage'
+const CREDIT_ADJUST_FEATURE = 'customer_groups.credit.adjust'
+const CREDIT_AMOUNT_PATTERN = /^-?\d{1,14}(\.\d{1,2})?$/
 
 type CreditPanelContext = {
   resourceKind: string
@@ -85,6 +87,11 @@ type CreditAccountFormValues = {
   creditLimit: number
   isOnHold: boolean
   holdReason: string
+}
+
+type CreditAdjustFormValues = {
+  amount: string
+  note: string
 }
 
 const HOLD_STATUS_BADGE_VARIANTS: StatusMap<'onHold' | 'active'> = {
@@ -274,11 +281,15 @@ function CreditLedgerList({ accountId }: { accountId: string }) {
 function CreditAccountRowItem({
   row,
   canManage,
+  canAdjust,
   onEdit,
+  onAdjust,
 }: {
   row: CreditAccountRow
   canManage: boolean
+  canAdjust: boolean
   onEdit: (row: CreditAccountRow) => void
+  onAdjust: (row: CreditAccountRow) => void
 }) {
   const t = useT()
   const [ledgerOpen, setLedgerOpen] = React.useState(false)
@@ -331,6 +342,17 @@ function CreditAccountRowItem({
           >
             <History className="size-4" aria-hidden />
           </IconButton>
+          {canAdjust ? (
+            <IconButton
+              type="button"
+              variant="ghost"
+              size="xs"
+              aria-label={t('customer_groups.groups.creditTab.adjust', 'Adjust')}
+              onClick={() => onAdjust(row)}
+            >
+              <Receipt className="size-4" aria-hidden />
+            </IconButton>
+          ) : null}
           {canManage ? (
             <IconButton
               type="button"
@@ -357,14 +379,18 @@ export function CreditPanelWidget({ context }: InjectionWidgetComponentProps<unk
   const t = useT()
   const { payload: backendChromePayload, isReady: backendChromeReady } = useBackendChrome()
   const canManage = backendChromeReady && hasFeature(backendChromePayload?.grantedFeatures, CREDIT_MANAGE_FEATURE)
+  const canAdjust = backendChromeReady && hasFeature(backendChromePayload?.grantedFeatures, CREDIT_ADJUST_FEATURE)
   const editDialogContentRef = React.useRef<HTMLDivElement | null>(null)
   const createDialogContentRef = React.useRef<HTMLDivElement | null>(null)
+  const adjustDialogContentRef = React.useRef<HTMLDivElement | null>(null)
   const [createOpen, setCreateOpen] = React.useState(false)
   const [accounts, setAccounts] = React.useState<CreditAccountRow[]>([])
   const [loading, setLoading] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
   const [editingAccount, setEditingAccount] = React.useState<CreditAccountRow | null>(null)
+  const [adjustingAccount, setAdjustingAccount] = React.useState<CreditAccountRow | null>(null)
   const [formInstanceKey, setFormInstanceKey] = React.useState(0)
+  const [adjustFormInstanceKey, setAdjustFormInstanceKey] = React.useState(0)
 
   const customerId = isValidContext(context) ? context.resourceId : null
 
@@ -397,6 +423,10 @@ export function CreditPanelWidget({ context }: InjectionWidgetComponentProps<unk
   React.useEffect(() => {
     if (editingAccount) setFormInstanceKey((current) => current + 1)
   }, [editingAccount])
+
+  React.useEffect(() => {
+    if (adjustingAccount) setAdjustFormInstanceKey((current) => current + 1)
+  }, [adjustingAccount])
 
   const editFields = React.useMemo<CrudField[]>(
     () => [
@@ -476,6 +506,82 @@ export function CreditPanelWidget({ context }: InjectionWidgetComponentProps<unk
   const handleEditDialogKeyDown = useDialogKeyHandler({
     onConfirm: submitEditForm,
     onCancel: closeEditDialog,
+  })
+
+  // Step 1.12 (D-R5-2/G20, §6.5/§9): the operator-facing half of hybrid settlement — a
+  // signed, non-zero correction with a required note, posted through the
+  // `customer_groups.credit.adjust` command route rather than `CrudForm`'s usual
+  // `createCrud`/`updateCrud` helpers (this is not a CRUD write on the account entity
+  // itself, it appends a ledger entry). Gated separately from `canManage` (`credit.adjust`
+  // is its own ACL feature, §9.1) — a role can edit limits without being allowed to move
+  // the balance, or vice versa.
+  const adjustFields = React.useMemo<CrudField[]>(
+    () => [
+      {
+        id: 'amount',
+        label: t('customer_groups.groups.creditTab.field.amount', 'Amount'),
+        type: 'text',
+        required: true,
+        description: t(
+          'customer_groups.groups.creditTab.field.amountHelp',
+          'Positive increases exposure, negative lowers it (e.g. a payment received).',
+        ),
+      },
+      {
+        id: 'note',
+        label: t('customer_groups.groups.creditTab.field.note', 'Note'),
+        type: 'textarea',
+        rows: 2,
+        maxLength: 2000,
+        required: true,
+      },
+    ],
+    [t],
+  )
+
+  const closeAdjustDialog = React.useCallback(() => setAdjustingAccount(null), [])
+
+  const handleAdjustSubmit = React.useCallback(
+    async (values: CreditAdjustFormValues) => {
+      if (!adjustingAccount) return
+      const amount = typeof values.amount === 'string' ? values.amount.trim() : ''
+      if (!CREDIT_AMOUNT_PATTERN.test(amount) || Number(amount) === 0) {
+        const message = t(
+          'customer_groups.groups.creditTab.errors.amountInvalid',
+          'Enter a signed amount with up to 2 decimal places (not zero).',
+        )
+        throw createCrudFormError(message, { amount: message })
+      }
+      const note = typeof values.note === 'string' ? values.note.trim() : ''
+      if (!note) {
+        const message = t('customer_groups.groups.creditTab.errors.noteRequired', 'A note is required for every adjustment.')
+        throw createCrudFormError(message, { note: message })
+      }
+      await apiCallOrThrow(
+        `/api/customer_groups/customer-groups/credit-accounts/${encodeURIComponent(adjustingAccount.id)}/adjust`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ amount, note }),
+        },
+        {
+          errorMessage: t('customer_groups.groups.creditTab.errors.adjustFailed', 'Failed to post the adjustment.'),
+        },
+      )
+      setAdjustingAccount(null)
+      flash(t('customer_groups.groups.creditTab.adjusted', 'Adjustment posted.'), 'success')
+      await load()
+    },
+    [adjustingAccount, load, t],
+  )
+
+  const submitAdjustForm = React.useCallback(
+    () => adjustDialogContentRef.current?.querySelector('form')?.requestSubmit(),
+    [],
+  )
+  const handleAdjustDialogKeyDown = useDialogKeyHandler({
+    onConfirm: submitAdjustForm,
+    onCancel: closeAdjustDialog,
   })
 
   const createFields = React.useMemo<CrudField[]>(
@@ -565,7 +671,14 @@ export function CreditPanelWidget({ context }: InjectionWidgetComponentProps<unk
       ) : (
         <ul className="space-y-2" aria-label={t('customer_groups.groups.creditTab.listLabel', 'Credit accounts')}>
           {accounts.map((row) => (
-            <CreditAccountRowItem key={row.id} row={row} canManage={canManage} onEdit={setEditingAccount} />
+            <CreditAccountRowItem
+              key={row.id}
+              row={row}
+              canManage={canManage}
+              canAdjust={canAdjust}
+              onEdit={setEditingAccount}
+              onAdjust={setAdjustingAccount}
+            />
           ))}
         </ul>
       )}
@@ -611,6 +724,29 @@ export function CreditPanelWidget({ context }: InjectionWidgetComponentProps<unk
             submitLabel={t('customer_groups.groups.creditTab.editDialog.submit', 'Save')}
             onSubmit={handleEditSubmit}
           />
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={adjustingAccount != null}
+        onOpenChange={(next) => {
+          if (!next) setAdjustingAccount(null)
+        }}
+      >
+        <DialogContent ref={adjustDialogContentRef} onKeyDown={handleAdjustDialogKeyDown}>
+          <DialogHeader>
+            <DialogTitle>{t('customer_groups.groups.creditTab.adjustDialog.title', 'Post credit adjustment')}</DialogTitle>
+          </DialogHeader>
+          {adjustingAccount ? (
+            <CrudForm<CreditAdjustFormValues>
+              key={adjustFormInstanceKey}
+              embedded
+              fields={adjustFields}
+              initialValues={{ amount: '', note: '' }}
+              submitLabel={t('customer_groups.groups.creditTab.adjustDialog.submit', 'Post adjustment')}
+              onSubmit={handleAdjustSubmit}
+            />
+          ) : null}
         </DialogContent>
       </Dialog>
     </div>

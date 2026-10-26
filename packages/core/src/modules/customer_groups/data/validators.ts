@@ -362,3 +362,34 @@ export const customerCreditAccountDeleteSchema = z.object({
 })
 
 export type CustomerCreditAccountDeleteInput = z.infer<typeof customerCreditAccountDeleteSchema>
+
+// Release 5 Phase 3 (Step 1.12, §6.5/§9): `POST …/credit-accounts/:id/adjust`. Signed
+// decimal string, up to 14 integer digits and 2 fraction digits (the `numeric(16,2)`
+// ledger column), never zero (§5.5: "adjust ... Never zero") — a zero-amount correction
+// is not a correction. `note` is required (§5.5: "Required on `adjust`"), unlike every
+// other free-text column in this module.
+const adjustAmountNotZero = (payload: { amount: string }) => Number(payload.amount) !== 0
+
+const customerCreditAdjustBaseSchema = z.object({
+  amount: z
+    .string()
+    .trim()
+    .regex(/^-?\d{1,14}(\.\d{1,2})?$/, 'amount must be a signed decimal string with up to 2 fraction digits'),
+  note: z.string().trim().min(1).max(2000),
+})
+
+// The HTTP body (§9): `{ amount: string, note: string }`, `.strict()` so the account id
+// (URL) and the tenant/organization/actor (session) can never be smuggled through it.
+export const customerCreditAdjustRequestSchema = customerCreditAdjustBaseSchema
+  .strict()
+  .refine(adjustAmountNotZero, { message: 'amount must not be zero', path: ['amount'] })
+
+export type CustomerCreditAdjustRequest = z.infer<typeof customerCreditAdjustRequestSchema>
+
+// The command input (`customer_groups.credit.adjust`): the route-resolved account id
+// joins the validated body before the command handler ever sees it.
+export const customerCreditAdjustCommandSchema = customerCreditAdjustBaseSchema
+  .extend({ creditAccountId: uuid() })
+  .refine(adjustAmountNotZero, { message: 'amount must not be zero', path: ['amount'] })
+
+export type CustomerCreditAdjustCommandInput = z.infer<typeof customerCreditAdjustCommandSchema>

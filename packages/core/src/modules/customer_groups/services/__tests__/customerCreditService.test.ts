@@ -636,4 +636,193 @@ describe('customerCreditService', () => {
       expect(result.entry.amount).toBe('-20.00')
     })
   })
+
+  // Step 1.12 (D-R5-2/G20, §6.5/§9). The operator's only direct write path: a signed,
+  // non-zero correction that appends under the same account-row lock as every other
+  // write, whose own undo is this same method called again with a negated amount.
+  describe('adjustCredit', () => {
+    test('appends a positive adjustment and increases exposure', async () => {
+      const { em, tables } = createFakeEm()
+      const account = seedAccount(tables, { creditLimit: '500.00' })
+      const service = buildService(em, allowTerms(true))
+
+      const result = await service.adjustCredit({
+        scope: SCOPE,
+        buyer: { customerId: CUSTOMER_ID },
+        currencyCode: CURRENCY,
+        amount: '40.00',
+        note: 'Manual correction',
+        idempotencyKey: 'adjust-1',
+      })
+
+      expect(result.entry.entryType).toBe('adjust')
+      expect(result.entry.amount).toBe('40.00')
+      expect(result.entry.balanceAfter).toBe('40.00')
+      expect(result.entry.creditAccountId).toBe(account.id)
+      expect(result.entry.relatedEntryId).toBeNull()
+
+      const check = await service.checkCredit({
+        scope: SCOPE,
+        buyer: { customerId: CUSTOMER_ID },
+        currencyCode: CURRENCY,
+        amount: '0.00',
+      })
+      expect(check.exposure).toBe('40.00')
+    })
+
+    test('a negative adjustment lowers exposure (manual settlement, D-R5-2)', async () => {
+      const { em, tables } = createFakeEm()
+      seedAccount(tables, { creditLimit: '500.00' })
+      const service = buildService(em, allowTerms(true))
+
+      await service.adjustCredit({
+        scope: SCOPE,
+        buyer: { customerId: CUSTOMER_ID },
+        currencyCode: CURRENCY,
+        amount: '100.00',
+        note: 'Opening exposure',
+        idempotencyKey: 'adjust-open',
+      })
+      const settled = await service.adjustCredit({
+        scope: SCOPE,
+        buyer: { customerId: CUSTOMER_ID },
+        currencyCode: CURRENCY,
+        amount: '-60.00',
+        note: 'Payment received, settled manually',
+        idempotencyKey: 'adjust-settle',
+      })
+
+      expect(settled.entry.amount).toBe('-60.00')
+      expect(settled.entry.balanceAfter).toBe('40.00')
+      expect(tables.get(CustomerCreditLedgerEntry) ?? []).toHaveLength(2)
+    })
+
+    test('rejects a zero amount', async () => {
+      const { em, tables } = createFakeEm()
+      seedAccount(tables, { creditLimit: '500.00' })
+      const service = buildService(em, allowTerms(true))
+
+      await expect(
+        service.adjustCredit({
+          scope: SCOPE,
+          buyer: { customerId: CUSTOMER_ID },
+          currencyCode: CURRENCY,
+          amount: '0.00',
+          note: 'Should be rejected',
+          idempotencyKey: 'adjust-zero',
+        }),
+      ).rejects.toMatchObject({ code: 'invalid_amount' })
+      expect(tables.get(CustomerCreditLedgerEntry) ?? []).toHaveLength(0)
+    })
+
+    test('throws no_account when nothing matches the scope', async () => {
+      const { em } = createFakeEm()
+      const service = buildService(em, allowTerms(true))
+
+      await expect(
+        service.adjustCredit({
+          scope: SCOPE,
+          buyer: { customerId: CUSTOMER_ID },
+          currencyCode: CURRENCY,
+          amount: '10.00',
+          note: 'No account yet',
+          idempotencyKey: 'adjust-no-account',
+        }),
+      ).rejects.toMatchObject({ code: 'no_account' })
+    })
+
+    test('a replayed idempotency key returns the original entry without double-posting', async () => {
+      const { em, tables } = createFakeEm()
+      seedAccount(tables, { creditLimit: '500.00' })
+      const service = buildService(em, allowTerms(true))
+
+      const first = await service.adjustCredit({
+        scope: SCOPE,
+        buyer: { customerId: CUSTOMER_ID },
+        currencyCode: CURRENCY,
+        amount: '25.00',
+        note: 'First post',
+        idempotencyKey: 'adjust-replay',
+      })
+      const second = await service.adjustCredit({
+        scope: SCOPE,
+        buyer: { customerId: CUSTOMER_ID },
+        currencyCode: CURRENCY,
+        amount: '25.00',
+        note: 'First post',
+        idempotencyKey: 'adjust-replay',
+      })
+
+      expect(second.entry.entryId).toBe(first.entry.entryId)
+      expect(tables.get(CustomerCreditLedgerEntry) ?? []).toHaveLength(1)
+      // Step 1.12 (G18): the event fires once, for the write that actually happened —
+      // a replay must not re-announce the same adjustment.
+      expect(emitCustomerGroupsEventMock).toHaveBeenCalledTimes(1)
+    })
+
+    test('emits customer_groups.credit.adjusted after the write commits', async () => {
+      const { em, tables } = createFakeEm()
+      const account = seedAccount(tables, { creditLimit: '500.00' })
+      const service = buildService(em, allowTerms(true))
+
+      const result = await service.adjustCredit({
+        scope: SCOPE,
+        buyer: { customerId: CUSTOMER_ID },
+        currencyCode: CURRENCY,
+        amount: '15.00',
+        note: 'Correction',
+        idempotencyKey: 'adjust-event',
+      })
+
+      expect(emitCustomerGroupsEventMock).toHaveBeenCalledWith(
+        'customer_groups.credit.adjusted',
+        expect.objectContaining({
+          tenantId: TENANT,
+          organizationId: ORG,
+          creditAccountId: account.id,
+          customerId: CUSTOMER_ID,
+          currencyCode: CURRENCY,
+          entryId: result.entry.entryId,
+          amount: '15.00',
+          exposureAfter: '15.00',
+        }),
+        { persistent: true, tenantId: TENANT, organizationId: ORG },
+      )
+    })
+
+    test('undo shape: a negated amount with relatedEntryId appends the inverse, never deletes (G20)', async () => {
+      const { em, tables } = createFakeEm()
+      seedAccount(tables, { creditLimit: '500.00' })
+      const service = buildService(em, allowTerms(true))
+
+      const forward = await service.adjustCredit({
+        scope: SCOPE,
+        buyer: { customerId: CUSTOMER_ID },
+        currencyCode: CURRENCY,
+        amount: '30.00',
+        note: 'Correction to undo',
+        idempotencyKey: 'adjust-to-undo',
+      })
+
+      const undo = await service.adjustCredit({
+        scope: SCOPE,
+        buyer: { customerId: CUSTOMER_ID },
+        currencyCode: CURRENCY,
+        amount: '-30.00',
+        note: 'Reversal of adjustment',
+        idempotencyKey: `undo:${forward.entry.entryId}`,
+        relatedEntryId: forward.entry.entryId,
+      })
+
+      expect(undo.entry.amount).toBe('-30.00')
+      expect(undo.entry.relatedEntryId).toBe(forward.entry.entryId)
+      expect(undo.entry.balanceAfter).toBe('0.00')
+      // Both entries remain — the original is never deleted (G20).
+      expect(tables.get(CustomerCreditLedgerEntry) ?? []).toHaveLength(2)
+      const originalStillPresent = (tables.get(CustomerCreditLedgerEntry) ?? []).some(
+        (row) => row.id === forward.entry.entryId,
+      )
+      expect(originalStillPresent).toBe(true)
+    })
+  })
 })

@@ -76,6 +76,7 @@ export type CustomerCreditServiceErrorCode =
   | 'settle_exceeds_reservation'
   | 'no_account'
   | 'invalid_buyer'
+  | 'invalid_amount'
 
 export class CustomerCreditServiceError extends Error {
   readonly code: CustomerCreditServiceErrorCode
@@ -133,6 +134,26 @@ export type SettleCreditInput = {
 
 export type SettleCreditResult = { settled: boolean; entry: CreditEntryView }
 
+// Step 1.12 (D-R5-2/G20, §6.5). `adjust` is the only entry type an operator writes
+// directly: a signed, non-zero correction with a required note — manual settlement of a
+// payment when no integration calls `settleCredit`, or any other correction. `relatedEntryId`
+// and `idempotencyKey` are supplied by the caller (the command, never the HTTP body) so the
+// SAME method serves both the forward write (a fresh id, no related entry) and the command's
+// own undo (the key `undo:{entryId}`, `relatedEntryId` = the entry being reversed) without
+// duplicating the lock/sum/append logic.
+export type AdjustCreditInput = {
+  scope: CommerceScope
+  buyer: CreditBuyerInput
+  currencyCode: string
+  amount: DecimalString
+  note: string
+  idempotencyKey: string
+  relatedEntryId?: string | null
+  createdByUserId?: string | null
+}
+
+export type AdjustCreditResult = { entry: CreditEntryView }
+
 export interface CustomerCreditService {
   // Read-only, no lock. A hint for the UI and checkout's payment-method list, never a
   // guarantee — only `reserveCredit` decides under the lock (§6.3).
@@ -149,6 +170,11 @@ export interface CustomerCreditService {
   // Lowers exposure for a payment. With `reserveIdempotencyKey`, the settle belongs to
   // that reservation and may not exceed its open amount; without it, it is account-level.
   settleCredit(input: SettleCreditInput): Promise<SettleCreditResult>
+
+  // Appends a signed, non-zero `adjust` entry under the account row lock (§6.3). Used
+  // both for the forward `/adjust` command and, with a negated amount, for its undo
+  // (G20) — never a delete.
+  adjustCredit(input: AdjustCreditInput): Promise<AdjustCreditResult>
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +250,38 @@ async function emitCreditLimitExceededEvent(input: {
       creditLimit: input.creditLimit,
       sourceType: input.sourceType,
       sourceId: input.sourceId,
+    },
+    { persistent: true, tenantId: input.scope.tenantId, organizationId: input.scope.organizationId },
+  )
+}
+
+// §10.1 `CreditEntryEventPayload` for `.adjusted` — the only `credit.*` entry event this
+// module emits so far (the sibling `.reserved`/`.released`/`.settled` stay undeclared,
+// see `events.ts`): nothing in a prior Step's scope consumed them, but `adjust` is a
+// staff-initiated, auditable action an operator-facing webhook or notification may want
+// to react to from day one.
+async function emitCreditAdjustedEvent(input: {
+  scope: CommerceScope
+  creditAccountId: string
+  customerId: string
+  currencyCode: string
+  entry: CreditEntryView
+}): Promise<void> {
+  await emitCustomerGroupsEvent(
+    'customer_groups.credit.adjusted',
+    {
+      tenantId: input.scope.tenantId,
+      organizationId: input.scope.organizationId,
+      creditAccountId: input.creditAccountId,
+      customerId: input.customerId,
+      currencyCode: input.currencyCode,
+      entryId: input.entry.entryId,
+      amount: input.entry.amount,
+      exposureAfter: input.entry.balanceAfter,
+      sourceType: 'manual' as const,
+      sourceId: null,
+      relatedEntryId: input.entry.relatedEntryId,
+      linkedOrderId: input.entry.linkedOrderId,
     },
     { persistent: true, tenantId: input.scope.tenantId, organizationId: input.scope.organizationId },
   )
@@ -690,6 +748,76 @@ export class DefaultCustomerCreditService implements CustomerCreditService {
       ],
       { transaction: true, label: 'customer_groups.credit.settle' },
     )
+
+    return result
+  }
+
+  async adjustCredit(input: AdjustCreditInput): Promise<AdjustCreditResult> {
+    const { scope, currencyCode } = input
+    const amount = roundHalfUpToTwoDp(input.amount)
+    if (toMinorUnits(amount) === 0) {
+      throw new CustomerCreditServiceError('invalid_amount', '[internal] adjustCredit: amount must not be zero')
+    }
+    const customerId = await resolveBuyerCustomerId(this.em, input.buyer, scope.tenantId)
+
+    let result!: AdjustCreditResult
+    let created = false
+
+    await withAtomicFlush(
+      this.em,
+      [
+        async () => {
+          // Same lock/idempotency shape as `reserveCredit`/`settleCredit` (§6.3): lock the
+          // account row first, then look up the idempotency key under the lock. `adjust`
+          // has no caller-supplied business key (§9: the body is `{ amount, note }` only) —
+          // the command mints its own key per execution, so a found row here means either a
+          // genuine replay of the SAME command invocation or the undo key reused on a second
+          // undo attempt, both of which must return the original entry rather than double-post.
+          const account = await this.findAccount(scope, customerId, currencyCode, { lockMode: LockMode.PESSIMISTIC_WRITE })
+          if (!account) {
+            throw new CustomerCreditServiceError('no_account', '[internal] adjustCredit: no credit account for this customer/currency')
+          }
+
+          const existing = await this.em.findOne(CustomerCreditLedgerEntry, {
+            tenantId: scope.tenantId,
+            idempotencyKey: input.idempotencyKey,
+          })
+          if (existing) {
+            result = { entry: toEntryView(existing) }
+            return
+          }
+
+          const exposure = await this.sumExposure(account.id, scope)
+          const balanceAfter = addDecimalStrings(exposure, amount)
+          const entry = this.em.create(CustomerCreditLedgerEntry, {
+            organizationId: scope.organizationId,
+            tenantId: scope.tenantId,
+            creditAccountId: account.id,
+            entryType: 'adjust',
+            amount,
+            sourceType: 'manual',
+            sourceId: null,
+            relatedEntryId: input.relatedEntryId ?? null,
+            idempotencyKey: input.idempotencyKey,
+            balanceAfter,
+            createdByActorType: 'staff_user',
+            createdByUserId: input.createdByUserId ?? null,
+            note: input.note,
+          })
+          this.em.persist(entry)
+          created = true
+          result = { entry: toEntryView(entry) }
+        },
+      ],
+      { transaction: true, label: 'customer_groups.credit.adjust' },
+    )
+
+    // Emitted only for the write that actually happened — a replay of the same
+    // idempotency key (§6.5 rule 1) must not re-announce an adjustment that already
+    // fired its event the first time.
+    if (created) {
+      await emitCreditAdjustedEvent({ scope, creditAccountId: result.entry.creditAccountId, customerId, currencyCode, entry: result.entry })
+    }
 
     return result
   }

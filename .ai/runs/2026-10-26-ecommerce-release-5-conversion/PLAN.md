@@ -29,7 +29,7 @@
 | 1 | 1.9 | promotions: `revertCodeUse` + `sales.order.cancelled` subscriber (C5) | dispatch:standard | done | pending |
 | 1 | 1.10 | promotions: un-hide `delivery_method` rule + `DELIVERY_DISCOUNT` effect (D-R5-17) | dispatch:standard | done | pending |
 | 1 | 1.11 | customer_groups: admin credit-account provisioning route + ledger-listing read route (G13/D-R5-5 gap-fill) | dispatch:standard | done | pending |
-| 1 | 1.12 | customer_groups: admin credit-account `/adjust` command route (G13/G20/D-R5-2 gap-fill) | dispatch:standard | todo | — |
+| 1 | 1.12 | customer_groups: admin credit-account `/adjust` command route (G13/G20/D-R5-2 gap-fill) | dispatch:standard | done | pending |
 | 2 | 2.1 | availability: `AvailabilityReservation` entity + migration (A3) | dispatch:standard | todo | — |
 | 2 | 2.2 | availability: reserve/release/commit via `wmsReservationService`, CAS, per-line outcomes, allocation (A6/A7/A14/A15) | dispatch:standard | todo | — |
 | 2 | 2.3 | availability: expiry job + reconciliation job + events (A11/A12/A13) | dispatch:standard | todo | — |
@@ -160,6 +160,30 @@ commit `c92470d8d5`).
   optimistic-lock 409 carries — rather than `{ error: 'credit_account_exists' }` literally, so
   `createCrud`'s error surfacing shows a readable message. Alternative considered: the literal spec
   shape — rejected because every other `customer_groups` error body carries a message in `error`.
+- Step 1.12 (§5.5/§9): the ledger column note says "`idempotency_key` ... for `adjust` the command
+  id" — read as "the command mints its own key per execution," not a caller-supplied value, since
+  the spec's own `/adjust` body (`{ amount, note }`) has no key field. `commands/adjustCredit.ts`
+  therefore generates `` `adjust:${randomUUID()}` `` inside `execute()`. Alternative considered:
+  add an optional `idempotencyKey` to the HTTP body so a retrying client could de-dupe — rejected as
+  contradicting the spec's own literal body shape without a stated reason to diverge from it; an
+  operator-driven admin action retried by a human is not the same risk class as checkout's
+  machine-retried submit.
+- Step 1.12 (§6.5/G20): `adjustCredit`'s undo is implemented by calling the SAME service method a
+  second time with the negated amount, `relatedEntryId` = the original entry, and the key
+  `` `undo:${entryId}` `` — reusing the one lock/idempotency-respecting write path rather than a
+  second method. Alternative considered: a dedicated `undoAdjustCredit` method — rejected as
+  duplicating `adjustCredit`'s lock/sum/append logic for no behavioural difference.
+- Step 1.12 (G18/§10.1): declared and emitted `customer_groups.credit.adjusted` (the command has no
+  consumer without it, per the Step's own brief) — gated to fire only on a genuinely NEW ledger
+  entry, never on an idempotent replay of the same key, so a replay cannot double-announce. The
+  sibling `credit.reserved/.released/.settled` and `credit_account.put_on_hold/.released_from_hold`
+  events stay undeclared (same reasoning Step 1.8 gave: no consumer yet).
+- Step 1.12 (G20): the route sets the `x-om-operation` response header (`serializeOperationMetadata`,
+  the same convention every other command-backed route in this codebase follows — e.g.
+  `staff/api/leave-requests/accept/route.ts`) so the command's `undo` handler is actually reachable
+  through the generic `/api/audit_logs/audit-logs/actions/undo` route. Without it, "a command with
+  real undo" would be implemented but unreachable from any client. Not explicitly named in the
+  Step's brief, but treated as part of "the route's own shape," not a scope change.
 
 ## External References
 

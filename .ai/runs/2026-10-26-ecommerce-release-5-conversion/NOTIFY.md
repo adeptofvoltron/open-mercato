@@ -175,3 +175,47 @@
   create route, now shipped, and `checkCredit`'s `no_account` refusal path, already correct).
   Deferred to Phase 6 polish rather than appending a dedicated Step now; revisit only if the final
   integration-coverage pass (Step 6.1) finds a spec test case that actually requires it.
+
+## 2026-10-26T18:40:00Z — Step 1.12 landed
+- `customer_groups`: `POST /api/customer_groups/customer-groups/credit-accounts/:id/adjust`
+  (`credit.adjust`, `.strict()` body `{ amount: string, note: string }`, amount signed/non-zero/≤2dp)
+  closes the last D-R5-2 gap: the operator-facing half of hybrid settlement. The account is
+  resolved inside the caller's organization scope (same shape as the sibling `[id]/ledger` route);
+  the route dispatches the new `customer_groups.credit.adjust` command through `commandBus.execute`.
+- `customerCreditService.adjustCredit` (new method, `services/customerCreditService.ts`) appends a
+  signed `adjust` entry under the SAME account-row lock (`LockMode.PESSIMISTIC_WRITE` inside
+  `withAtomicFlush`) as `reserveCredit`/`releaseCredit`/`settleCredit`, with the same idempotency-key
+  lookup pattern — the command mints its own key (`` `adjust:${randomUUID()}` ``) per execution since
+  the HTTP body carries none (§9's literal `{ amount, note }`). Rejects a zero amount
+  (`invalid_amount`).
+- `commands/adjustCredit.ts`: the command (`customer_groups.credit.adjust`, `isUndoable: true`).
+  `buildLog` snapshots everything undo needs (account/tenant/org/customer/currency ids, the entry id
+  and its amount); `undo` calls `adjustCredit` a SECOND time with the negated amount,
+  `relatedEntryId` = the original entry, and the key `` `undo:${entryId}` `` — appending the inverse
+  entry, never deleting the original (G20). The route sets the `x-om-operation` response header
+  (same convention as every other command-backed route, e.g. `staff/leave-requests/accept`) so the
+  generic `/api/audit_logs/audit-logs/actions/undo` route can actually reach this `undo` handler.
+- Declared and emit `customer_groups.credit.adjusted` (`events.ts`, G18/§10.1) after the write
+  commits, gated to fire once per genuinely new entry — never on an idempotent replay.
+- Admin UI: credit panel widget (`widgets/injection/credit-panel.tsx`) gained an "Adjust" icon
+  button (gated by `credit.adjust`, independent of `credit.manage`) opening a dialog with `amount`
+  (signed decimal string) and a required `note`, posted via `apiCallOrThrow` directly against the
+  `/adjust` route (not `createCrud`/`updateCrud` — this isn't a CRUD write on the account entity,
+  it appends a ledger entry).
+- Tests: `services/__tests__/customerCreditService.test.ts` (7 new cases: positive/negative
+  adjustment, zero rejection, no-account, idempotent replay, the `.adjusted` event, and the
+  undo shape appending an inverse entry while the original survives);
+  `commands/__tests__/adjustCredit.test.ts` (8 new cases: scope resolution, zero-amount validation,
+  cross-tenant/cross-org 404, missing-tenant 400, `buildLog` payload shape, undo negation both
+  directions); `__integration__/TC-CGRP-033-credit-account-adjust.spec.ts` (full HTTP path: post,
+  exposure math, `.strict()`/zero/decimal-places validation, undo via the generic audit-logs undo
+  route confirming the reversal entry appears and the original survives, ACL —
+  `credit.adjust` required, `credit.view`/`.manage` alone insufficient — and tenant/organization
+  isolation). Typecheck and the `customer_groups` jest suite (378 tests) pass; `i18n:check-sync` and
+  `i18n:check-hardcoded` are clean for this module. The Playwright suite itself was not executed in
+  this run (no live app/DB server available in this worktree) — verified by typecheck plus the unit
+  tests exercising the same service/command code paths the route calls.
+- Scope calls made without the owner (all logged in PLAN.md "Decisions taken without the owner"):
+  the command-minted idempotency key, reusing one method for both the forward write and its undo,
+  the `.adjusted` event's emission-once-per-write gate, and adding the `x-om-operation` header so
+  undo is actually reachable.
