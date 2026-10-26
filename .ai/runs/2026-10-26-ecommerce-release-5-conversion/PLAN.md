@@ -38,7 +38,7 @@
 | 2 | 2.6 | customer_groups: approval portal + staff routes + ACL + grants (G5/G7/D-R5-7/D-R5-34) | dispatch:standard | done | pending |
 | 2 | 2.7 | customer_groups: approval notifications (D-R5-6/D-R5-32/G15) | dispatch:standard | done | pending |
 | 2 | 2.8 | cart: lock contract — `lockTtlMs`, idempotent extend by `checkoutSessionId`, `unlock`/`markConverted` match (C1) | dispatch:standard | done | pending |
-| 2 | 2.9 | cart: D-R5-21/D-R5-22 identity binding on `/current/*` + trusted `resolveForBuyer` path for pay_link/api/agent | dispatch:standard | todo | — |
+| 2 | 2.9 | cart: D-R5-21/D-R5-22 identity binding on `/current/*` + trusted `resolveForBuyer` path for pay_link/api/agent | dispatch:standard | done | pending |
 | 2 | 2.10 | cart: `markConverted` additive inputs (`salesOrderId`/`lineMap`/`salesQuoteId`, K8/D-R5-26); admin list + detail + reprice (K6) | dispatch:standard | todo | — |
 | 2 | 2.11 | cart: abandonment payload (K9) + code-reservation release on expire/abandon (K11) | dispatch:standard | todo | — |
 | 2 | 2.12 | checkout: B.1 session entity + step machine + token hash + C14 minimum (rate limits, encryption, redaction) | dispatch:standard | todo | — |
@@ -524,6 +524,54 @@ commit `c92470d8d5`).
   event and let an extend reuse `cart.lock.acquired` — rejected as conflating two materially
   different transitions (a fresh lock runs re-price/visibility/approval; an extend runs none of
   them) under one signal, which a future consumer (e.g. an audit trail) could not tell apart.
+
+- Step 2.9 (D-R5-21, §8.4's own "Consequences" bullet): the task brief scoped Part A to "every
+  `/current/*` route" via the shared route-entry helper, naming only the TARGET cart addressed
+  by `X-Cart-Token`. §8.4's own text additionally calls out one more case under the SAME rule:
+  "`POST /current/merge`: ... a `sourceToken` that resolves an identified basket of another
+  buyer is the same `404`." The `sourceToken` names a SECOND basket that `cart.merge`
+  (`commands/merge.ts`) resolves itself, never through `lib/currentCartRoute.ts#
+  resolveCurrentCart` — so leaving it alone would ship the rule only half-closed on the one
+  route where two tokens are in play at once. Added the identical check (`getCustomerAuthFromRequest`
+  session vs. the resolved guest cart's `customerUserId`, collapsing a mismatch into the SAME
+  `'[internal] source cart not found'` 404 the route already throws for an unresolvable
+  `sourceToken`) directly in `mergeCartCommand.execute`, right after the existing
+  `if (!guestCart) throw notFound(...)` check. Alternative considered: leave it to a future
+  Step since the task brief's own Implementation bullets never named it — rejected because
+  D-R5-21/§8.4 is explicitly the authoritative contract for this exact scenario, the fix is a
+  five-line, single-call-site addition with zero risk to the surrounding merge logic, and
+  shipping "every /current/* route" while silently leaving ONE documented consequence of the
+  same rule open would be the exact kind of partial security fix this Step exists to close.
+- Step 2.9 (D-R5-22, §6a.4's literal fill list vs. the task brief's field list): the task
+  brief's Implementation bullet lists `resolveForBuyer`'s fields to use as "`customerIds`/
+  `customerGroupIds`/`priceKindId`/`taxMode`/`currencyCode`", but the REVISED, authoritative
+  spec text (§6a.4, rev 10) states plainly: "The result fills `customer_id`, `customer_ids`
+  (person and company), `customer_user_id`, `customer_group_ids`, `price_kind_id`, `tax_mode`
+  and `buyer_digest`" — seven named fields, `currencyCode` conspicuously absent. Cross-checked
+  against `cartCreateInputSchema` (`data/validators.ts`): `currencyCode` is a REQUIRED,
+  non-optional field on the trusted caller's own input, confirming the omission is deliberate,
+  not an oversight — the cart's currency is the trusted caller's own choice (e.g. checkout's
+  already-resolved document currency), not something a buyer's identity should silently
+  override, and `resolveForBuyer`'s own `currencyCode` output is `null` whenever no `storeId`
+  is given anyway (true for the typical pay_link/api/agent caller). Per the root AGENTS.md rule
+  that the spec is the authoritative contract and the task brief's field list is only the
+  analysis-era paraphrase that produced it (same precedent Step 2.7 applied to the `approval.
+  decided` notification), implemented the seven-field fill exactly as §6a.4 states and left
+  `currencyCode` as the trusted caller's own required input, unconditionally. Alternative
+  considered: also override `currencyCode` from `resolveForBuyer` when present — rejected as
+  contradicting the spec's own literal, carefully-enumerated fill list with no stated reason to
+  diverge, and as a behavior that would silently second-guess a trusted caller's explicit,
+  required input.
+- Step 2.9 (scope boundary, confirmed not violated): did NOT extend the trusted-path identity
+  refresh to `cart.lock`/the admin re-price/recovery re-locking, despite §6a.4's own text naming
+  all three as future callers of the SAME refresh ("The same call refreshes identity at every
+  whole-cart re-price of a non-storefront cart that has a buyer"). None of those call sites
+  exist in this worktree yet (`cart.lock` ships Step 2.8 with no buyer-identity-refresh logic of
+  its own; the admin re-price and checkout recovery are later Phase 2/Phase 4 Steps) — this
+  Step's own brief named only `cart/commands/cart.ts:236-258` (the `cart.create` trusted-path
+  seeding) as its Part B target, and explicitly said not to build the full pay-link flow. The
+  Step that adds the lock/recovery buyer-identity refresh should reuse
+  `resolveTrustedCartBuyerIdentity`'s same shape rather than inventing a parallel helper.
 
 ## External References
 

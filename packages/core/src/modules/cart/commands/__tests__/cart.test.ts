@@ -216,6 +216,11 @@ function makeCtx(opts: {
   commandBus?: unknown
   promotionsService?: unknown
   catalogScopedProductService?: unknown
+  // Step 2.9 (§6a.4/D-R5-22) — omitted entirely by default, which falls through to this
+  // container's own `throw` below, caught by `tryResolveStoreContextService`'s try/catch:
+  // the exact "ecommerce not registered" fallback every pre-existing trusted-path test in
+  // this file already exercises without knowing it.
+  storeContextService?: unknown
   auth?: CommandRuntimeContext['auth']
   selectedOrganizationId?: string | null
 }): CommandRuntimeContext {
@@ -236,6 +241,10 @@ function makeCtx(opts: {
         // a fake container just needs the token to resolve, never reads `auth` itself.
         if (token === 'promotionsService') return opts.promotionsService ?? makeDefaultPromotionsService()
         if (token === 'catalogScopedProductService') return opts.catalogScopedProductService ?? makeDefaultCatalogScopedProductService()
+        if (token === 'storeContextService') {
+          if (opts.storeContextService) return opts.storeContextService
+          throw new Error('storeContextService is not registered')
+        }
         throw new Error(`Unexpected DI token: ${token}`)
       },
       register: jest.fn((...args: unknown[]) => {
@@ -404,6 +413,132 @@ describe('cart.create', () => {
     expect(getCreated()).toBeNull()
     expect(em.persist).not.toHaveBeenCalled()
     expect(em.flush).not.toHaveBeenCalled()
+  })
+
+  // Step 2.9 (§6a.4/D-R5-22) — the trusted-path buyer-identity fill. Before this step a
+  // trusted `pos`/`pay_link`/`agent`/`api` cart created for a known customer stored
+  // `customerIds = [customerId]`, `customerGroupIds = []`, `priceKindId = null` straight
+  // from the caller's own input, never resolving the buyer's company/group/price-kind (X2).
+  describe('authenticated path — §6a.4/D-R5-22 trusted buyer-identity fill', () => {
+    const TRUSTED_PERSON_ID = 'bbbbbbbb-0000-4000-8000-000000000002'
+    const TRUSTED_COMPANY_ID = 'aaaaaaaa-0000-4000-8000-000000000001'
+    const TRUSTED_CUSTOMER_USER_ID = 'cccccccc-0000-4000-8000-000000000003'
+    const TRUSTED_GROUP_ID = 'dddddddd-0000-4000-8000-000000000004'
+    const TRUSTED_PRICE_KIND_ID = 'eeeeeeee-0000-4000-8000-000000000005'
+
+    function makeTrustedInput(overrides: Record<string, unknown> = {}) {
+      return {
+        channel: 'api' as const,
+        storeId: null,
+        salesChannelId: null,
+        currencyCode: 'USD',
+        locale: 'en-US',
+        taxMode: 'gross' as const,
+        customerId: null,
+        customerUserId: null,
+        email: null,
+        ...overrides,
+      }
+    }
+
+    it('resolves customerIds/customerGroupIds/priceKindId/taxMode/buyerDigest via resolveForBuyer, leaving currencyCode as the caller supplied', async () => {
+      const resolveForBuyer = jest.fn(async () => ({
+        tenantId: TENANT_ID,
+        organizationId: ORG_ID,
+        storeId: null,
+        customerId: TRUSTED_COMPANY_ID,
+        customerIds: [TRUSTED_PERSON_ID, TRUSTED_COMPANY_ID],
+        customerUserId: TRUSTED_CUSTOMER_USER_ID,
+        customerGroupIds: [TRUSTED_GROUP_ID],
+        priceKindId: TRUSTED_PRICE_KIND_ID,
+        taxMode: 'net' as const,
+        currencyCode: null,
+        buyerDigest: 'resolved-buyer-digest',
+      }))
+      const handler = commandRegistry.get<CartCreateCommandInput, CartCreateResult>('cart.create')
+      const { em, getCreated } = makeEm()
+      const dataEngine = makeDataEngine()
+      const userHasAllFeatures = jest.fn(async () => true)
+      const ctx = makeCtx({
+        em,
+        dataEngine,
+        rbacService: { userHasAllFeatures },
+        storeContextService: { resolveForBuyer },
+        auth: { sub: 'api-key-1', tenantId: TENANT_ID, orgId: ORG_ID },
+        selectedOrganizationId: ORG_ID,
+      })
+
+      await handler!.execute(makeTrustedInput({ customerUserId: TRUSTED_CUSTOMER_USER_ID, currencyCode: 'EUR' }), ctx)
+
+      expect(resolveForBuyer).toHaveBeenCalledWith({
+        tenantId: TENANT_ID,
+        organizationId: ORG_ID,
+        storeId: null,
+        customerUserId: TRUSTED_CUSTOMER_USER_ID,
+        customerId: null,
+      })
+      const created = getCreated()!
+      expect(created.customerId).toBe(TRUSTED_COMPANY_ID)
+      expect(created.customerIds).toEqual([TRUSTED_PERSON_ID, TRUSTED_COMPANY_ID])
+      expect(created.customerUserId).toBe(TRUSTED_CUSTOMER_USER_ID)
+      expect(created.customerGroupIds).toEqual([TRUSTED_GROUP_ID])
+      expect(created.priceKindId).toBe(TRUSTED_PRICE_KIND_ID)
+      expect(created.taxMode).toBe('net')
+      expect(created.buyerDigest).toBe('resolved-buyer-digest')
+      // §6a.4's own fill list names seven fields, deliberately not currencyCode — the
+      // trusted caller's own required input stays authoritative.
+      expect(created.currencyCode).toBe('EUR')
+    })
+
+    it('falls back to the pre-Step-2.9 placeholder identity when ecommerce is not registered (documented fallback, not silent)', async () => {
+      const handler = commandRegistry.get<CartCreateCommandInput, CartCreateResult>('cart.create')
+      const { em, getCreated } = makeEm()
+      const dataEngine = makeDataEngine()
+      const userHasAllFeatures = jest.fn(async () => true)
+      const ctx = makeCtx({
+        em,
+        dataEngine,
+        rbacService: { userHasAllFeatures },
+        auth: { sub: 'api-key-1', tenantId: TENANT_ID, orgId: ORG_ID },
+        selectedOrganizationId: ORG_ID,
+      })
+
+      await handler!.execute(makeTrustedInput({ customerId: TRUSTED_COMPANY_ID, taxMode: 'gross' }), ctx)
+
+      const created = getCreated()!
+      expect(created.customerId).toBe(TRUSTED_COMPANY_ID)
+      expect(created.customerIds).toEqual([TRUSTED_COMPANY_ID])
+      expect(created.customerGroupIds).toEqual([])
+      expect(created.priceKindId).toBeNull()
+      expect(created.taxMode).toBe('gross')
+      expect(created.buyerDigest).toBe('')
+    })
+
+    it('a guest trusted cart (no customer named at all) is unaffected — resolveForBuyer is never called', async () => {
+      const resolveForBuyer = jest.fn()
+      const handler = commandRegistry.get<CartCreateCommandInput, CartCreateResult>('cart.create')
+      const { em, getCreated } = makeEm()
+      const dataEngine = makeDataEngine()
+      const userHasAllFeatures = jest.fn(async () => true)
+      const ctx = makeCtx({
+        em,
+        dataEngine,
+        rbacService: { userHasAllFeatures },
+        storeContextService: { resolveForBuyer },
+        auth: { sub: 'api-key-1', tenantId: TENANT_ID, orgId: ORG_ID },
+        selectedOrganizationId: ORG_ID,
+      })
+
+      await handler!.execute(makeTrustedInput(), ctx)
+
+      expect(resolveForBuyer).not.toHaveBeenCalled()
+      const created = getCreated()!
+      expect(created.customerId).toBeNull()
+      expect(created.customerIds).toEqual([])
+      expect(created.customerGroupIds).toEqual([])
+      expect(created.priceKindId).toBeNull()
+      expect(created.buyerDigest).toBe('')
+    })
   })
 })
 

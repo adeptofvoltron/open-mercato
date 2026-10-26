@@ -8,6 +8,14 @@ jest.mock('@open-mercato/shared/lib/i18n/server', () => ({
   }),
 }))
 
+// Step 2.9 — §8.4/D-R5-21's own "Consequences" bullet: "a `sourceToken` that resolves an
+// identified basket of another buyer is the same `404`." Mocked the same way
+// `lib/__tests__/currentCartRoute.identity-binding.test.ts` mocks it.
+const mockGetCustomerAuthFromRequest = jest.fn()
+jest.mock('@open-mercato/core/modules/customer_accounts/lib/customerAuth', () => ({
+  getCustomerAuthFromRequest: (...args: unknown[]) => mockGetCustomerAuthFromRequest(...args),
+}))
+
 type FakeRow = Record<string, any>
 
 function matchesWhere(row: FakeRow, where: Record<string, unknown>): boolean {
@@ -556,6 +564,75 @@ describe('cart.merge — §7.1 policy rows', () => {
     }
     expect(isCrudHttpError(captured)).toBe(true)
     expect((captured as { status: number }).status).toBe(404)
+  })
+
+  // Step 2.9 — §8.4/D-R5-21's own "Consequences" bullet: "a `sourceToken` that resolves an
+  // identified basket of another buyer is the same `404`." The TARGET cart's own identity
+  // binding is enforced one layer up, at the route edge (`lib/currentCartRoute.ts`, before
+  // this command ever runs); these three tests cover the SOURCE side, which this command
+  // resolves itself.
+  it('404s when sourceToken resolves another buyer\'s identified basket and the requester has no session', async () => {
+    seededCarts = [
+      makeCartFixture({ id: 'cart-target', tokenHash: 'target-token-hash' }),
+      makeCartFixture({ id: 'cart-guest', tokenHash: hashCartToken('other-buyer-token'), customerUserId: 'customer-user-other-buyer' }),
+    ]
+    mockGetCustomerAuthFromRequest.mockResolvedValue(null)
+    const handler = getMergeHandler()
+    const em = makeEm()
+    const ctx = { ...makeCtx({ em }), request: new Request('https://example.com') }
+
+    let captured: unknown
+    try {
+      await handler.execute({ targetCartId: 'cart-target', tenantId: TENANT_ID, organizationId: ORG_ID, sourceToken: 'other-buyer-token', routeContext: makeRouteContext() }, ctx)
+    } catch (err) {
+      captured = err
+    }
+    expect(isCrudHttpError(captured)).toBe(true)
+    expect((captured as { status: number }).status).toBe(404)
+  })
+
+  it('404s when sourceToken resolves another buyer\'s identified basket even with the requester\'s OWN valid session for a different customer', async () => {
+    seededCarts = [
+      makeCartFixture({ id: 'cart-target', tokenHash: 'target-token-hash' }),
+      makeCartFixture({ id: 'cart-guest', tokenHash: hashCartToken('other-buyer-token'), customerUserId: 'customer-user-other-buyer' }),
+    ]
+    mockGetCustomerAuthFromRequest.mockResolvedValue({ sub: 'customer-user-requester', type: 'customer' })
+    const handler = getMergeHandler()
+    const em = makeEm()
+    const ctx = { ...makeCtx({ em }), request: new Request('https://example.com') }
+
+    let captured: unknown
+    try {
+      await handler.execute({ targetCartId: 'cart-target', tenantId: TENANT_ID, organizationId: ORG_ID, sourceToken: 'other-buyer-token', routeContext: makeRouteContext() }, ctx)
+    } catch (err) {
+      captured = err
+    }
+    expect(isCrudHttpError(captured)).toBe(true)
+    expect((captured as { status: number }).status).toBe(404)
+  })
+
+  it('merges normally when sourceToken resolves an identified basket belonging to the SAME requester as the presented session', async () => {
+    seededCarts = [
+      makeCartFixture({ id: 'cart-target', tokenHash: 'target-token-hash' }),
+      makeCartFixture({ id: 'cart-guest', tokenHash: hashCartToken('own-identified-source-token'), customerUserId: 'customer-user-1' }),
+    ]
+    seededCartLines = [
+      makeLineFixture({ id: 'line-target-1', cartId: 'cart-target', productId: 'product-1', quantity: '2', lineNumber: 1 }),
+      makeLineFixture({ id: 'line-guest-1', cartId: 'cart-guest', productId: 'product-2', quantity: '3', lineNumber: 1 }),
+    ]
+    seededProducts = [makeProductFixture({ id: 'product-1' }), makeProductFixture({ id: 'product-2' })]
+    mockGetCustomerAuthFromRequest.mockResolvedValue({ sub: 'customer-user-1', type: 'customer' })
+    const handler = getMergeHandler()
+    const em = makeEm()
+    const ctx = { ...makeCtx({ em }), request: new Request('https://example.com') }
+
+    const result = await handler.execute(
+      { targetCartId: 'cart-target', tenantId: TENANT_ID, organizationId: ORG_ID, sourceToken: 'own-identified-source-token', routeContext: makeRouteContext() },
+      ctx,
+    )
+
+    expect(result.mergeSummary.strategy).toBe('sum')
+    expect(result.mergeSummary.counts.merged).toBe(1)
   })
 
   // Step 7.5 — §9: a locked TARGET cart gets the distinguishable 423, not the generic 404

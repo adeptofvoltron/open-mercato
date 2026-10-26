@@ -13,6 +13,12 @@ import type { EntityManager } from '@mikro-orm/postgresql'
 import type { RbacService } from '@open-mercato/core/modules/auth/services/rbacService'
 import type { SalesAdjustmentDraft, SalesDocumentAmounts } from '@open-mercato/core/modules/sales/lib/types'
 import { E } from '#generated/entities.ids.generated'
+// §6a.4 (D-R5-22): `ecommerce` stays a SOFT dependency of `cart` (not in `index.ts`'s own
+// `requires`, same convention `lib/routeContext.ts` already documents for
+// `storeContextService`) — only the type is imported here; the service itself is resolved
+// through DI with a local try/catch (`tryResolveStoreContextService` below), never a hard
+// static value import.
+import type { StoreContextService } from '@open-mercato/core/modules/ecommerce/lib/storeContextService'
 import { Cart, CartLine } from '../data/entities'
 import type { CartChannel, CartKind, CartStatus, CartTaxMode } from '../data/entities'
 import { cartCreateInputSchema, type CartCreateInput as CartCreateTrustedInput } from '../data/validators'
@@ -117,6 +123,47 @@ const CART_CHANNEL_FEATURES: Record<Exclude<CartChannel, 'storefront'>, string> 
   pay_link: 'cart.channel.payLink',
   agent: 'cart.channel.agent',
   api: 'cart.channel.api',
+}
+
+function tryResolveStoreContextService(container: { resolve: <T = unknown>(name: string) => T }): StoreContextService | null {
+  try {
+    return container.resolve<StoreContextService>('storeContextService') ?? null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * §6a.4 (D-R5-22): the trusted-path buyer-identity fill. Before this, a `pos`/`pay_link`/
+ * `agent`/`api` cart created for a known buyer stamped `customerIds = [customerId]`,
+ * `customerGroupIds = []`, `priceKindId = null` directly from the trusted caller's own
+ * input (X2) — the company entity, group memberships and price kind were never resolved, so
+ * credit/approval/terms (`customer_groups`) and pricing both resolved against the PERSON,
+ * never the company, for a B2B buyer on any non-storefront channel.
+ *
+ * Returns `null` — meaning "use the old, caller-supplied-only fields verbatim" — in BOTH
+ * documented fallback cases: no buyer named at all (a genuine guest trusted cart, left
+ * completely unaffected), and `ecommerce` not registered (§6a.4: "that fallback is
+ * documented, not silent: the cart then prices at list and resolves terms against the
+ * person"). A `resolveForBuyer` call that reaches the service but names an id outside the
+ * caller's own tenant/organization scope throws `StorefrontResolutionError` and propagates —
+ * that is a bug in the TRUSTED caller, not an absence of `ecommerce`, and must not be
+ * swallowed the way the DI-resolution failure above is.
+ */
+async function resolveTrustedCartBuyerIdentity(
+  container: { resolve: <T = unknown>(name: string) => T },
+  input: { tenantId: string; organizationId: string; storeId: string | null; customerUserId: string | null; customerId: string | null },
+) {
+  if (!input.customerUserId && !input.customerId) return null
+  const storeContextService = tryResolveStoreContextService(container)
+  if (!storeContextService) return null
+  return storeContextService.resolveForBuyer({
+    tenantId: input.tenantId,
+    organizationId: input.organizationId,
+    storeId: input.storeId,
+    customerUserId: input.customerUserId,
+    customerId: input.customerId,
+  })
 }
 
 // These rejection messages are `[internal]`-prefixed (not yet routed through `t(...)`) because
@@ -234,27 +281,48 @@ const createCartCommand: CommandHandler<CartCreateCommandInput, CartCreateResult
       }
       await requireChannelFeature(ctx, parsed.channel)
       const { tenantId, organizationId } = resolveAuthenticatedScope(ctx)
+      const storeId = parsed.storeId ?? null
+      const trustedCustomerId = parsed.customerId ?? null
+      const trustedCustomerUserId = parsed.customerUserId ?? null
+      // §6a.4 (D-R5-22): resolves the buyer's REAL company/group/price-kind identity through
+      // the one trusted seam (Step 1.2) instead of the old context-less seeding below. `null`
+      // when no buyer was named at all, or when `ecommerce` is not registered — both
+      // documented fallbacks that leave `fields` exactly as this module shipped before this
+      // step (see `resolveTrustedCartBuyerIdentity`'s own doc comment).
+      const buyerIdentity = await resolveTrustedCartBuyerIdentity(ctx.container, {
+        tenantId,
+        organizationId,
+        storeId,
+        customerUserId: trustedCustomerUserId,
+        customerId: trustedCustomerId,
+      })
       fields = {
         tenantId,
         organizationId,
         channel: parsed.channel,
-        storeId: parsed.storeId ?? null,
+        storeId,
         salesChannelId: parsed.salesChannelId ?? null,
+        // `currencyCode` is deliberately NOT one of the fields `resolveForBuyer` fills (§6a.4's
+        // own fill list names exactly seven: customer_id, customer_ids, customer_user_id,
+        // customer_group_ids, price_kind_id, tax_mode, buyer_digest) — it stays the trusted
+        // caller's own, required input (`cartCreateInputSchema.currencyCode`), the same way it
+        // always has, never derived from the buyer's identity or the resolved store's default.
         currencyCode: parsed.currencyCode,
         locale: parsed.locale,
-        taxMode: parsed.taxMode,
-        // No `StoreContext`/`BuyerContext` is resolved on this path at all (§6a.4: "pos, pay_link,
-        // agent and api carts have no channel binding and no buyer digest") — `customerGroupIds`
-        // stays empty and `priceKindId` stays unresolved; only the single `customerId` the trusted
-        // caller supplied is known, so `customerIds` is derived from it rather than copied from a
+        taxMode: buyerIdentity?.taxMode ?? parsed.taxMode,
+        // No `StoreContext`/`BuyerContext` is resolved when `buyerIdentity` is `null`
+        // (§6a.4: "pos, pay_link, agent and api carts have no channel binding and no buyer
+        // digest" — the documented fallback) — `customerGroupIds` stays empty and
+        // `priceKindId` stays unresolved; only the single `customerId` the trusted caller
+        // supplied is known, so `customerIds` is derived from it rather than copied from a
         // buyer context that was never resolved.
-        customerId: parsed.customerId ?? null,
-        customerIds: parsed.customerId ? [parsed.customerId] : [],
-        customerUserId: parsed.customerUserId ?? null,
-        customerGroupIds: [],
-        priceKindId: null,
+        customerId: buyerIdentity?.customerId ?? trustedCustomerId,
+        customerIds: buyerIdentity?.customerIds ?? (trustedCustomerId ? [trustedCustomerId] : []),
+        customerUserId: buyerIdentity?.customerUserId ?? trustedCustomerUserId,
+        customerGroupIds: buyerIdentity?.customerGroupIds ?? [],
+        priceKindId: buyerIdentity?.priceKindId ?? null,
         email: parsed.email ?? null,
-        buyerDigest: '',
+        buyerDigest: buyerIdentity?.buyerDigest ?? '',
       }
     }
 

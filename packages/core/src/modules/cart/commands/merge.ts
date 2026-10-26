@@ -11,6 +11,9 @@ import type { DataEngine } from '@open-mercato/shared/lib/data/engine'
 import { findOneWithDecryption, findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
 import { E } from '#generated/entities.ids.generated'
+// §8.4 (D-R5-21): same precedent as `lib/currentCartRoute.ts` — a plain static import, both
+// modules being `packages/core`.
+import { getCustomerAuthFromRequest } from '@open-mercato/core/modules/customer_accounts/lib/customerAuth'
 
 import { CatalogProduct } from '@open-mercato/core/modules/catalog/data/entities'
 import { deriveQuantityRules } from '@open-mercato/core/modules/availability/lib/quantityRules'
@@ -435,6 +438,20 @@ const mergeCartCommand: CommandHandler<CartMergeInput, CartMergeResult> = {
     // token, a cross-tenant token and a genuinely absent source cart all collapse to the
     // same 404 — never a distinguishable reason.
     if (!guestCart) throw notFound('[internal] source cart not found')
+    // §8.4 (D-R5-21)'s own "Consequences" bullet names this exact case: "a `sourceToken`
+    // that resolves an identified basket of another buyer is the same `404`." The TARGET
+    // cart's own identity binding is already enforced at the route edge
+    // (`lib/currentCartRoute.ts#resolveCurrentCart`) before this command ever runs — this is
+    // the SOURCE side of the same rule, since `sourceToken` names a second basket this
+    // command resolves itself, never through that route-edge seam. A guest source cart
+    // (`customerUserId` null) is unaffected — token alone still suffices, same as any other
+    // guest basket.
+    if (guestCart.customerUserId) {
+      const sourceAuth = ctx.request ? await getCustomerAuthFromRequest(ctx.request) : null
+      if (!sourceAuth || sourceAuth.sub !== guestCart.customerUserId) {
+        throw notFound('[internal] source cart not found')
+      }
+    }
     if (guestCart.id === sessionCart.id) throw badRequest('[internal] cannot merge a cart into itself')
     // Same store, same currency only (PLAN.md's own Step 7.3 scope line; §16 Open Question 2
     // — "Cross-store carts [are] scoped to one store per the roadmap" — reads as the reason

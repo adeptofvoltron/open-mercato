@@ -635,3 +635,59 @@
   outside this Step's own new tests (one existing test's expected-error log line, `currentCartRoute.
   error-mapping.test.ts`, prints "boom" to stderr by design — not a failure). No UI touched, no
   `yarn generate`/`yarn db:generate` needed (no new auto-discovered files, no schema change).
+
+## 2026-10-26T22:26:13Z — Step 2.9 landed
+
+- **Behavior change (D-R5-21, UPGRADE_NOTES-ready description for Step 6.2):** every
+  `/api/cart/current/*` route (`current`, `current/lines`, `current/lines/[lineId]`,
+  `current/lines/bulk`, `current/promotions`, `current/promotions/[id]`, `current/merge`,
+  `current/undo-merge`) now refuses an IDENTIFIED basket (one with `customer_user_id` set) to
+  any request that does not also carry that buyer's own customer session (`X-Cart-Token` plus
+  a valid `customer_auth_token` cookie or `Authorization: Bearer <customer JWT>` whose subject
+  equals the basket's `customer_user_id`). A request with no session, or with a DIFFERENT
+  customer's valid session, now gets the exact same `404` body as an unknown/wrong token — no
+  re-price, no re-identification, no activity stamp runs. `POST /current/merge`'s `sourceToken`
+  body field follows the identical rule for the SOURCE (guest) cart it names. A GUEST basket
+  (`customer_user_id` null) is completely unaffected and stays fully token-only, exactly as
+  before. Before this change, an anonymous `GET /current` presenting an identified basket's
+  token silently re-identified that basket to "guest" (`customerUserId` rewritten to `null` by
+  the whole-cart re-price trigger), disclosing B2B contract pricing and re-pricing the basket to
+  list — the storefront integration must now forward the buyer's customer session alongside the
+  cart token on every request, and must start a brand-new guest cart after logout rather than
+  reusing the old token (a later login still merges it normally). No cart/API contract fields
+  changed — only the authorization outcome for this one case.
+- **Non-breaking addition (D-R5-22):** a trusted `pos`/`pay_link`/`agent`/`api` cart created
+  via `cart.create`'s authenticated path for a known buyer (`customerId` or `customerUserId`
+  supplied by the trusted caller, never from request input) now resolves that buyer's REAL
+  company/group/price-kind identity through `storeContextService.resolveForBuyer` when
+  `ecommerce` is registered — `customerId`, `customerIds` (person AND company), `customerUserId`,
+  `customerGroupIds`, `priceKindId`, `taxMode` and `buyerDigest` all come from the resolved
+  identity instead of the old placeholder (`customerIds = [customerId]`, no groups, no price
+  kind). `currencyCode` is unaffected — it stays the trusted caller's own required input, per
+  the spec's own fill list. A guest trusted cart (no buyer named) or a deployment with
+  `ecommerce` disabled behaves exactly as before (documented fallback, not silent).
+- Files: `packages/core/src/modules/cart/lib/currentCartRoute.ts` (the identity-binding check,
+  centralized once in `resolveCurrentCart`'s own `peekCartCustomerUserId` pre-check — runs
+  BEFORE `cart.get` so the old bypass's own write path, trigger 2's `applyCartRepriceTriggerFields`,
+  can never fire for a mismatched/anonymous request against an identified basket);
+  `packages/core/src/modules/cart/commands/merge.ts` (the SAME check applied to `sourceToken`'s
+  resolved guest cart); `packages/core/src/modules/cart/commands/cart.ts` (the trusted-path
+  `resolveForBuyer` fill, `resolveTrustedCartBuyerIdentity`/`tryResolveStoreContextService`).
+  Tests: `packages/core/src/modules/cart/lib/__tests__/currentCartRoute.identity-binding.test.ts`
+  (new, 6 cases), `packages/core/src/modules/cart/commands/__tests__/merge.test.ts` (+3 cases),
+  `packages/core/src/modules/cart/commands/__tests__/cart.test.ts` (+3 cases).
+- Two scope calls made without the owner, both logged in PLAN.md "Decisions taken without the
+  owner": (1) extended Part A to also cover `cart.merge`'s `sourceToken`, which the task brief's
+  own bullet list did not name but §8.4's text explicitly lists as a consequence of the same
+  rule; (2) followed the spec's literal seven-field `resolveForBuyer` fill list over the task
+  brief's broader field list, which named `currencyCode` — the spec text and the trusted
+  caller's own required-field validator both confirm the omission is deliberate.
+- Checks (local mode, no Docker `app` container running): `npx tsc --noEmit` scoped to
+  `packages/core`, clean (0 errors). Full `src/modules/cart` jest suite from `packages/core`:
+  19/19 suites, 238/238 tests — zero regressions (226 pre-existing + 12 new: 6 identity-binding
+  + 3 merge sourceToken + 3 trusted-path identity fill). `eslint` clean on every changed/new
+  file. The X1 regression test (`resolveCurrentCart`'s "an identified basket refuses a
+  token-only anonymous request" case) and the guest/token-only preservation test both pass,
+  proving the old bypass path can no longer be reached and guest baskets are unaffected. No UI
+  touched, no `yarn generate`/`yarn db:generate` needed (no new auto-discovered files, no schema
+  change).
