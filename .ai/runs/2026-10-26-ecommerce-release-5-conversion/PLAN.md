@@ -30,7 +30,7 @@
 | 1 | 1.10 | promotions: un-hide `delivery_method` rule + `DELIVERY_DISCOUNT` effect (D-R5-17) | dispatch:standard | done | pending |
 | 1 | 1.11 | customer_groups: admin credit-account provisioning route + ledger-listing read route (G13/D-R5-5 gap-fill) | dispatch:standard | done | pending |
 | 1 | 1.12 | customer_groups: admin credit-account `/adjust` command route (G13/G20/D-R5-2 gap-fill) | dispatch:standard | done | pending |
-| 2 | 2.1 | availability: `AvailabilityReservation` entity + migration (A3) | dispatch:standard | todo | — |
+| 2 | 2.1 | availability: `AvailabilityReservation` entity + migration (A3) | dispatch:standard | done | pending |
 | 2 | 2.2 | availability: reserve/release/commit via `wmsReservationService`, CAS, per-line outcomes, allocation (A6/A7/A14/A15) | dispatch:standard | todo | — |
 | 2 | 2.3 | availability: expiry job + reconciliation job + events (A11/A12/A13) | dispatch:standard | todo | — |
 | 2 | 2.4 | customer_groups: `CustomerPurchaseApproval` entity + migration (actor-typed columns, policy snapshot) | dispatch:standard | todo | — |
@@ -184,6 +184,26 @@ commit `c92470d8d5`).
   through the generic `/api/audit_logs/audit-logs/actions/undo` route. Without it, "a command with
   real undo" would be implemented but unreachable from any client. Not explicitly named in the
   Step's brief, but treated as part of "the route's own shape," not a scope change.
+- Step 2.1 (A3/§5.3): the spec places `AvailabilityReservationStatus`/`AvailabilityReservationLineOutcome`/
+  the richer `AvailabilityReservationLine` type in a new file, `lib/reservationCommands.ts`, that
+  does not exist yet (it is Step 2.2's own deliverable — the `reserve`/`release`/`commit` commands).
+  Since this Step is entity-and-migration-only, the narrower, persisted-snapshot versions of these
+  types (`AvailabilityReservationSourceType`, `AvailabilityReservationStatus`,
+  `AvailabilityReservationLineOutcome`, `AvailabilityReservationItemSnapshot`) were declared
+  alongside the `AvailabilityReservation` entity in `data/entities.ts` instead — the same place
+  `wms/data/entities.ts` declares `InventoryReservationSourceType`/`InventoryReservationStatus`
+  next to `InventoryReservation`. Step 2.2 should import these from `data/entities.ts` for the
+  column-shape types and layer its own richer `AvailabilityReservationLine` (adding `key`/
+  `available`) in `lib/reservationCommands.ts` on top, narrowing down to the entity's snapshot
+  shape before persisting — not redeclare a second, divergent set of status/outcome unions.
+  Alternative considered: leave the types undeclared until Step 2.2 — rejected because the entity's
+  own `status`/`items` columns need a TS type now, and zod validators for the `items` jsonb shape
+  were an explicit deliverable of this Step.
+- Step 2.1 (§5.3's own text): no optimistic-lock header was wired — the spec states this table
+  "is not user-editable (no admin form, A18), so it carries `updated_at` for transitions only, with
+  no optimistic-lock header," which directly answers the root AGENTS.md scoping question the task
+  brief raised rather than leaving it a judgment call. `updated_at` is still an `onUpdate` column so
+  Step 2.2's CAS `WHERE status = 'active' AND …` transitions can observe it.
 
 ## External References
 

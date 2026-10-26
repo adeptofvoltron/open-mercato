@@ -228,3 +228,40 @@
   (customer_groups+promotions+cart+wms+ecommerce) 214/215 suites, 2254/2256 tests, 1 expected skip.
 - Phase 1 is complete. All 12 Steps landed; one rescue needed (infrastructure, not quality); two
   gap-fills appended and closed within the same phase. No fix-forward Steps needed.
+
+## 2026-10-26T19:00:00Z — Step 2.1 landed (Phase 2 opens)
+- `availability`: `AvailabilityReservation` entity (`availability_reservations`) per §5.3/A3 —
+  `id`, `tenant_id`/`organization_id`, `idempotency_key`, `source_type` (narrowed to the literal
+  `'checkout'`, A16's system-only rule), `source_id`, `status` (`active|committed|released|expired`,
+  default `active`), `expires_at` (nullable), `items` (jsonb snapshot: `catalogProductId`,
+  `catalogVariantId`, `requested`, `outcome`, `heldQuantity`, `backorderQuantity`),
+  `wms_reservation_ids` (jsonb `string[]`, default `[]`), `order_id` (nullable uuid, FK-id only, no
+  ORM relation into `sales`), `status_reason` (nullable), `created_at`/`updated_at`. No
+  `deleted_at` (§5.3: never soft-deleted, the hold's own audit trail) and no optimistic-lock
+  header (§5.3: not user-editable, `updated_at` exists only for the Step 2.2 CAS transitions).
+- Indexes: unique `(tenant_id, organization_id, idempotency_key)` over ALL statuses (A15 — a key
+  is never reused for different content even once terminal); partial `(expires_at) WHERE status =
+  'active'` for the Step 2.3 expiry sweep (A11); `(tenant_id, organization_id, source_type,
+  source_id)` for session lookups.
+- `data/validators.ts`: zod schemas for the persisted `items` snapshot shape
+  (`availabilityReservationItemSnapshotSchema`/`...ItemsSnapshotSchema`, non-empty array,
+  five-member outcome enum), plus `sourceType`/`status` schemas. Entity-only Step — no
+  `reserve`/`release`/`commit` service or command code (Step 2.2's scope).
+- Test: `data/__tests__/reservation.test.ts` (7 cases) — entity/validator round-trip for a `held`
+  and a `backorder` line, null-variant product-rollup line, negative-quantity rejection, outcome
+  enum rejection, empty-items rejection, source-type/status enum bounds.
+- Scope call (logged in PLAN.md "Decisions taken without the owner"): the spec's richer
+  `AvailabilityReservationLine` type (`key`/`available`) lives in `lib/reservationCommands.ts`,
+  which is Step 2.2's own deliverable and doesn't exist yet. Declared the narrower, persisted-
+  snapshot status/outcome/source-type types in `data/entities.ts` instead, next to the entity —
+  mirrors `wms/data/entities.ts`'s `InventoryReservationSourceType`/`Status` precedent. Step 2.2
+  should import these rather than redeclare a divergent set.
+- Checks: `yarn typecheck` in `packages/core` clean (tsc --noEmit, no output). `yarn db:generate`
+  produced exactly one migration (`availability: generated Migration20261026185450_availability.ts`,
+  a pure `create table` + 3 indexes + 1 unique constraint). Re-ran a second time to confirm
+  `availability: no changes`. Pre-existing, unrelated drift in `forms` and `wms` (an old consent
+  unique-index drop and a wms FK/idempotency-key backfill, both predating this Step) appeared on
+  both runs regardless of this Step's own changes — discarded both times per the root AGENTS.md
+  coding-agent exception, snapshots reverted via `git checkout`. `yarn jest` in `packages/core`:
+  new test file 7/7 pass; full `src/modules/availability` suite 108/108 pass (11 suites), no
+  regressions.

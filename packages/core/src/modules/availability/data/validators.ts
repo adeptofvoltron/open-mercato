@@ -85,3 +85,36 @@ export const availabilityPolicyMergedConstraintsSchema = refinePolicyConstraints
 
 export type AvailabilityPolicyCreateInput = z.infer<typeof availabilityPolicyCreateSchema>
 export type AvailabilityPolicyUpdateInput = z.infer<typeof availabilityPolicyUpdateSchema>
+
+// Release 5 Phase 3 (§5.3, A3). Validates the `AvailabilityReservation.items` jsonb snapshot —
+// exactly the per-line shape §5.3's data-model table names (`catalogProductId`, `catalogVariantId`,
+// `requested`, `outcome`, `heldQuantity`, `backorderQuantity`). The `reserve`/`release`/`commit`
+// commands that populate this column (Step 2.2) build their own richer in-memory line type
+// (adding `key`/`available`, §4.1) and narrow it down to this snapshot before persisting.
+export const availabilityReservationSourceTypeSchema = z.literal('checkout')
+export const availabilityReservationStatusSchema = z.enum(['active', 'committed', 'released', 'expired'])
+export const availabilityReservationLineOutcomeSchema = z.enum([
+  'held',
+  'not_tracked',
+  'preorder',
+  'backorder',
+  'shortfall',
+])
+
+export const availabilityReservationItemSnapshotSchema = z.object({
+  catalogProductId: uuid(),
+  catalogVariantId: uuid().nullable(),
+  requested: positiveInt(),
+  outcome: availabilityReservationLineOutcomeSchema,
+  heldQuantity: nonNegativeInt(),
+  backorderQuantity: nonNegativeInt(),
+})
+
+export const availabilityReservationItemsSnapshotSchema = z
+  .array(availabilityReservationItemSnapshotSchema)
+  .min(1)
+
+export type AvailabilityReservationSourceType = z.infer<typeof availabilityReservationSourceTypeSchema>
+export type AvailabilityReservationStatus = z.infer<typeof availabilityReservationStatusSchema>
+export type AvailabilityReservationLineOutcome = z.infer<typeof availabilityReservationLineOutcomeSchema>
+export type AvailabilityReservationItemSnapshotInput = z.infer<typeof availabilityReservationItemSnapshotSchema>
