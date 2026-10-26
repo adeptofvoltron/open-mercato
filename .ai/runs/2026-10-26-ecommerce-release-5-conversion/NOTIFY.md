@@ -865,3 +865,16 @@
   promotions` jest suite — 28/28 suites, 333/333 tests, unaffected (confirms `PromotionCodeService
   .releaseCode`'s own signature/behavior was read, never edited). `TMPDIR=/tmp yarn typecheck`
   (scoped to `packages/core`) — clean, exit 0. `npx eslint` on all four touched files — clean.
+
+## 2026-10-27T19:40:00Z — checkpoint 5 (Steps 2.6–2.11)
+- Range: `38149dcb0a`..`7443c78d16`. Summary: approval portal/staff routes + ACL/grants +
+  notifications (customer_groups approval track complete); cart lock extend, D-R5-21/22 identity
+  binding (recorded behavior change, UPGRADE_NOTES-ready description already logged above by
+  Step 2.9 itself), markConverted lineMap + first cart admin UI, abandonment payload + K11
+  code-release.
+- Checks: forced full typecheck (40/40, 0 cached) pass; scoped tests pass (customer_groups+cart+
+  promotions 95/97 suites, 1087/1095 tests — 2 expected Postgres-gated skips).
+- Process note: this checkpoint covers 6 Steps, not 5 — a pacing slip (dispatched 2.10→2.11
+  without pausing). No quality impact; resuming strict every-5 pacing from Step 2.12.
+- Decisions/problems: none blocking. One non-blocking gap from 2.11 (purge sweeper / converted
+  baskets' code reservations) already logged above.
