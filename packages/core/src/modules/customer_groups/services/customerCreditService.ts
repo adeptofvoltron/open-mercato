@@ -25,6 +25,14 @@ import { resolveCompanyFirstCustomerId } from '../lib/creditIdentity'
 // `promotions/lib/code-service.ts#useCode`, D-R4-12) replacing a SERIALIZABLE design that
 // does not work here: `withAtomicFlush` ignores `isolationLevel` when it joins an ambient
 // transaction (`packages/shared/src/lib/commands/flush.ts`). No 40001 retry helper.
+//
+// Encryption (G22, Step 1.7): `hold_reason`/`note` are registered in `../encryption.ts`.
+// Every plain `this.em.find`/`findOne` below is still correct as-is — this service never
+// reads either field's VALUE back for business logic (only `isOnHold`/`creditLimit`/
+// amounts), so the ciphertext MikroORM returns for them is never surfaced or compared.
+// The write side needs no change either: the platform's flush subscriber encrypts a
+// registered field transparently regardless of whether the entity was loaded through a
+// decrypting helper.
 
 export type CommerceScope = { tenantId: string; organizationId: string }
 
