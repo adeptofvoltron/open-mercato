@@ -491,3 +491,13 @@
     and by checkout's `min_order_value` check (Step 5.1).
   - `allowQuoteRequests` — needed by checkout B.5 (Step 5.1, D-R5-20 request_quote method gating).
   - `requiresPoNumber` — needed by checkout B.5 (Step 5.1, D-R5-28 PO-on-quote).
+
+## 2026-10-26T21:00:00Z — checkpoint 4 (Steps 2.1–2.5)
+- Range: `04f87ab424`..`5db46425d1`. Summary: availability reservation entity + reserve/release/
+  commit service (bug found+fixed during concurrency testing: raw SQL FOR UPDATE wasn't binding
+  to the ambient transaction, switched to ORM lockMode) + expiry/reconciliation jobs; customer
+  purchase approval entity + CAS service (mutation-tested double-decide race) + expiry job.
+- Checks: forced full typecheck (40/40, 0 cached) pass; scoped tests pass (availability+wms+
+  customer_groups 115/118 suites, 973/990 tests — 3 expected Postgres-gated skips).
+- Decisions/problems: none blocking. One tracked follow-up already logged above (resolveTerms
+  gaps). availability track is now fully complete for this release.
