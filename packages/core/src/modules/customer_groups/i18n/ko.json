@@ -225,6 +225,8 @@
   "customer_groups.groups.personTab.validRange": "{from} – {until}",
   "customer_groups.groups.personTab.validUntilOnly": "{until}까지",
   "customer_groups.nav.group": "고객 그룹",
+  "customer_groups.notifications.creditLimitExceeded.body": "{requestedAmount} {currencyCode} 예약이 거부되었습니다: 노출 금액이 신용 한도 {creditLimit} {currencyCode}를 초과하게 됩니다.",
+  "customer_groups.notifications.creditLimitExceeded.title": "신용 한도 초과",
   "customer_groups.widgets.groupPicker.label": "고객 그룹",
   "customer_groups.widgets.groupPicker.placeholder": "고객 그룹 검색…",
   "customer_groups.widgets.groupPicker.priority": "우선순위 {priority}",

@@ -10,6 +10,7 @@ import {
 } from '../data/entities'
 import { createCustomerGroupsService, type CustomerGroupsService } from './customerGroupsService'
 import { resolveCompanyFirstCustomerId } from '../lib/creditIdentity'
+import { emitCustomerGroupsEvent } from '../events'
 
 // Release 5 Phase 3 (spec §6, §6.3, §6.5). Row-lock concurrency (G1), scoped calls with
 // an addressable release (G2), decimal-string money (G14) and the four idempotency
@@ -161,11 +162,15 @@ export interface CustomerCreditService {
 const MONEY_FRACTION_DIGITS = 2
 const MONEY_MINOR_UNIT_FACTOR = 10 ** MONEY_FRACTION_DIGITS
 
-function toMinorUnits(value: string): number {
+// Exported for `workers/credit-exposure-audit.ts` (G21), which recomputes the same
+// `SUM(amount)` this service computes under the lock (`sumExposure` below) and must use
+// the identical minor-unit rounding to compare against `balance_after` without reporting
+// its own rounding as drift (G14).
+export function toMinorUnits(value: string): number {
   return Math.round(Number(value) * MONEY_MINOR_UNIT_FACTOR)
 }
 
-function formatMinorUnits(value: number): string {
+export function formatMinorUnits(value: number): string {
   return (value / MONEY_MINOR_UNIT_FACTOR).toFixed(MONEY_FRACTION_DIGITS)
 }
 
@@ -190,6 +195,38 @@ function roundHalfUpToTwoDp(value: string): string {
   const isNegative = amount < 0 && absMinorUnits !== 0
   const formatted = formatMinorUnits(absMinorUnits)
   return isNegative ? `-${formatted}` : formatted
+}
+
+// §10.1 `CreditLimitExceededPayload`. No PII (ids and amounts only), consistent with
+// checkout's redaction rule — see `events.ts` for why the sibling `credit.*` events stay
+// undeclared for now.
+async function emitCreditLimitExceededEvent(input: {
+  scope: CommerceScope
+  creditAccountId: string
+  customerId: string
+  currencyCode: string
+  requestedAmount: DecimalString
+  exposure: DecimalString
+  creditLimit: DecimalString
+  sourceType: CustomerCreditLedgerSourceType
+  sourceId: string
+}): Promise<void> {
+  await emitCustomerGroupsEvent(
+    'customer_groups.credit.limit_exceeded',
+    {
+      tenantId: input.scope.tenantId,
+      organizationId: input.scope.organizationId,
+      creditAccountId: input.creditAccountId,
+      customerId: input.customerId,
+      currencyCode: input.currencyCode,
+      requestedAmount: input.requestedAmount,
+      exposure: input.exposure,
+      creditLimit: input.creditLimit,
+      sourceType: input.sourceType,
+      sourceId: input.sourceId,
+    },
+    { persistent: true, tenantId: input.scope.tenantId, organizationId: input.scope.organizationId },
+  )
 }
 
 function idempotencyMismatchError(): CustomerCreditServiceError {
@@ -489,6 +526,24 @@ export class DefaultCustomerCreditService implements CustomerCreditService {
         entry: toEntryView(existing),
         check: buildCheck({ allowed: !releaseEntry, reason: 'ok', customerId, currencyCode, account, exposure }),
       }
+    }
+
+    // §10.1 `CreditLimitExceededPayload`, "emitted on a refused reserveCredit" — after the
+    // (no-op) writing transaction has already committed above, never from the idempotent-
+    // replay paths, which always resolve to `reason: 'ok'`. Drives the Step 1.8
+    // `customer_groups.credit.limit_exceeded` notification (G15).
+    if (result.check.reason === 'limit_exceeded' && result.check.creditAccountId) {
+      await emitCreditLimitExceededEvent({
+        scope,
+        creditAccountId: result.check.creditAccountId,
+        customerId,
+        currencyCode,
+        requestedAmount: amount,
+        exposure: result.check.exposure ?? '0.00',
+        creditLimit: result.check.creditLimit ?? '0.00',
+        sourceType: input.sourceType,
+        sourceId: input.sourceId,
+      })
     }
 
     return result

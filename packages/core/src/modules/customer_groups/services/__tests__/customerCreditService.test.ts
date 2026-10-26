@@ -10,6 +10,16 @@
 import { randomUUID } from 'crypto'
 import { CustomerCreditAccount, CustomerCreditLedgerEntry } from '../../data/entities'
 import type { CustomerGroupsService, ResolvedTerms } from '../customerGroupsService'
+
+// Step 1.8: `reserveCredit` emits `customer_groups.credit.limit_exceeded` on refusal —
+// mocked here (as `../../events` mocks it in `api/customer-groups/__tests__/*.test.ts`)
+// so this file keeps testing only the service's decision logic; the emission itself is
+// asserted below in the `limit_exceeded` test case.
+const emitCustomerGroupsEventMock = jest.fn(async () => {})
+jest.mock('../../events', () => ({
+  emitCustomerGroupsEvent: (...args: unknown[]) => emitCustomerGroupsEventMock(...args),
+}))
+
 import {
   DefaultCustomerCreditService,
   CustomerCreditServiceError,
@@ -142,6 +152,10 @@ function buildService(em: FakeEm, groupsService: CustomerGroupsService) {
 }
 
 describe('customerCreditService', () => {
+  beforeEach(() => {
+    emitCustomerGroupsEventMock.mockClear()
+  })
+
   describe('checkCredit', () => {
     test('not_permitted wins even when an account exists', async () => {
       const { em, tables } = createFakeEm()
@@ -298,6 +312,42 @@ describe('customerCreditService', () => {
       expect(result.reserved).toBe(false)
       expect(result.check.reason).toBe('limit_exceeded')
       expect(tables.get(CustomerCreditLedgerEntry) ?? []).toHaveLength(0)
+
+      // Step 1.8 (G15): the refusal emits `customer_groups.credit.limit_exceeded`,
+      // which drives the credit-manager notification.
+      expect(emitCustomerGroupsEventMock).toHaveBeenCalledTimes(1)
+      expect(emitCustomerGroupsEventMock).toHaveBeenCalledWith(
+        'customer_groups.credit.limit_exceeded',
+        expect.objectContaining({
+          tenantId: TENANT,
+          organizationId: ORG,
+          customerId: CUSTOMER_ID,
+          currencyCode: CURRENCY,
+          requestedAmount: '150.00',
+          creditLimit: '100.00',
+          sourceType: 'checkout',
+          sourceId: 'session-1',
+        }),
+        { persistent: true, tenantId: TENANT, organizationId: ORG },
+      )
+    })
+
+    test('does not emit limit_exceeded on on_hold or not_permitted refusals', async () => {
+      const { em, tables } = createFakeEm()
+      seedAccount(tables, { isOnHold: true })
+      const service = buildService(em, allowTerms(true))
+
+      await service.reserveCredit({
+        scope: SCOPE,
+        buyer: { customerId: CUSTOMER_ID },
+        currencyCode: CURRENCY,
+        amount: '10.00',
+        sourceType: 'checkout',
+        sourceId: 'session-1',
+        idempotencyKey: 'reserve-hold-no-event',
+      })
+
+      expect(emitCustomerGroupsEventMock).not.toHaveBeenCalled()
     })
 
     test('idempotency rule 1: same key, same tuple returns the original entry, nothing new written', async () => {

@@ -225,6 +225,8 @@
   "customer_groups.groups.personTab.validRange": "{from} – {until}",
   "customer_groups.groups.personTab.validUntilOnly": "Bis {until}",
   "customer_groups.nav.group": "Kundengruppen",
+  "customer_groups.notifications.creditLimitExceeded.body": "Eine Reservierung von {requestedAmount} {currencyCode} wurde abgelehnt: Das Obligo würde das Kreditlimit von {creditLimit} {currencyCode} überschreiten.",
+  "customer_groups.notifications.creditLimitExceeded.title": "Kreditlimit überschritten",
   "customer_groups.widgets.groupPicker.label": "Kundengruppe",
   "customer_groups.widgets.groupPicker.placeholder": "Kundengruppen durchsuchen …",
   "customer_groups.widgets.groupPicker.priority": "Priorität {priority}",

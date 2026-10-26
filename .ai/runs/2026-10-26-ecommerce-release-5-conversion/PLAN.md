@@ -25,10 +25,11 @@
 | 1 | 1.5 | customer_groups: credit entities + migration + new `CustomerGroupTerms` columns | dispatch:standard | done | pending |
 | 1 | 1.6 | customer_groups: credit service, row-lock reserve/release/settle + N=20 test (G1/G2/G12/G14) | dispatch:standard | done | pending |
 | 1 | 1.7 | customer_groups: credit admin API + UI + ACL + encryption.ts (G13/G16/G22) | dispatch:standard | done | pending |
-| 1 | 1.8 | customer_groups: credit notifications + exposure-audit job + cancel-release subscriber (D-R5-2/G15/G21) | dispatch:standard | todo | — |
+| 1 | 1.8 | customer_groups: credit notifications + exposure-audit job + cancel-release subscriber (D-R5-2/G15/G21) | dispatch:standard | done | pending |
 | 1 | 1.9 | promotions: `revertCodeUse` + `sales.order.cancelled` subscriber (C5) | dispatch:standard | todo | — |
 | 1 | 1.10 | promotions: un-hide `delivery_method` rule + `DELIVERY_DISCOUNT` effect (D-R5-17) | dispatch:standard | todo | — |
 | 1 | 1.11 | customer_groups: admin credit-account provisioning route + ledger-listing read route (G13/D-R5-5 gap-fill) | dispatch:standard | todo | — |
+| 1 | 1.12 | customer_groups: admin credit-account `/adjust` command route (G13/G20/D-R5-2 gap-fill) | dispatch:standard | todo | — |
 | 2 | 2.1 | availability: `AvailabilityReservation` entity + migration (A3) | dispatch:standard | todo | — |
 | 2 | 2.2 | availability: reserve/release/commit via `wmsReservationService`, CAS, per-line outcomes, allocation (A6/A7/A14/A15) | dispatch:standard | todo | — |
 | 2 | 2.3 | availability: expiry job + reconciliation job + events (A11/A12/A13) | dispatch:standard | todo | — |
@@ -100,6 +101,20 @@ commit `c92470d8d5`).
   for the widget, not the full §9 route table. Alternative considered: ship the full credit-accounts
   resource (create + ledger + adjust) in one Step — rejected as scope creep past what this Step was
   asked to build; a future Step should pick these up explicitly.
+- Step 1.8 (G13/G20/D-R5-2): `/adjust` is still not shipped after this Step either — the Step's own
+  brief named three deliverables (notifications, the exposure-audit job, the cancel-release
+  subscriber) and explicitly warned against scope-creeping `/adjust` in alongside them. Checked
+  PLAN.md Phase 1/2: Step 1.11's gap-fill covers account-creation and ledger-listing only, not
+  `/adjust`; no other Step names it. Per D-R5-2/§6.5, `/adjust` is the operator-facing half of
+  "payments settle only via `/adjust` or `settleCredit`" — without it, an on-account tenant with no
+  payments integration has no way to ever lower exposure, which is a real functional gap for
+  Release 5 completeness, not a cosmetic one. Appended Step 1.12 (same pattern as 1.11: a same-
+  module, additive, low-risk admin command route with an unambiguous spec basis, §9/§9.1/§9.2/G20)
+  to the end of Phase 1 rather than building it here or stopping the run. Alternative considered:
+  build it in this commit since the service method shape (`adjust` as a command, G20) is simple —
+  rejected because it is an admin API route (validator, feature-gated route, command registration,
+  audit/undo wiring), a different surface than this Step's notification/job/subscriber work, and
+  the brief's own instruction named this exact trade-off and asked to prefer the gap-fill.
 
 ## External References
 
@@ -181,6 +196,18 @@ re-paste them.
   route (`GET .../credit-accounts/:id/ledger`, `customer_groups.credit.view`, decrypted `note`,
   paginated) so the admin UI (1.7's widget) can show ledger history. No notification/job change —
   that's 1.8's own scope.
+- **1.12** `customer_groups`: gap-fill appended after Step 1.8 landed without it — see PLAN.md
+  "Decisions taken without the owner". D-R5-2/§6.5 states payments settle "only via `/adjust` or
+  `settleCredit`"; Step 1.8 shipped the automatic cancel-release subscriber and the audit job but,
+  per its own brief, deliberately did not build `/adjust` (an admin API route, not its scope). Add:
+  `POST /api/customer_groups/customer-groups/credit-accounts/:id/adjust`
+  (`customer_groups.credit.adjust`, body `{ amount: string, note: string }` validated `.strict()`),
+  running the `customer_groups.credit.adjust` command under the account row lock (§6.3, same
+  pattern as `reserveCredit`/`releaseCredit`), appending a signed ledger entry with the required
+  `note` (G20). Undo appends the inverse entry (`related_entry_id` = the original,
+  `idempotencyKey: undo:{entryId}`) and never deletes (G20). Declare and emit
+  `customer_groups.credit.adjusted` (G18) alongside it, since the command has no consumer without
+  it. ACL feature `customer_groups.credit.adjust` already exists (Step 1.7).
 
 ### Phase 2 — wave 2 (depends on wave 1)
 

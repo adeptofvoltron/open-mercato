@@ -8,6 +8,14 @@ const events = [
   { id: 'customer_groups.membership.removed', label: 'Customer Removed from Group', entity: 'membership', category: 'crud' },
   { id: 'customer_groups.membership.expired', label: 'Group Membership Expired', entity: 'membership', category: 'lifecycle' },
   { id: 'customer_groups.terms.updated', label: 'Customer Group Terms Updated', entity: 'terms', category: 'crud' },
+  // Release 5 Phase 3 (G15/G18, D-R5-2, §10). Emitted by `reserveCredit` on a refusal
+  // whose reason is `limit_exceeded`, after the (no-op) writing transaction commits. Drives
+  // the `customer_groups.credit.limit_exceeded` notification (`notifications.ts`) through a
+  // persistent subscriber. The remaining `credit.*`/`credit_account.*` events in spec §10
+  // (reserved/released/settled/adjusted/put_on_hold/released_from_hold) have no consumer in
+  // this Step's scope and stay undeclared until a Step that needs them (webhooks, `/adjust`)
+  // adds them — see NOTIFY.md.
+  { id: 'customer_groups.credit.limit_exceeded', label: 'Credit Limit Exceeded', entity: 'credit_account', category: 'lifecycle' },
 ] as const
 
 export const eventsConfig = createModuleEvents({
