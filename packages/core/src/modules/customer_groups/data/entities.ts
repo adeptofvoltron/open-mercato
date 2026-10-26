@@ -584,6 +584,23 @@ export class CustomerPurchaseApproval {
   @Property({ name: 'expires_at', type: Date })
   expiresAt!: Date
 
+  // Release 5 Phase 4 (Step 2.7, G15/D-R5-6/D-R5-32, §10.2). The buyer-side e-mail
+  // fan-out and the single decided-email-to-requester are each sent through
+  // `sendEmail`, which has no dedup of its own (unlike the in-app staff notification,
+  // which dedupes per recipient via the notification system's own `groupKey`). A
+  // persistent subscriber redelivery (`packages/events/AGENTS.md`: "persistent
+  // subscribers MUST be idempotent — they may be retried on failure") would otherwise
+  // re-send every buyer e-mail. These two CAS markers, written with the same
+  // `nativeUpdate ... WHERE … IS NULL` guard this service already uses for every other
+  // transition, make each e-mail batch exactly-once. Not user-editable (no admin form),
+  // so no optimistic-lock header — `updated_at` stays the transition-only column it
+  // already is.
+  @Property({ name: 'requested_email_sent_at', type: Date, nullable: true })
+  requestedEmailSentAt?: Date | null
+
+  @Property({ name: 'decided_email_sent_at', type: Date, nullable: true })
+  decidedEmailSentAt?: Date | null
+
   @Property({ name: 'created_at', type: Date, onCreate: () => new Date() })
   createdAt: Date = new Date()
 

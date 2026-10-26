@@ -544,3 +544,58 @@
   `src/modules/customer_groups` jest suite: 40/42 suites pass, 445/453 tests (8 skipped — the two
   pg-gated concurrency suites, expected without a live Postgres), zero regressions. `eslint` clean
   on every new/changed file. No UI touched — no browser verification needed.
+
+## 2026-10-26T21:52:32Z — Step 2.7 landed
+- `customer_groups`: approval notifications — in-app to merchant deciders (`customer_groups.
+  approval.requested`, new type in `notifications.ts`, fan-out via `createForFeature` +
+  `restrictRecipientsToOrganization: true` to every staff holder of `customer_groups.approvals.
+  decide` in the organization, idempotent on redelivery for free via the notification system's own
+  `groupKey` dedupe); e-mail to buyer-side deciders/requesters through the shared `sendEmail`
+  pipeline, gated by a new per-tenant switch (`ModuleConfigService` key `customer_groups.
+  approval_emails_enabled`, default ON, same call shape `resolveApprovalExpiryDays` already
+  established in this module).
+- Did NOT declare `customer_groups.approval.decided` — the authoritative, REVISED spec text
+  (§10.2's own closing line) explicitly says it is not declared in Release 5 (no path creates a
+  staff-requested approval, X7), directly contradicting the pre-decision G15 wording the Step brief
+  quoted. Did NOT e-mail the requester on `.withdrawn` — §10.2's e-mail trigger table names only
+  `.approved`/`.rejected`/`.expired`. Both are genuine conflicts between the Step brief (which
+  quotes the ANALYSIS doc, written BEFORE the owner's decision pass) and the spec (written AFTER
+  it, and the explicitly authoritative text per PLAN.md's own "Implementation Plan" preamble) — see
+  PLAN.md "Decisions taken without the owner" for the full reasoning and code citations.
+- Idempotency for the e-mail sends (no platform primitive exists for this — persistent subscribers
+  are only at-least-once, and `sendEmail` has no dedup of its own): added two additive, nullable
+  timestamp columns to `CustomerPurchaseApproval` (`requested_email_sent_at`,
+  `decided_email_sent_at`) as CAS markers, migration `Migration20261026213913_customer_groups`
+  (generated via `yarn db:generate`; two unrelated migrations it also emitted for `forms`/`wms`
+  were deleted and their snapshots reverted per the coding-agent exception in root AGENTS.md).
+- New files: `lib/approvalNotifications.ts` (merchant in-app fan-out), `lib/approvalEmails.ts`
+  (buyer e-mail fan-out + requester e-mail + the per-tenant switch + the CAS markers), `lib/
+  approvalEmailRecipients.ts` (FK-id-only raw-SQL reads against `customer_accounts.customer_users`,
+  no ORM import — same convention `lib/creditIdentity.ts` already set), `lib/
+  approvalDecidedSubscriberHandler.ts` (shared dispatch behind the three decided subscribers),
+  `emails/ApprovalEmail.tsx` (shared buyer-facing e-mail layout, modelled on `customer_accounts/
+  emails/CustomerInvitationEmail.tsx`), four subscribers (`subscribers/approval-{requested,
+  approved,rejected,expired}-notification.ts`, one event id per file per the `events` module's own
+  registry contract).
+- `customer_accounts` (`customerRbacService`, for the portal-decide feature check) and `configs`
+  (`moduleConfigService`, for the switch) are both resolved via a local `tryResolve` helper and
+  degrade to "skip the e-mail" when absent — optional peers, per `packages/core/AGENTS.md` → Cross-
+  Module Coupling, same pattern `customer_groups/di.ts`'s own `softCradle` already established for
+  `moduleConfigService`.
+- No deep link on the new in-app notification — no staff admin UI page for approvals exists yet
+  (Step 2.6 shipped API routes only); left `linkHref` unset rather than inventing one, same
+  restraint `customer_groups.credit.limit_exceeded` took in Step 1.8.
+- Tests: `lib/__tests__/approvalNotifications.test.ts` (merchant fan-out + groupKey + feature id),
+  `lib/__tests__/approvalEmails.test.ts` (all three policies' routing, the per-tenant switch, the
+  CAS-marker idempotency on redelivery for both the requested batch and the decided single-send,
+  the never-staff-requester guard, requester exclusion from the buyer-decider list),
+  `lib/__tests__/approvalDecidedSubscriberHandler.test.ts` (status binding, payload parsing),
+  `subscribers/__tests__/approval-requested-notification.test.ts` (policy-gated dispatch, one
+  channel's failure not blocking the other).
+- Checks (local mode, no Docker `app` container running): `yarn db:generate` (customer_groups
+  migration reviewed, unrelated forms/wms output discarded); `yarn generate` (clean, 381 generated
+  artifacts refreshed); `npx tsc --noEmit` scoped to `packages/core` clean (0 errors); `npx jest
+  src/modules/customer_groups` from `packages/core` (root `yarn jest` fails on every suite here,
+  known issue) — 44/46 suites pass, 467/475 tests, 2 suites skipped (pg-gated concurrency, expected
+  without a live worker harness), zero regressions; `eslint` clean on every new/changed file. No UI
+  touched — no browser verification needed.

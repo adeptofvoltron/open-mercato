@@ -36,7 +36,7 @@
 | 2 | 2.4 | customer_groups: `CustomerPurchaseApproval` entity + migration (actor-typed columns, policy snapshot) | dispatch:standard | done | pending |
 | 2 | 2.5 | customer_groups: approval service, CAS decide/withdraw (G6) + `expire-approvals` job (D-R5-27) | dispatch:standard | done | pending |
 | 2 | 2.6 | customer_groups: approval portal + staff routes + ACL + grants (G5/G7/D-R5-7/D-R5-34) | dispatch:standard | done | pending |
-| 2 | 2.7 | customer_groups: approval notifications (D-R5-6/D-R5-32/G15) | dispatch:standard | todo | — |
+| 2 | 2.7 | customer_groups: approval notifications (D-R5-6/D-R5-32/G15) | dispatch:standard | done | pending |
 | 2 | 2.8 | cart: lock contract — `lockTtlMs`, idempotent extend by `checkoutSessionId`, `unlock`/`markConverted` match (C1) | dispatch:standard | todo | — |
 | 2 | 2.9 | cart: D-R5-21/D-R5-22 identity binding on `/current/*` + trusted `resolveForBuyer` path for pay_link/api/agent | dispatch:standard | todo | — |
 | 2 | 2.10 | cart: `markConverted` additive inputs (`salesOrderId`/`lineMap`/`salesQuoteId`, K8/D-R5-26); admin list + detail + reprice (K6) | dispatch:standard | todo | — |
@@ -416,6 +416,57 @@ commit `c92470d8d5`).
   mapping the service's own `getApproval`/`decideApproval`/`withdrawApproval` already return, rather
   than a second, drifting copy of the `ApprovalView` shape. Purely additive (an `export` keyword on
   an existing function); no behavior change.
+
+- Step 2.7 (G15, D-R5-6, §10.2): did NOT declare `customer_groups.approval.decided` — the Step
+  brief (itself quoting G15's pre-decision wording, "staff requester") conflicts with the
+  REVISED, authoritative spec text written after the owner's decision pass: §10.2's closing line
+  states plainly "A notification for a staff requester (`approval.decided`) is not declared in
+  Release 5, because no Release 5 path creates a staff-requested approval (X7)." Verified against
+  the actual code: `customerPurchaseApprovalService.withdrawApproval`'s own comment (Step 2.5)
+  says "Release 5 only ever has `customer_user` requesters, X7" and `requestApproval` never sets
+  `requestedByActorType: 'staff_user'` anywhere in this release's scope (that needs the
+  assisted-selling proposal seam, Steps 4.3-4.5, not yet landed). Per the root AGENTS.md rule that
+  the spec is the authoritative contract and the analysis is only the finding that produced it,
+  followed the spec over the brief's own analysis-era phrasing. Alternative considered: declare the
+  type anyway for forward-compatibility with the future proposal seam — rejected as declaring a
+  notification type with zero reachable emitters today, and because `BACKWARD_COMPATIBILITY.md`
+  freezes notification ids on ship, so adding it NOW (dead) is no easier than adding it LATER (live)
+  when assisted-selling actually lands.
+- Step 2.7 (D-R5-6, §10.2): the buyer-requester e-mail fires on `.approved`/`.rejected`/`.expired`
+  only, NOT `.withdrawn` — the Step brief's own bullet list named all four, but §10.2's e-mail
+  trigger table lists exactly three ("`approval.approved`, `.rejected`, `.expired` | The requester,
+  when a `customer_user`") and omits `.withdrawn` by its absence, not by oversight (the surrounding
+  text enumerates every other trigger explicitly). A withdrawal is always either the requester's
+  own action or a system cleanup of their own basket (cart merge/expiry/purge, `withdrawnReason`) —
+  there is nothing to tell them they do not already know, unlike approved/rejected/expired, which
+  are decisions someone ELSE (or time) made. Alternative considered: e-mail on withdrawn too for
+  symmetry with the brief's four-state list — rejected as contradicting the spec's own literal
+  trigger table with no stated reason to diverge, the same precedent Step 2.6 set for not inventing
+  a third portal ACL feature past the spec's literal route table.
+- Step 2.7 (G15/G20, idempotency): the task brief's own test requirement ("idempotent on event
+  redelivery — no duplicate emails/notifications") has no existing platform primitive to lean on —
+  `packages/events/AGENTS.md` confirms persistent subscribers are only at-least-once (a redelivery
+  re-runs every persistent subscriber for an event, including ones that already succeeded), and
+  `sendEmail` has no dedup of its own (unlike the sibling in-app notification, which dedupes per
+  recipient via the notification system's `groupKey`). Added two additive, nullable timestamp
+  columns to `CustomerPurchaseApproval` (`requested_email_sent_at`, `decided_email_sent_at`,
+  migration `Migration20261026213913_customer_groups`) as CAS markers, claimed via the SAME
+  `nativeUpdate ... WHERE … IS NULL` pattern this service's own `decideApproval`/`withdrawApproval`
+  already use for every other transition, claimed BEFORE any send is attempted (not after) so a
+  crash mid-batch cannot leave the marker unset while some recipients were already mailed. Not
+  user-editable (no admin form), so no optimistic-lock header, same reasoning Step 2.1 gave for
+  `AvailabilityReservation`'s own transition-only `updated_at`. Alternative considered: a generic
+  reusable "idempotency key" ledger table — rejected after confirming no such shared primitive
+  exists anywhere in `packages/shared`/`packages/core` (every module with this need, e.g. `cart`,
+  `payment_gateways`, `shipping_carriers`, `wms`, built its own small marker); inventing one now,
+  for one module's two call sites, is a bigger surface than two columns on the one entity that
+  already needs the guard.
+- Step 2.7 (§10.2, in-app deep link): `customer_groups.approval.requested`'s in-app notification
+  carries no `linkHref`/action — no staff admin UI page for purchase approvals exists yet (Step 2.6
+  shipped API routes only, no backend UI). Left unset rather than linking to a JSON API route or
+  inventing a page that doesn't exist, mirroring the restraint `customer_groups.credit.limit_
+  exceeded` already took for its own ambiguous deep link (Step 1.8). A future Step building the
+  staff approvals admin UI should add one.
 
 ## External References
 

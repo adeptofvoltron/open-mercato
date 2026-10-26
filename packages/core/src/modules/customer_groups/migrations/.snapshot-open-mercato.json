@@ -1783,6 +1783,23 @@
           "enumItems": [],
           "mappedType": "datetime"
         },
+        "decided_email_sent_at": {
+          "name": "decided_email_sent_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        },
         "expires_at": {
           "name": "expires_at",
           "type": "timestamptz(6)",
@@ -1952,6 +1969,23 @@
           "collation": null,
           "enumItems": [],
           "mappedType": "text"
+        },
+        "requested_email_sent_at": {
+          "name": "requested_email_sent_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "datetime"
         },
         "status": {
           "name": "status",
