@@ -431,3 +431,37 @@ export const customerPurchaseApprovalWithdrawnReasonValues = [
   'cart_purged',
 ] as const
 export const customerPurchaseApprovalWithdrawnReasonSchema = z.enum(customerPurchaseApprovalWithdrawnReasonValues)
+
+// Release 5 Phase 4 (Step 2.6, §9/§9.2). Decide body shared by the staff
+// (`customer_groups.approvals.decide`) and portal (`customer_groups.portal.approvals.decide`)
+// routes. `.strict()` so scope/actor fields cannot be smuggled through the body — the
+// deciding actor always comes from the authenticated session, never the request body,
+// per root AGENTS.md's "scope from the route edge" rule.
+export const customerPurchaseApprovalDecideRequestSchema = z
+  .object({
+    decision: z.enum(['approved', 'rejected']),
+    note: z.string().trim().min(1).max(2000).optional(),
+  })
+  .strict()
+export type CustomerPurchaseApprovalDecideRequest = z.infer<typeof customerPurchaseApprovalDecideRequestSchema>
+
+// Staff list filters (§9: "Organization-scoped list; filters status, customerId,
+// subjectType, ids"). `ids` is a comma-separated list of uuids, split by the route.
+export const customerPurchaseApprovalListQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(20),
+  status: customerPurchaseApprovalStatusSchema.optional(),
+  customerId: z.string().uuid().optional(),
+  subjectType: customerPurchaseApprovalSubjectTypeSchema.optional(),
+  ids: z.string().optional(),
+})
+export type CustomerPurchaseApprovalListQuery = z.infer<typeof customerPurchaseApprovalListQuerySchema>
+
+// Portal list query (§9 portal table: "Pending first, pageSize ≤ 100") — no filters
+// beyond pagination; visibility (own company, own requests vs. the whole company for a
+// `…decide` holder) is computed server-side from the session, never from the query.
+export const customerPurchaseApprovalPortalListQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(20),
+})
+export type CustomerPurchaseApprovalPortalListQuery = z.infer<typeof customerPurchaseApprovalPortalListQuerySchema>

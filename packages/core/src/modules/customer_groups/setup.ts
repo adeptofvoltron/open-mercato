@@ -48,17 +48,30 @@ export const setup: ModuleSetupConfig = {
   defaultRoleFeatures: {
     superadmin: ['customer_groups.*'],
     admin: ['customer_groups.*'],
-    // Release 5 Phase 3 (D-R5-7, least privilege): `employee` gets the view-only credit
-    // feature. `credit.manage`/`credit.adjust` stay with `admin` (covered by the
-    // `customer_groups.*` wildcard above) or are granted by hand. `approvals.view` is
-    // deferred alongside the ACL feature itself — see PLAN.md "Decisions taken without
-    // the owner". Existing tenants need `yarn mercato auth sync-role-acls` (spec §8.4).
+    // Release 5 Phases 3-4 (D-R5-7, least privilege): `employee` gets the view-only
+    // credit AND approvals features. `credit.manage`/`credit.adjust`/`approvals.decide`
+    // stay with `admin` (covered by the `customer_groups.*` wildcard above) or are
+    // granted by hand. Existing tenants need `yarn mercato auth sync-role-acls` (spec
+    // §8.4).
     employee: [
       'customer_groups.groups.view',
       'customer_groups.memberships.view',
       'customer_groups.terms.view',
       'customer_groups.credit.view',
+      'customer_groups.approvals.view',
     ],
+  },
+
+  // Release 5 Phase 4 (Step 2.6, D-R5-7/G16, spec §9.1 grant plan). Portal grants for
+  // the buyer-facing approval API (G5): `portal_admin` views and decides its own
+  // company's requests; `buyer` views and withdraws its own requests (the feature only
+  // gates the read/withdraw surface — "own requests only" is enforced by the route's
+  // company/requester scoping, not by withholding the feature, same reasoning Step
+  // 2.6's task brief states explicitly); `viewer` gets nothing. Existing tenants need
+  // `yarn mercato customer_accounts sync-customer-role-acls` (spec §8.4).
+  defaultCustomerRoleFeatures: {
+    portal_admin: ['customer_groups.portal.approvals.view', 'customer_groups.portal.approvals.decide'],
+    buyer: ['customer_groups.portal.approvals.view'],
   },
 
   // Release 5 Phase 3 (G21, Step 1.8): schedule the daily exposure audit per tenant/

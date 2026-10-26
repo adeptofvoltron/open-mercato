@@ -266,7 +266,12 @@ function toSlotView(
   }
 }
 
-function toApprovalView(row: CustomerPurchaseApproval): ApprovalView {
+// Exported so the Step 2.6 staff/portal list-and-detail routes (which read
+// `CustomerPurchaseApproval` rows directly for filtering/pagination the service's own
+// per-id methods don't support) serialize through the SAME shape the service itself
+// returns from `getApproval`/`decideApproval`/`withdrawApproval`, rather than a second,
+// drifting copy of this mapping.
+export function toApprovalView(row: CustomerPurchaseApproval): ApprovalView {
   return {
     id: row.id,
     customerId: row.customerId,

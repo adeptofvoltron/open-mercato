@@ -501,3 +501,46 @@
   customer_groups 115/118 suites, 973/990 tests — 3 expected Postgres-gated skips).
 - Decisions/problems: none blocking. One tracked follow-up already logged above (resolveTerms
   gaps). availability track is now fully complete for this release.
+
+## 2026-10-26T22:00:00Z — Step 2.6 landed
+- `customer_groups`: staff routes — `GET /api/customer_groups/customer-groups/approvals` (list,
+  `approvals.view`, filters `status`/`customerId`/`subjectType`/`ids`, organization-scoped via the
+  same `resolveOrganizationScopeForRequest` the credit routes use), `GET …/approvals/:id` (detail,
+  same feature), `POST …/approvals/:id/decide` (`approvals.decide`, body `{ decision, note? }`,
+  optimistic-lock header via `enforceCommandOptimisticLock` since the service itself does not read
+  it, G6/§5.6). The staff actor is always `{ actorType: 'staff_user', actorId: auth.sub }` — no
+  `side` input exists on `decideApproval` (Step 2.5 derives the slot from `actor.actorType`
+  directly, simpler than the brief's own framing).
+- Portal routes (new `api/portal/approvals/` tree) — `GET /api/customer_groups/portal/approvals`
+  (list, pending-first, `…portal.approvals.view`), `GET …/:id` (detail), `POST …/:id/decide`
+  (`…portal.approvals.decide`, buyer slot), `POST …/:id/withdraw` (`…portal.approvals.view`,
+  requester-only enforced by the SERVICE's own actor comparison). Every portal route resolves the
+  customer session via `customer_accounts/lib/customerAuth` (static import, same convention as
+  `workflows/api/portal/tasks/route.ts` — both are `packages/core` modules, no extractability
+  concern like `staff`'s dynamic import). A request for another company's approval answers 404,
+  the same body as an unknown id (`lib/portalApprovalAccess.ts`'s `isApprovalVisibleToPortalPrincipal`
+  — one pure predicate, reused by list/detail/decide/withdraw, no second copy of the rule).
+- ACL (`acl.ts`): added `customer_groups.approvals.view`/`.decide` (staff) and
+  `customer_groups.portal.approvals.view`/`.decide` (portal), `dependsOn` the sibling `.view` each,
+  closing the deferral Step 1.7 logged. `setup.ts`: `employee` → `approvals.view` (D-R5-7);
+  `defaultCustomerRoleFeatures.portal_admin` → both portal features, `.buyer` → view only (own
+  requests/withdraw enforced by route scoping, not feature withholding — per the Step brief's own
+  explicit instruction).
+- `services/customerPurchaseApprovalService.ts`: exported `toApprovalView` (was private) so the
+  new list/detail routes serialize through the exact same mapping `getApproval`/`decideApproval`/
+  `withdrawApproval` already return — additive, no behavior change.
+- Tests: `lib/__tests__/portalApprovalAccess.test.ts` (8 cases) for the pure visibility
+  predicate/list-`WHERE` builder; `data/__tests__/purchaseApprovalRoutes.test.ts` (9 cases) for the
+  new decide/list-query zod schemas (`.strict()` body, pageSize cap, filter validation). New
+  Playwright integration spec `TC-CGRP-034-purchase-approval-routes.spec.ts` (2 tests): staff
+  decide feature-gating + tenant/organization isolation + re-decide-409; portal company scoping
+  (buyer sees/withdraws only their own requests, a `…decide` holder sees the whole company,
+  self-decision 403, cross-company 404 on every route, viewer gets 403 with no portal feature at
+  all) — written against the live-DB `withClient` fixture convention this suite's siblings already
+  use (no create route exists for approvals, so every fixture row is inserted directly), NOT
+  executed in this sandboxed worktree (no live Postgres/dev server here) — same situation as every
+  prior `__integration__` spec in this run; run it via the project's normal QA/CI pipeline.
+- Checks: `yarn workspace @open-mercato/core typecheck` clean (0 errors). Full
+  `src/modules/customer_groups` jest suite: 40/42 suites pass, 445/453 tests (8 skipped — the two
+  pg-gated concurrency suites, expected without a live Postgres), zero regressions. `eslint` clean
+  on every new/changed file. No UI touched — no browser verification needed.

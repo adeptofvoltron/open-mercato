@@ -9,12 +9,26 @@ export const features = [
   // Step ships) and `credit.adjust` (the ledger `/adjust` command — not shipped until a
   // later Step) are separate on purpose: different kinds of financial authority tenants
   // will want to grant to different roles. Both depend on `credit.view` only, not on each
-  // other. `approvals.*` is deferred to Step 2.6 — see PLAN.md "Decisions taken without
-  // the owner": `CustomerPurchaseApproval` does not exist yet (Step 2.4), so declaring an
-  // ACL feature with nothing behind it is premature.
+  // other.
   { id: 'customer_groups.credit.view', title: 'View credit accounts', module: 'customer_groups' },
   { id: 'customer_groups.credit.manage', title: 'Manage credit limits', module: 'customer_groups', dependsOn: ['customer_groups.credit.view'] },
   { id: 'customer_groups.credit.adjust', title: 'Post credit adjustments', module: 'customer_groups', dependsOn: ['customer_groups.credit.view'] },
+  // Release 5 Phase 4 (Step 2.6, G5/G16, spec §9.1). Staff-side purchase-approval
+  // features — the sibling of `credit.view`/`credit.manage` above, now that
+  // `CustomerPurchaseApproval` exists (Step 2.4) and its service (Step 2.5) is wired.
+  // `approvals.decide` depends on `approvals.view` only, same convention as `credit.*`.
+  { id: 'customer_groups.approvals.view', title: 'View purchase approvals', module: 'customer_groups' },
+  { id: 'customer_groups.approvals.decide', title: 'Decide purchase approvals', module: 'customer_groups', dependsOn: ['customer_groups.approvals.view'] },
+  // Portal features (customer RBAC, granted through `defaultCustomerRoleFeatures` in
+  // `setup.ts`, D-R5-7) — the buyer-facing half of G5's approval API. Resolved by
+  // `CustomerRbacService`, a disjoint namespace from the staff features above.
+  { id: 'customer_groups.portal.approvals.view', title: 'View purchase approvals (portal)', module: 'customer_groups' },
+  {
+    id: 'customer_groups.portal.approvals.decide',
+    title: 'Decide purchase approvals (portal)',
+    module: 'customer_groups',
+    dependsOn: ['customer_groups.portal.approvals.view'],
+  },
 ]
 
 export default features

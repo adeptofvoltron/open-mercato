@@ -35,7 +35,7 @@
 | 2 | 2.3 | availability: expiry job + reconciliation job + events (A11/A12/A13) | dispatch:standard | done | pending |
 | 2 | 2.4 | customer_groups: `CustomerPurchaseApproval` entity + migration (actor-typed columns, policy snapshot) | dispatch:standard | done | pending |
 | 2 | 2.5 | customer_groups: approval service, CAS decide/withdraw (G6) + `expire-approvals` job (D-R5-27) | dispatch:standard | done | pending |
-| 2 | 2.6 | customer_groups: approval portal + staff routes + ACL + grants (G5/G7/D-R5-7/D-R5-34) | dispatch:standard | todo | — |
+| 2 | 2.6 | customer_groups: approval portal + staff routes + ACL + grants (G5/G7/D-R5-7/D-R5-34) | dispatch:standard | done | pending |
 | 2 | 2.7 | customer_groups: approval notifications (D-R5-6/D-R5-32/G15) | dispatch:standard | todo | — |
 | 2 | 2.8 | cart: lock contract — `lockTtlMs`, idempotent extend by `checkoutSessionId`, `unlock`/`markConverted` match (C1) | dispatch:standard | todo | — |
 | 2 | 2.9 | cart: D-R5-21/D-R5-22 identity binding on `/current/*` + trusted `resolveForBuyer` path for pay_link/api/agent | dispatch:standard | todo | — |
@@ -380,6 +380,42 @@ commit `c92470d8d5`).
   literally — rejected per the brief's explicit "defense in depth" instruction and because it
   would make the cross-company guard only as strong as whatever the Step 2.6 route happens to
   verify, with no second layer.
+
+- Step 2.6 (G5/§9 portal table): the portal `withdraw` route is gated on
+  `customer_groups.portal.approvals.view`, NOT a separate `…withdraw` feature — the spec's own §9
+  portal route table names exactly this: `POST .../withdraw | customer_groups.portal.approvals.view
+  | Requester only`. "Requester only" is enforced by identity (the service's own
+  `requestedByActorType`/`requestedByActorId` comparison in `withdrawApproval`, Step 2.5), not by a
+  dedicated RBAC feature. Alternative considered: invent a third portal feature
+  (`…approvals.withdraw`) for symmetry with the staff `view`/`decide` pair — rejected as contradicting
+  the spec's own literal route table with no stated reason to diverge.
+- Step 2.6 (§9.2, G5): a non-decider's withdraw attempt on an approval requested by someone ELSE at
+  their OWN company answers **404** (not visible to them per `isApprovalVisibleToPortalPrincipal`),
+  never the service's own 403 `approval_withdraw_forbidden` — the route's cross-company/"own
+  requests only" visibility check runs BEFORE the service call, so a non-owner's lack-of-decide-
+  feature case never reaches the service's requester-comparison branch at all. The 403 code DOES
+  fire for a decide-HOLDER attempting to withdraw someone else's company-visible request (not
+  tested in this Step's integration spec — no scenario names it, and the service's existing unit
+  tests from Step 2.5 already exercise that branch directly). Not a stated ambiguity in the brief,
+  but the natural consequence of composing the visibility guard (spec's explicit disclosure rule)
+  with the service's own requester guard (spec's explicit `approval_withdraw_forbidden` rule) in
+  the only order that keeps the disclosure guarantee: visibility first, requester-ness second.
+- Step 2.6 (§9 portal table, "Pending first"): implemented by loading the caller's full matching
+  row set (id/status/created_at only, via the SAME `buildPortalApprovalListWhere` the list route's
+  authorization rule is defined in once) and ranking/paginating in memory, rather than a raw SQL
+  `ORDER BY (status = 'pending') DESC` — `status` sorts alphabetically in plain SQL/ORM `orderBy`
+  (approved, expired, pending, rejected, withdrawn), which is NOT pending-first, so either approach
+  needs a rank expression somewhere. Chose in-memory ranking over raw SQL so the one-and-only
+  `WHERE` (the authorization rule) is never duplicated as a second, hand-written SQL string that
+  could drift from it. Alternative considered: raw SQL for both the `WHERE` and the `ORDER BY`
+  — rejected as a second copy of the visibility rule's `WHERE`, the exact drift risk `lib/
+  portalApprovalAccess.ts`'s own doc comment warns against.
+- Step 2.6 (§9/§9.2): `CustomerPurchaseApprovalService.toApprovalView` (private in Step 2.5) is now
+  exported — the staff/portal list and detail routes read `CustomerPurchaseApproval` rows directly
+  (the service has no list method, and `getApproval` is per-id) and serialize through the SAME
+  mapping the service's own `getApproval`/`decideApproval`/`withdrawApproval` already return, rather
+  than a second, drifting copy of the `ApprovalView` shape. Purely additive (an `export` keyword on
+  an existing function); no behavior change.
 
 ## External References
 
