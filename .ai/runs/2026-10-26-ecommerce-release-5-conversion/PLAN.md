@@ -39,7 +39,7 @@
 | 2 | 2.7 | customer_groups: approval notifications (D-R5-6/D-R5-32/G15) | dispatch:standard | done | pending |
 | 2 | 2.8 | cart: lock contract — `lockTtlMs`, idempotent extend by `checkoutSessionId`, `unlock`/`markConverted` match (C1) | dispatch:standard | done | pending |
 | 2 | 2.9 | cart: D-R5-21/D-R5-22 identity binding on `/current/*` + trusted `resolveForBuyer` path for pay_link/api/agent | dispatch:standard | done | pending |
-| 2 | 2.10 | cart: `markConverted` additive inputs (`salesOrderId`/`lineMap`/`salesQuoteId`, K8/D-R5-26); admin list + detail + reprice (K6) | dispatch:standard | todo | — |
+| 2 | 2.10 | cart: `markConverted` additive inputs (`salesOrderId`/`lineMap`/`salesQuoteId`, K8/D-R5-26); admin list + detail + reprice (K6) | dispatch:standard | done | pending |
 | 2 | 2.11 | cart: abandonment payload (K9) + code-reservation release on expire/abandon (K11) | dispatch:standard | todo | — |
 | 2 | 2.12 | checkout: B.1 session entity + step machine + token hash + C14 minimum (rate limits, encryption, redaction) | dispatch:standard | todo | — |
 | 2 | 2.13 | checkout: B.3 delivery + payment step (rate quoting C13, delivery-promotions evaluation C8) | dispatch:standard | todo | — |
@@ -572,6 +572,81 @@ commit `c92470d8d5`).
   seeding) as its Part B target, and explicitly said not to build the full pay-link flow. The
   Step that adds the lock/recovery buyer-identity refresh should reuse
   `resolveTrustedCartBuyerIdentity`'s same shape rather than inventing a parallel helper.
+
+- Step 2.10 (K6/§10.2, sort field): §10.2 names `grandTotalGrossAmount` as an admin-list sort
+  option, but `Cart.totals.grandTotalGrossAmount` lives inside the `totals` jsonb snapshot
+  (§3.2), not a plain column — the query-engine sort path (`sortFieldMap`) only resolves
+  literal column names, and the sibling `SalesDocument` family (`sales/data/entities.ts`)
+  stores its own grand total as a real, flat, sortable column. Added a Postgres STORED
+  GENERATED column, `Cart.grandTotalGrossAmount` (`grand_total_gross_amount`), computed from
+  `totals->>'grandTotalGrossAmount'` — the SAME declarative pattern `CartLine.configurationHash`
+  (this module) and `wms.InventoryBalance.quantityAvailable` already use, plus a composite
+  index mirroring the sibling `carts_tenant_status_*_idx` family. Hand-authored the migration
+  (`Migration20261026231500_cart.ts`) and `.snapshot-open-mercato.json` edit directly rather
+  than running `yarn db:generate` — a local Postgres instance exists in this sandbox but holds
+  schema state from unrelated prior QA/dev sessions (`om_qa_*`/`om_cart49` databases, not this
+  worktree's own migration history), and diffing against it risked emitting unrelated drift the
+  "coding-agent exception" would then require manually pruning; a two-statement `alter table`
+  hand-migration matching this module's own existing generated-column precedent carries no such
+  risk. Alternative considered: skip the `grandTotalGrossAmount` sort option entirely and ship
+  only `lastActivityAt` — rejected as leaving a spec-named filter/sort half-built for no stated
+  reason, when the root-cause fix (a real column, matching the exact pattern `sales` already set)
+  is small and precedented.
+- Step 2.10 (§11, event payload growth): added `checkoutSessionId` to the `cart.cart.converted`
+  payload alongside the new `salesOrderId`/`salesQuoteId`/`lineMap` fields the Step's own brief
+  named explicitly — not named in the brief's own bullet list, but §11's literal rev-10 payload
+  shape for this event includes it (`{ cartId, tenantId, organizationId, checkoutSessionId,
+  salesOrderId, salesQuoteId, lineMap }`), and the command already has the cart's own stored
+  `checkoutSessionId` on hand at the call site. Purely additive on an already-additive-this-
+  release event payload. Alternative considered: leave it out and let a future Step add it when
+  checkout actually reads it — rejected as splitting one event's one payload-growth change
+  across two Steps for no reason, when the authoritative shape is already known now.
+- Step 2.10 (§9.1/D-R5-26, lineMap id format): `cartMarkConvertedLineMapEntrySchema`'s
+  `cartLineId`/`salesOrderLineId`/`salesQuoteLineId` are plain non-empty strings, not `uuid()` —
+  `cart.markConverted` has no public route (§10: "no public route... `checkout` calls the DI
+  service/command directly, in-process"), so this is the command's own internal input shape, not
+  an HTTP body validator. The real malformed-map guard is the bijection check against the cart's
+  actual live `CartLine` rows (`commands/lock.ts#validateConversionLineMap`), not the id's
+  lexical format — a `uuid()` constraint would only reject a caller whose ids happen not to look
+  like UUIDs while doing nothing extra against the actual attack this guard exists for (a map
+  that doesn't match the cart's real lines). Matches this module's own test-fixture convention
+  (every `CartLine.id` fixture in `commands/__tests__/{cart,lock}.test.ts` is already a plain
+  string like `'line-1'`, never a real UUID).
+- Step 2.10 (K6/§10.2, admin reprice: active OR abandoned): `commands/cart.ts`'s `cart.reprice`
+  status guard was relaxed from `status !== 'active'` to `status !== 'active' && status !==
+  'abandoned'` — generically, not gated on `trigger === 'admin_reprice'` specifically. Safe
+  because this command never writes `Cart.status` anywhere in its own body (confirmed by
+  reading its full `execute()`), so reprice-ing an abandoned cart cannot reactivate it and
+  §10.2's "not buyer activity... neither reactivates an `abandoned` basket nor moves
+  `last_activity_at`" guarantee holds by construction. Alternative considered: a
+  trigger-scoped exception (`cart.status !== 'active' && !(cart.status === 'abandoned' &&
+  input.trigger === 'admin_reprice')`) — rejected as more code for an identical outcome, since
+  no OTHER existing caller ever reaches this command with an abandoned cart's id in the first
+  place (every other dispatcher already requires `active` before it ever calls `cart.reprice`).
+- Step 2.10 (§10.2, buyer-identity refresh semantics): `applyCartRepriceTriggerFields` gained a
+  DEDICATED `'admin_reprice'` branch rather than reusing `'buyer_context_changed'`'s — the
+  admin route may resolve NO buyer refresh at all (`ecommerce` disabled) and must not wipe the
+  cart's existing `customerId`/`customerIds`/`customerGroupIds`/`priceKindId` back to null in
+  that case, unlike trigger 2, which always has a complete, freshly-resolved `BuyerContext` to
+  overwrite with. The new branch only writes a field when the admin route's call actually named
+  it (`input.<field> !== undefined`).
+- Step 2.10 (K6/§10.2, `customerPurchaseApprovalService` tryResolve despite a hard dependency):
+  `cart/index.ts`'s `requires: [..., 'customer_groups', ...]` already makes `customer_groups`
+  mandatory whenever `cart` is installed, so `customerPurchaseApprovalService` is always
+  registered in practice — resolved it via a local `tryResolveCustomerPurchaseApprovalService`
+  soft-DI helper anyway (`lib/adminCartScope.ts`), per this Step's own brief and K6's explicit
+  text ("`null` with no error when `customer_groups`' approval service is absent"). Costless
+  defensive coding, and both branches are unit-tested regardless of whether the "absent" branch
+  is reachable in a real deployment today.
+- Step 2.10 (root AGENTS.md cross-module coupling): the admin detail/reprice routes' own
+  `organizationIds` derivation (`lib/adminCartScope.ts#organizationIdsFromCartScope`) duplicates
+  `customer_groups/lib/customerScope.ts#organizationIdsFromScope`'s algorithm rather than
+  importing it — that function is module-private to `customer_groups` (not a DI service, not a
+  declared public export of its own `index.ts`), and root AGENTS.md's module-boundary rules do
+  not carve out an exception for "small pure helper." `customer_groups` is itself the precedent
+  for this exact duplication (its own comment: "Hand-written routes resolve an
+  `OrganizationScope` themselves; this derives the `organizationIds` list exactly the way
+  `makeCrudRoute` derives `ctx.organizationIds`").
 
 ## External References
 

@@ -1734,6 +1734,24 @@
           "enumItems": [],
           "mappedType": "datetime"
         },
+        "grand_total_gross_amount": {
+          "name": "grand_total_gross_amount",
+          "type": "numeric(16,4)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": 16,
+          "scale": 4,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "decimal",
+          "generated": "((totals->>'grandTotalGrossAmount')::numeric(16,4)) stored"
+        },
         "id": {
           "name": "id",
           "type": "uuid",
@@ -2224,6 +2242,18 @@
           "composite": true,
           "constraint": false,
           "keyName": "carts_tenant_status_expires_idx",
+          "primary": false,
+          "unique": false
+        },
+        {
+          "columnNames": [
+            "tenant_id",
+            "status",
+            "grand_total_gross_amount"
+          ],
+          "composite": true,
+          "constraint": false,
+          "keyName": "carts_tenant_status_grand_total_idx",
           "primary": false,
           "unique": false
         },

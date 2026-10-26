@@ -1037,6 +1037,93 @@ describe('cart.reprice', () => {
     expect((captured as { status: number }).status).toBe(404)
   })
 
+  // Step 2.10 (K6/§10.2) — the admin reprice route is the one caller allowed to reprice an
+  // `abandoned` basket; this command never writes `cart.status` anywhere in its own body,
+  // so an abandoned cart stays abandoned after the reprice (never silently reactivated).
+  it('(K6/§10.2) reprices an abandoned cart without reactivating it', async () => {
+    const cart = seedCartWithLines({ status: 'abandoned' })
+    const handler = commandRegistry.get<CartRepriceInput, CartRepriceResult>('cart.reprice')
+    const { em } = makeEm()
+    const dataEngine = makeDataEngine()
+    const ctx = makeCtx({ em, dataEngine })
+
+    const result = await handler!.execute(
+      { cartId: cart.id as string, tenantId: TENANT_ID, organizationId: ORG_ID, trigger: 'admin_reprice' },
+      ctx,
+    )
+
+    expect(result.cart.status).toBe('abandoned')
+    expect(seededCarts.find((row) => row.id === cart.id)!.status).toBe('abandoned')
+  })
+
+  it('still refuses a merged cart with 409 cart_not_active', async () => {
+    const cart = seedCartWithLines({ status: 'merged' })
+    const handler = commandRegistry.get<CartRepriceInput, CartRepriceResult>('cart.reprice')
+    const { em } = makeEm()
+    const dataEngine = makeDataEngine()
+    const ctx = makeCtx({ em, dataEngine })
+
+    let captured: unknown
+    try {
+      await handler!.execute(
+        { cartId: cart.id as string, tenantId: TENANT_ID, organizationId: ORG_ID, trigger: 'admin_reprice' },
+        ctx,
+      )
+    } catch (err) {
+      captured = err
+    }
+
+    expect(isCrudHttpError(captured)).toBe(true)
+    expect((captured as { status: number }).status).toBe(409)
+  })
+
+  // Step 2.10 — `applyCartRepriceTriggerFields`'s dedicated `'admin_reprice'` branch only
+  // writes a buyer-identity field when the admin route actually resolved it (unlike
+  // `'buyer_context_changed'`, which always overwrites with a full fresh context) — a
+  // partial/absent refresh (e.g. `ecommerce` disabled) must never wipe an existing field
+  // back to `null`.
+  it("(admin_reprice) a partial field set never wipes the cart's existing buyer identity", async () => {
+    const cart = seedCartWithLines({ customerId: 'customer-existing', priceKindId: 'price-kind-existing' })
+    const handler = commandRegistry.get<CartRepriceInput, CartRepriceResult>('cart.reprice')
+    const { em } = makeEm()
+    const dataEngine = makeDataEngine()
+    const ctx = makeCtx({ em, dataEngine })
+
+    const result = await handler!.execute(
+      { cartId: cart.id as string, tenantId: TENANT_ID, organizationId: ORG_ID, trigger: 'admin_reprice' },
+      ctx,
+    )
+
+    expect(result.cart.customerId).toBe('customer-existing')
+    expect(result.cart.priceKindId).toBe('price-kind-existing')
+  })
+
+  it('(admin_reprice) a resolved buyer-identity refresh overwrites only the fields it names', async () => {
+    const cart = seedCartWithLines({ customerId: 'customer-existing' })
+    const handler = commandRegistry.get<CartRepriceInput, CartRepriceResult>('cart.reprice')
+    const { em } = makeEm()
+    const dataEngine = makeDataEngine()
+    const ctx = makeCtx({ em, dataEngine })
+
+    const result = await handler!.execute(
+      {
+        cartId: cart.id as string,
+        tenantId: TENANT_ID,
+        organizationId: ORG_ID,
+        trigger: 'admin_reprice',
+        customerId: 'customer-refreshed',
+        customerIds: ['customer-refreshed'],
+        customerGroupIds: ['group-refreshed'],
+        priceKindId: 'price-kind-refreshed',
+      },
+      ctx,
+    )
+
+    expect(result.cart.customerId).toBe('customer-refreshed')
+    expect(result.cart.customerGroupIds).toEqual(['group-refreshed'])
+    expect(result.cart.priceKindId).toBe('price-kind-refreshed')
+  })
+
   it('does not disclose a priceChange or stamp lastPriceChangeAt when the resolved price is unchanged', async () => {
     const cart = seedCartWithLines()
     const handler = commandRegistry.get<CartRepriceInput, CartRepriceResult>('cart.reprice')

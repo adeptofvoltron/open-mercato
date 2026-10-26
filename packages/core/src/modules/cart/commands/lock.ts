@@ -10,6 +10,7 @@ import { findOneWithDecryption, findWithDecryption } from '@open-mercato/shared/
 import { E } from '#generated/entities.ids.generated'
 import { Cart, CartLine } from '../data/entities'
 import type { ResolvedCartRouteContext } from '../lib/routeContext'
+import { cartMarkConvertedLineMapSchema, type CartMarkConvertedLineMapEntry } from '../data/validators'
 import { resolveCartLockTimeoutMs } from '../lib/sweepConfig'
 import { assertCartNotLocked } from '../lib/lockGuard'
 import { emitCartEvent } from '../events'
@@ -389,9 +390,75 @@ export type CartMarkConvertedInput = {
   /** (rev 10 — C1) Same contract as `CartUnlockInput.checkoutSessionId`: optional, but when
    * supplied must match the cart's own stored session or the call gets the uniform `404`. */
   checkoutSessionId?: string
+  /** (rev 10 — K8/D-R5-26, §9.1/§11) The order outcome's id. Optional/additive — Release 4
+   * shipped this command with neither id nor a line map; checkout (Steps 4.2/5.1) is the
+   * real caller that always supplies exactly one of `salesOrderId`/`salesQuoteId`. Never
+   * both in the same call (D-R5-26: "one conversion is either an order or a quote"). */
+  salesOrderId?: string
+  /** (rev 10 — D-R5-26, §9.1/§11) The `request_quote` outcome's id. */
+  salesQuoteId?: string
+  /**
+   * (rev 10 — K8/D-R5-26, §9.1) Every `cartLineId` must name a live (non-deleted) line of
+   * THIS cart, and every live line must appear in the map exactly once (§9.1: "Every
+   * `cartLineId` must be a live line of the cart... A malformed map is refused with an
+   * internal `400` and nothing is written"). Entries carry `salesOrderLineId` XOR
+   * `salesQuoteLineId`, matching whichever of `salesOrderId`/`salesQuoteId` is set on this
+   * same call — never a mix of both shapes in one map (D-R5-26). Gift lines
+   * (`origin: 'promotion'`) are mapped like any other line, per §9.1's own text.
+   */
+  lineMap?: CartMarkConvertedLineMapEntry[]
 }
 
 export type CartMarkConvertedResult = { cart: CartSummary }
+
+/**
+ * §9.1/D-R5-26's "malformed map" guard. Validates the CROSS-entry shape (every entry uses
+ * the SAME line-id field, matching whichever of `salesOrderId`/`salesQuoteId` this call
+ * named, never both) and the bijection against the cart's own live lines (every live line
+ * appears exactly once; no foreign or duplicate `cartLineId`). A no-op — returns without
+ * throwing — when the caller supplies neither `salesOrderId`/`salesQuoteId` nor `lineMap`,
+ * preserving the exact pre-Release-5 behavior for every existing caller (none of which name
+ * any of these three fields today).
+ */
+function validateConversionLineMap(
+  input: Pick<CartMarkConvertedInput, 'salesOrderId' | 'salesQuoteId' | 'lineMap'>,
+  liveLineIds: Set<string>,
+): void {
+  if (input.salesOrderId !== undefined && input.salesQuoteId !== undefined) {
+    throw new CrudHttpError(400, {
+      error: '[internal] cart_convert_line_map_invalid',
+      code: 'cart_convert_line_map_invalid',
+    })
+  }
+  if (input.lineMap === undefined) return
+
+  const parsed = cartMarkConvertedLineMapSchema.safeParse(input.lineMap)
+  const invalid = () =>
+    new CrudHttpError(400, { error: '[internal] cart_convert_line_map_invalid', code: 'cart_convert_line_map_invalid' })
+  if (!parsed.success) throw invalid()
+
+  const expectedKey = input.salesOrderId !== undefined
+    ? 'salesOrderLineId'
+    : input.salesQuoteId !== undefined
+      ? 'salesQuoteLineId'
+      : null
+  // Neither id named: a `lineMap` on its own has no discriminant to validate entries
+  // against (§9.1 only ever shows `lineMap` paired with one of the two ids) — fail closed
+  // rather than guess which shape the caller meant.
+  if (!expectedKey) throw invalid()
+  const otherKey = expectedKey === 'salesOrderLineId' ? 'salesQuoteLineId' : 'salesOrderLineId'
+
+  const seenCartLineIds = new Set<string>()
+  for (const entry of parsed.data) {
+    if (entry[expectedKey] === undefined || entry[otherKey] !== undefined) throw invalid()
+    if (seenCartLineIds.has(entry.cartLineId)) throw invalid()
+    seenCartLineIds.add(entry.cartLineId)
+    if (!liveLineIds.has(entry.cartLineId)) throw invalid()
+  }
+  // Bijection: every live line of the cart must appear exactly once (§9.1's own text), not
+  // just every mapped id be a live line.
+  if (seenCartLineIds.size !== liveLineIds.size) throw invalid()
+}
 
 const markConvertedCommand: CommandHandler<CartMarkConvertedInput, CartMarkConvertedResult> = {
   id: 'cart.markConverted',
@@ -418,6 +485,19 @@ const markConvertedCommand: CommandHandler<CartMarkConvertedInput, CartMarkConve
       throw notFound('[internal] cart not found')
     }
 
+    // §9.1/D-R5-26 (K8): validated BEFORE the write, against the cart's own live lines, so
+    // a malformed map writes nothing (§9.1: "nothing is written").
+    if (input.salesOrderId !== undefined || input.salesQuoteId !== undefined || input.lineMap !== undefined) {
+      const liveLines = (await findWithDecryption(
+        em,
+        CartLine,
+        { cartId: cart.id, deletedAt: null, tenantId: scope.tenantId, organizationId: scope.organizationId },
+        {},
+        scope,
+      )) as CartLine[]
+      validateConversionLineMap(input, new Set(liveLines.map((line) => line.id)))
+    }
+
     const now = new Date()
     await withAtomicFlush(
       em,
@@ -439,10 +519,21 @@ const markConvertedCommand: CommandHandler<CartMarkConvertedInput, CartMarkConve
       events: cartCrudEvents,
       indexer: cartCrudIndexer,
     })
+    // (rev 10 — K8/D-R5-16/D-R5-26, §11) The Release 5 payload grows additively:
+    // `checkoutSessionId` (the cart's own stored session — always set on a `locked` cart,
+    // never `input.checkoutSessionId`, which stays optional at the type level), plus
+    // `salesOrderId`/`salesQuoteId`/`lineMap`, each `null` when this call did not supply it
+    // — exactly §11's literal payload shape. Release 4 emitted only
+    // `{ cartId, tenantId, organizationId }`; every pre-existing consumer destructures a
+    // subset of these fields, so the growth is non-breaking.
     await emitCartEvent('cart.cart.converted', {
       cartId: cart.id,
       tenantId: cart.tenantId,
       organizationId: cart.organizationId,
+      checkoutSessionId: cart.checkoutSessionId,
+      salesOrderId: input.salesOrderId ?? null,
+      salesQuoteId: input.salesQuoteId ?? null,
+      lineMap: input.lineMap ?? null,
     })
 
     return { cart: toCartSummary(cart) }

@@ -733,4 +733,200 @@ describe('cart.markConverted', () => {
     expect((captured as { status: number }).status).toBe(404)
     expect(seededCarts.find((row) => row.id === CART_ID)!.status).toBe('locked')
   })
+
+  // Step 2.10 (K8/D-R5-26, §9.1/§11) — backward-compat regression guard: a caller that
+  // names NEITHER `salesOrderId` NOR `salesQuoteId` NOR `lineMap` behaves EXACTLY as before
+  // this Step — the event payload still grows additively (checkoutSessionId is always
+  // included now, per §11's literal shape), but no validation runs and the write succeeds
+  // identically to the pre-Release-5 call shape already covered above.
+  it('(K8/D-R5-26) with neither salesOrderId/salesQuoteId/lineMap: behaves exactly as before, and the converted payload carries null ids/map', async () => {
+    seededCarts = [makeCartFixture({ status: 'locked', checkoutSessionId: 'checkout-session-1' })]
+    const handler = getHandler<CartMarkConvertedInput, CartMarkConvertedResult>('cart.markConverted')
+    const em = makeEm()
+    const ctx = makeCtx({ em })
+
+    const result = await handler.execute({ cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID }, ctx)
+
+    expect(result.cart.status).toBe('converted')
+    expect(emitCartEventMock).toHaveBeenCalledWith(
+      'cart.cart.converted',
+      expect.objectContaining({
+        cartId: CART_ID,
+        checkoutSessionId: 'checkout-session-1',
+        salesOrderId: null,
+        salesQuoteId: null,
+        lineMap: null,
+      }),
+    )
+  })
+
+  // (K8, the order outcome) `salesOrderId` + a `salesOrderLineId`-shaped `lineMap` covering
+  // every live line emits the additive payload verbatim.
+  it('(K8) with salesOrderId + an order-shaped lineMap covering every live line: emits the additive payload', async () => {
+    seededCarts = [makeCartFixture({ status: 'locked', checkoutSessionId: 'checkout-session-1' })]
+    seededCartLines = [
+      { id: 'line-1', cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, deletedAt: null },
+      { id: 'line-2', cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, deletedAt: null },
+    ]
+    const handler = getHandler<CartMarkConvertedInput, CartMarkConvertedResult>('cart.markConverted')
+    const em = makeEm()
+    const ctx = makeCtx({ em })
+
+    const lineMap = [
+      { cartLineId: 'line-1', salesOrderLineId: 'order-line-1' },
+      { cartLineId: 'line-2', salesOrderLineId: 'order-line-2' },
+    ]
+    const result = await handler.execute(
+      {
+        cartId: CART_ID,
+        tenantId: TENANT_ID,
+        organizationId: ORG_ID,
+        salesOrderId: 'order-1',
+        lineMap,
+      },
+      ctx,
+    )
+
+    expect(result.cart.status).toBe('converted')
+    expect(emitCartEventMock).toHaveBeenCalledWith(
+      'cart.cart.converted',
+      expect.objectContaining({ cartId: CART_ID, salesOrderId: 'order-1', salesQuoteId: null, lineMap }),
+    )
+  })
+
+  // (D-R5-26, the quote outcome) `salesQuoteId` + a `salesQuoteLineId`-shaped `lineMap`
+  // emits the additive payload with `salesOrderId: null`.
+  it('(D-R5-26) with salesQuoteId + a quote-shaped lineMap covering every live line: emits the additive payload', async () => {
+    seededCarts = [makeCartFixture({ status: 'locked', checkoutSessionId: 'checkout-session-1' })]
+    seededCartLines = [{ id: 'line-1', cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, deletedAt: null }]
+    const handler = getHandler<CartMarkConvertedInput, CartMarkConvertedResult>('cart.markConverted')
+    const em = makeEm()
+    const ctx = makeCtx({ em })
+
+    const lineMap = [{ cartLineId: 'line-1', salesQuoteLineId: 'quote-line-1' }]
+    const result = await handler.execute(
+      { cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, salesQuoteId: 'quote-1', lineMap },
+      ctx,
+    )
+
+    expect(result.cart.status).toBe('converted')
+    expect(emitCartEventMock).toHaveBeenCalledWith(
+      'cart.cart.converted',
+      expect.objectContaining({ cartId: CART_ID, salesOrderId: null, salesQuoteId: 'quote-1', lineMap }),
+    )
+  })
+
+  // (D-R5-26) never both ids in the same call — refused before anything is written.
+  it('(D-R5-26) refuses a call naming BOTH salesOrderId and salesQuoteId, and writes nothing', async () => {
+    seededCarts = [makeCartFixture({ status: 'locked', checkoutSessionId: 'checkout-session-1' })]
+    const handler = getHandler<CartMarkConvertedInput, CartMarkConvertedResult>('cart.markConverted')
+    const em = makeEm()
+    const ctx = makeCtx({ em })
+
+    let captured: unknown
+    try {
+      await handler.execute(
+        { cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, salesOrderId: 'order-1', salesQuoteId: 'quote-1' },
+        ctx,
+      )
+    } catch (err) {
+      captured = err
+    }
+
+    expect(isCrudHttpError(captured)).toBe(true)
+    expect((captured as { status: number }).status).toBe(400)
+    expect(seededCarts.find((row) => row.id === CART_ID)!.status).toBe('locked')
+    expect(emitCartEventMock).not.toHaveBeenCalledWith('cart.cart.converted', expect.anything())
+  })
+
+  // (§9.1 "Every cartLineId must be a live line of the cart") a map naming a line that is
+  // not a live line of this cart is malformed — refused, nothing written.
+  it('refuses a lineMap entry naming a cartLineId that is not a live line of this cart', async () => {
+    seededCarts = [makeCartFixture({ status: 'locked', checkoutSessionId: 'checkout-session-1' })]
+    seededCartLines = [{ id: 'line-1', cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, deletedAt: null }]
+    const handler = getHandler<CartMarkConvertedInput, CartMarkConvertedResult>('cart.markConverted')
+    const em = makeEm()
+    const ctx = makeCtx({ em })
+
+    let captured: unknown
+    try {
+      await handler.execute(
+        {
+          cartId: CART_ID,
+          tenantId: TENANT_ID,
+          organizationId: ORG_ID,
+          salesOrderId: 'order-1',
+          lineMap: [{ cartLineId: 'not-a-real-line', salesOrderLineId: 'order-line-1' }],
+        },
+        ctx,
+      )
+    } catch (err) {
+      captured = err
+    }
+
+    expect(isCrudHttpError(captured)).toBe(true)
+    expect((captured as { status: number }).status).toBe(400)
+  })
+
+  // (§9.1 "every customer line must appear exactly once") a map missing one of the cart's
+  // two live lines is malformed — refused, nothing written.
+  it("refuses a lineMap that omits one of the cart's own live lines (incomplete bijection)", async () => {
+    seededCarts = [makeCartFixture({ status: 'locked', checkoutSessionId: 'checkout-session-1' })]
+    seededCartLines = [
+      { id: 'line-1', cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, deletedAt: null },
+      { id: 'line-2', cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, deletedAt: null },
+    ]
+    const handler = getHandler<CartMarkConvertedInput, CartMarkConvertedResult>('cart.markConverted')
+    const em = makeEm()
+    const ctx = makeCtx({ em })
+
+    let captured: unknown
+    try {
+      await handler.execute(
+        {
+          cartId: CART_ID,
+          tenantId: TENANT_ID,
+          organizationId: ORG_ID,
+          salesOrderId: 'order-1',
+          lineMap: [{ cartLineId: 'line-1', salesOrderLineId: 'order-line-1' }],
+        },
+        ctx,
+      )
+    } catch (err) {
+      captured = err
+    }
+
+    expect(isCrudHttpError(captured)).toBe(true)
+    expect((captured as { status: number }).status).toBe(400)
+  })
+
+  // (D-R5-26 "never both... entries are a UNION type") a lineMap entry carrying the WRONG
+  // shape for the id this call named (quote-shaped entry under an order conversion) is
+  // malformed — refused.
+  it('refuses a lineMap entry whose shape does not match the id this call named', async () => {
+    seededCarts = [makeCartFixture({ status: 'locked', checkoutSessionId: 'checkout-session-1' })]
+    seededCartLines = [{ id: 'line-1', cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, deletedAt: null }]
+    const handler = getHandler<CartMarkConvertedInput, CartMarkConvertedResult>('cart.markConverted')
+    const em = makeEm()
+    const ctx = makeCtx({ em })
+
+    let captured: unknown
+    try {
+      await handler.execute(
+        {
+          cartId: CART_ID,
+          tenantId: TENANT_ID,
+          organizationId: ORG_ID,
+          salesOrderId: 'order-1',
+          lineMap: [{ cartLineId: 'line-1', salesQuoteLineId: 'quote-line-1' }],
+        },
+        ctx,
+      )
+    } catch (err) {
+      captured = err
+    }
+
+    expect(isCrudHttpError(captured)).toBe(true)
+    expect((captured as { status: number }).status).toBe(400)
+  })
 })

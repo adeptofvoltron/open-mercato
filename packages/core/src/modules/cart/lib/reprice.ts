@@ -65,6 +65,13 @@ export type CartPriceChangeReason =
   // (`lib/promotionContext.ts`'s `buildPromotionsEffectsPhase` + this file's
   // `buildRecomputeCartTotalsPhase`) rather than dispatching a full `cart.reprice`.
   | 'undo'
+  // Step 2.10 (K6, §10.2) — trigger 7, the admin-forced `POST /api/cart/carts/:id/reprice`.
+  // Manually supplied by the admin reprice route (never detected by
+  // `detectCartRepriceTrigger`), same as `'merge'`/`'lock'` above. Distinct from
+  // `'buyer_context_changed'` because the admin route refreshes identity from the cart's
+  // OWN stored buyer (`resolveForBuyer`), not from a request-resolved `BuyerContext` — see
+  // `applyCartRepriceTriggerFields`'s own `'admin_reprice'` branch in `commands/cart.ts`.
+  | 'admin_reprice'
 
 export type CartPriceChange = {
   lineId: string

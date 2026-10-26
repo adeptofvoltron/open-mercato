@@ -691,3 +691,97 @@
   proving the old bypass path can no longer be reached and guest baskets are unaffected. No UI
   touched, no `yarn generate`/`yarn db:generate` needed (no new auto-discovered files, no schema
   change).
+
+## 2026-10-27T00:00:00Z — Step 2.10 landed
+
+- `cart`: `markConverted` additive `salesOrderId`/`salesQuoteId`/`lineMap` inputs (K8/D-R5-26),
+  and the FIRST admin UI this module ships — `GET /api/cart/carts` + `/carts/[id]` + `POST
+  /carts/[id]/reprice` (K6) with a `DataTable` list, a read-only detail page, and i18n in all 5
+  locales.
+- `cart.markConverted`: `lineMap` entries are `{ cartLineId, salesOrderLineId }` under
+  `salesOrderId`, or `{ cartLineId, salesQuoteLineId }` under `salesQuoteId` — never both ids in
+  one call (D-R5-26). Validated before any write: every entry's `cartLineId` must be a live line
+  of the cart, every live line must appear exactly once (bijection), and every entry must match
+  the SAME discriminant the call named — any violation throws `400
+  cart_convert_line_map_invalid` with nothing written. A caller naming none of the three fields
+  behaves exactly as before this Step (regression-tested). `cart.cart.converted`'s payload grows
+  additively to the full §11 rev-10 shape: `{ cartId, tenantId, organizationId,
+  checkoutSessionId, salesOrderId, salesQuoteId, lineMap }` (all three new fields `null` when
+  omitted).
+- Admin `GET /api/cart/carts` (`makeCrudRoute`, `cart.carts.view`): filters
+  `status`/`channel`/`storeId`/`customerId`/`requiresApproval`/`lastActivityFrom`/
+  `lastActivityTo`/`ids`; `kind` defaults to, and can ONLY be, `basket` (the §7a proposal seam
+  stays unreachable, K12's "pin the inert seam" posture, until Step 3.4); sorts by
+  `lastActivityAt` (default) or the new `grandTotalGrossAmount` generated column;
+  `pageSize ≤ 100`; `email` decrypted through the query engine with no free-text search on it
+  (search by `customerId`); `lineCount` batched in one `CartLine` query per page.
+- Admin `GET /api/cart/carts/[id]` (hand-written, `cart.carts.view`): reuses
+  `buildCartResponseEnvelope` for lines/totals/warnings, layered with admin-only fields
+  (`kind`/`channel`/`storeId`/`customerId`/`customerUserId`, decrypted `email`/`note`,
+  `proposedToCartId`), the LIVE approval via `customerPurchaseApprovalService.getApproval`
+  (soft `tryResolve`, both branches tested — present and absent), and `CartMergeLog` entries.
+  404s on an unknown cart, another organization, another tenant, or a proposal cart.
+- Admin `POST /api/cart/carts/[id]/reprice` (hand-written, `cart.carts.manage`, trigger 7):
+  REQUIRES the optimistic-lock header (`400` if missing, not merely fail-open —
+  `enforceCommandOptimisticLock`'s own default); accepts `active` OR `abandoned` carts (`423`
+  locked, `409 cart_not_active` otherwise); refreshes the buyer's identity via `ecommerce`'s
+  `storeContextService.resolveForBuyer` from the cart's OWN stored identity (soft peer, never
+  from the staff caller's request) before dispatching `cart.reprice` with the new
+  `trigger: 'admin_reprice'`; returns the §10.1 envelope with `versionBumpReason: 'repricing'`.
+- `commands/cart.ts` changes backing the admin reprice action: `cart.reprice`'s status guard now
+  accepts `'active' | 'abandoned'` (the command never writes `Cart.status`, so this can never
+  reactivate a basket); `applyCartRepriceTriggerFields` gained a dedicated `'admin_reprice'`
+  branch that only overwrites a buyer-identity field when the admin route actually resolved one
+  (never wipes an existing field on a partial/absent refresh, unlike trigger 2's always-full
+  overwrite); the §6a.2 whole-cart re-visibility pass now also runs for `admin_reprice`.
+- New generated column `Cart.grandTotalGrossAmount` (`grand_total_gross_amount`, Postgres STORED
+  GENERATED from `totals->>'grandTotalGrossAmount'`, same declarative pattern as
+  `CartLine.configurationHash`/`wms.InventoryBalance.quantityAvailable`), backing the admin
+  list's `grandTotalGrossAmount` sort — mirrors how `sales/data/entities.ts` already stores its
+  own grand total as a flat column. Migration + `.snapshot-open-mercato.json` hand-authored
+  (documented in PLAN.md's decisions log — a local Postgres exists in this sandbox but holds
+  unrelated prior-session schema state, so `yarn db:generate` was skipped in favor of a two-
+  statement `alter table` matching this module's own existing generated-column precedent).
+- Route-enumeration test (`api/carts/__tests__/routeEnumeration.test.ts`) asserts every admin
+  cart route file exports exactly the one HTTP method it needs (`GET`/`GET`/`POST`) and nothing
+  that could mutate a line — closing §10.2/§14's "no admin route adds, updates or removes a
+  line" guarantee at the HTTP layer.
+- Files: `packages/core/src/modules/cart/commands/lock.ts` (`markConverted` inputs + validation),
+  `packages/core/src/modules/cart/commands/cart.ts` (status guard, `admin_reprice` field
+  branch + revisibility gate), `packages/core/src/modules/cart/lib/reprice.ts` (new
+  `'admin_reprice'` reason), `packages/core/src/modules/cart/data/validators.ts` (lineMap +
+  admin list/reprice schemas), `packages/core/src/modules/cart/data/entities.ts`
+  (`grandTotalGrossAmount` generated column + index), `packages/core/src/modules/cart/migrations/
+  Migration20261026231500_cart.ts` + `.snapshot-open-mercato.json`, `packages/core/src/modules/
+  cart/lib/adminCartScope.ts` (new — org-scope + approval-service tryResolve helpers),
+  `packages/core/src/modules/cart/api/carts/{route.ts,[id]/route.ts,[id]/reprice/route.ts}` (new),
+  `packages/core/src/modules/cart/backend/cart/carts/{page.tsx,page.meta.ts,[id]/page.tsx,
+  [id]/page.meta.ts}` (new), `packages/core/src/modules/cart/i18n/{en,pl,es,de,ko}.json` (+71
+  keys each, real per-locale translations, not English placeholders). Tests: `commands/
+  __tests__/lock.test.ts` (+8 markConverted cases: backward-compat no-op, order/quote lineMap,
+  both-ids rejection, foreign-line rejection, incomplete-bijection rejection, wrong-shape
+  rejection), `commands/__tests__/cart.test.ts` (+4 reprice cases: abandoned acceptance, merged
+  rejection, partial-refresh non-destructive, full-refresh), `api/carts/__tests__/route.test.ts`
+  (buildFilters + kind rejection + lineCount afterList), `api/carts/[id]/__tests__/route.test.ts`
+  (401/404×3/200, approval present/absent, merge-log mapping), `api/carts/[id]/reprice/
+  __tests__/route.test.ts` (ACL metadata, missing/stale optimistic-lock header, 404×2, 423, 409,
+  abandoned acceptance, trigger/routeContext shape, envelope shape), `api/carts/__tests__/
+  routeEnumeration.test.ts` (new).
+- Checks (local mode): `npx tsc --noEmit` scoped to `packages/core`, clean (0 errors). Full
+  `src/modules/cart` jest suite from `packages/core`: 23/23 suites, 280/280 tests — zero
+  regressions (238 pre-existing + 42 new). `eslint` clean on every new/changed file.
+  `i18n-check-sync`: all 5 locales in sync (69 modules). `i18n-check-hardcoded`: zero hits under
+  `modules/cart/` (advisory, exit 0 either way). `yarn generate`: completed (exit 0, 383
+  generated artifacts refreshed, cart's own `api-route-shard.*.cart.generated.ts` picked up the
+  three new routes) — every generated output lives under the gitignored `.mercato/generated/`
+  tree, so nothing new is tracked by git. No `yarn db:migrate` run (hand-authored migration per
+  the documented decision above).
+- Scope calls made without the owner (full reasoning in PLAN.md's decisions log): the new
+  `grandTotalGrossAmount` generated column + migration (root-causing the admin list's sort
+  requirement rather than dropping it); `checkoutSessionId` added to the `cart.cart.converted`
+  payload (§11's own literal shape, not explicitly named in the brief); `cartMarkConverted
+  LineMapEntrySchema`'s plain-string (not `uuid()`) id fields; the admin reprice status guard's
+  blanket (not trigger-scoped) `'active' | 'abandoned'` relaxation; a dedicated
+  `'admin_reprice'` field-application branch; `tryResolveCustomerPurchaseApprovalService` kept
+  despite `customer_groups` being a hard dependency; and `lib/adminCartScope.ts` duplicating
+  (never importing) `customer_groups`' own module-private scope helper.

@@ -675,6 +675,19 @@ function applyCartRepriceTriggerFields(cart: Cart, input: CartRepriceInput): voi
     cart.customerUserId = input.customerUserId ?? null
     cart.customerGroupIds = input.customerGroupIds ?? []
     cart.priceKindId = input.priceKindId ?? null
+  } else if (input.trigger === 'admin_reprice') {
+    // Step 2.10 (K6/§10.2): unlike `'buyer_context_changed'`, the admin route always has a
+    // FULL, freshly-resolved `BuyerContext` to overwrite with — here the caller may supply
+    // only a SUBSET of fields (e.g. `ecommerce` disabled, so no `resolveForBuyer` call ran
+    // at all — see the admin reprice route's own doc comment). Each field is only written
+    // when the admin route actually resolved it, so a partial/absent refresh can never wipe
+    // an existing identity field back to `null`.
+    if (input.buyerDigest !== undefined) cart.buyerDigest = input.buyerDigest
+    if (input.customerId !== undefined) cart.customerId = input.customerId
+    if (input.customerIds !== undefined) cart.customerIds = input.customerIds
+    if (input.customerUserId !== undefined) cart.customerUserId = input.customerUserId
+    if (input.customerGroupIds !== undefined) cart.customerGroupIds = input.customerGroupIds
+    if (input.priceKindId !== undefined) cart.priceKindId = input.priceKindId
   } else if (input.trigger === 'currency_changed' && input.currencyCode) {
     cart.currencyCode = input.currencyCode
   } else if (input.trigger === 'locale_changed' && input.locale) {
@@ -715,8 +728,15 @@ const repriceCartCommand: CommandHandler<CartRepriceInput, CartRepriceResult> = 
     // already only reprices an active, unlocked cart by convention — this enforces that
     // invariant here too, so a stale token cannot reprice a converted/merged/expired/locked
     // cart directly and drift its stored totals away from the order it became.
+    //
+    // Step 2.10 (K6/§10.2): the admin forced re-price is the one caller allowed to reprice
+    // an `abandoned` basket too ("Runs `cart.reprice` whole-cart for a `kind = 'basket'`
+    // cart in `active` or `abandoned` status"). This is safe to allow generically (not
+    // gated on `input.trigger === 'admin_reprice'` specifically) because this command never
+    // writes `cart.status` anywhere in its own body — re-pricing an abandoned cart leaves it
+    // abandoned, matching §10.2's own "it neither reactivates an `abandoned` basket... " text.
     assertCartNotLocked(cart)
-    if (cart.status !== 'active') {
+    if (cart.status !== 'active' && cart.status !== 'abandoned') {
       throw new CrudHttpError(409, { error: '[internal] cart_not_active', code: 'cart_not_active', status: cart.status })
     }
 
@@ -778,8 +798,14 @@ const repriceCartCommand: CommandHandler<CartRepriceInput, CartRepriceResult> = 
     // closes it: `commands/lock.ts`'s `cart.lock` dispatches this command with
     // `trigger: 'lock'` specifically so this SAME pass runs with a freshly-resolved buyer
     // context (§9, D-R4-22) before `cart.lock` ever checks for a still-flagged line.
+    // Step 2.10 (K6/§10.2) adds `'admin_reprice'`: the admin forced re-price refreshes
+    // identity via `resolveForBuyer` exactly like trigger 2/5, so a storefront cart also
+    // gets this pass against its buyer's CURRENT scope.
     const runWholeCartRevisibilityPass =
-      (input.trigger === 'buyer_context_changed' || input.trigger === 'merge' || input.trigger === 'lock') &&
+      (input.trigger === 'buyer_context_changed' ||
+        input.trigger === 'merge' ||
+        input.trigger === 'lock' ||
+        input.trigger === 'admin_reprice') &&
       assortmentScope !== undefined
     const wholeCartRevisibilityPhases: Array<() => Promise<void>> = runWholeCartRevisibilityPass
       ? [

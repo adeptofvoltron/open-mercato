@@ -210,3 +210,57 @@ export type CartMergeRequest = z.infer<typeof cartMergeRequestSchema>
  * for the current (resolved) cart, not named by the caller. */
 export const cartMergeUndoRequestSchema = z.object({}).strict()
 export type CartMergeUndoRequest = z.infer<typeof cartMergeUndoRequestSchema>
+
+// ---------------------------------------------------------------------------
+// `cart.markConverted` (§9.1 rev 10 — K8/D-R5-26) — additive, optional conversion inputs.
+// The TS signature in §9.1 types `lineMap` as one flat shape with BOTH line-id fields
+// optional (`{ cartLineId, salesOrderLineId?, salesQuoteLineId? }`); D-R5-26's own text is
+// the cross-entry constraint ("never both [salesOrderId and salesQuoteId] in one call,
+// since one conversion is either an order or a quote") — enforced at the command layer
+// (`commands/lock.ts`), not by a zod discriminated union here, so this schema matches the
+// spec's own literal signature exactly.
+// ---------------------------------------------------------------------------
+
+// `cartLineId`/`salesOrderLineId`/`salesQuoteLineId` are plain non-empty strings, not
+// `uuid()` — this is the command's own internal input shape (§10: no public route), and
+// the REAL guard against a malformed map is the bijection check against the cart's actual
+// live lines (`commands/lock.ts#validateConversionLineMap`), not the id's lexical format.
+export const cartMarkConvertedLineMapEntrySchema = z.object({
+  cartLineId: z.string().min(1),
+  salesOrderLineId: z.string().min(1).optional(),
+  salesQuoteLineId: z.string().min(1).optional(),
+})
+export type CartMarkConvertedLineMapEntry = z.infer<typeof cartMarkConvertedLineMapEntrySchema>
+
+export const cartMarkConvertedLineMapSchema = z.array(cartMarkConvertedLineMapEntrySchema)
+
+// ---------------------------------------------------------------------------
+// Admin list (§10.2 rev 10 — K6) — `GET /api/cart/carts`. `kind` defaults to, and while the
+// §7a proposal seam is deferred (X5/K5) ONLY accepts, `'basket'` — the admin list never
+// returns a proposal cart until Step 3.4 actually ships the seam. `pageSize` is capped at
+// 100 (root AGENTS.md).
+// ---------------------------------------------------------------------------
+
+export const cartAdminListQuerySchema = z
+  .object({
+    page: z.coerce.number().min(1).default(1),
+    pageSize: z.coerce.number().min(1).max(100).default(50),
+    kind: z.literal('basket').default('basket'),
+    status: cartStatusSchema.optional(),
+    channel: cartChannelSchema.optional(),
+    storeId: uuid().optional(),
+    customerId: uuid().optional(),
+    requiresApproval: z.string().optional(),
+    lastActivityFrom: z.string().optional(),
+    lastActivityTo: z.string().optional(),
+    ids: z.string().optional(),
+    sortField: z.string().optional(),
+    sortDir: z.enum(['asc', 'desc']).optional(),
+  })
+  .passthrough()
+export type CartAdminListQuery = z.infer<typeof cartAdminListQuerySchema>
+
+/** `POST /api/cart/carts/:id/reprice` — no body fields (§10.2); `.strict()` so an
+ * unrecognized key 400s rather than being silently ignored. */
+export const cartAdminRepriceRequestSchema = z.object({}).strict()
+export type CartAdminRepriceRequest = z.infer<typeof cartAdminRepriceRequestSchema>
