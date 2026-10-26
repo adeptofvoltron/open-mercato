@@ -44,7 +44,7 @@ Phase A pay links keep their existing path end to end (checkout spec §2): a `Ch
 | Pre-implement analysis: availability F3 | done (2026-10-26) — `ANALYSIS-2026-10-26-availability-release-5.md` (A1–A21); owner decisions D-R5-8…10 in `ANALYSIS-2026-10-26-ecommerce-release-5-decisions.md` |
 | Pre-implement analysis: cart F4 | done (2026-10-26) — `ANALYSIS-2026-10-26-cart-module-release-5.md` (K1–K17); owner decisions D-R5-11 (seam stays in Release 5, with assisted-selling Phase 1 added) and D-R5-12 |
 | Pre-implement analysis: assisted selling (+ `resolveForBuyer`) | done (2026-10-26) — `ANALYSIS-2026-10-26-assisted-selling-release-5.md` (S1–S25); owner decisions D-R5-13…16 |
-| Pre-implement analysis: checkout B.1–B.5 | done (2026-10-26) — `ANALYSIS-2026-10-26-checkout-release-5.md` (C1–C26); owner decisions pending: C8, C10, C12, C15; C14 moves the rate-limit/encryption minimum from B.6 into B.1/B.3 |
+| Pre-implement analysis: checkout B.1–B.5 | done (2026-10-26) — `ANALYSIS-2026-10-26-checkout-release-5.md` (C1–C26); owner decisions D-R5-17…20; C14 moves the rate-limit/encryption minimum from B.6 into B.1/B.3 |
 | Cross-spec consistency pass and decisions | pending |
 | Spec revision pass | pending |
 | Implementation | pending |

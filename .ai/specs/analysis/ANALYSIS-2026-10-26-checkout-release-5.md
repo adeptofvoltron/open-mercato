@@ -290,7 +290,7 @@ There is no Migration & BC section; §14 covers the withdrawn v1 items only. Add
 
 ### Before Implementation (Must Do)
 
-1. **Owner decisions:**
+1. **Owner decisions, taken 2026-10-26 (D-R5-17…20): C8 = un-hide delivery promotions; C10 = soft dependencies; C12 = trusted in-process context for pay-link carts; C15 = `request_quote` payment method gated by a new `allow_quote_requests` term:**
    - C8: un-hide delivery promotions in Release 5;
    - C12: trusted context for pay-link cart seeding;
    - C15: quote trigger;
