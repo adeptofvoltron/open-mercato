@@ -26,7 +26,7 @@
 | 1 | 1.6 | customer_groups: credit service, row-lock reserve/release/settle + N=20 test (G1/G2/G12/G14) | dispatch:standard | done | pending |
 | 1 | 1.7 | customer_groups: credit admin API + UI + ACL + encryption.ts (G13/G16/G22) | dispatch:standard | done | pending |
 | 1 | 1.8 | customer_groups: credit notifications + exposure-audit job + cancel-release subscriber (D-R5-2/G15/G21) | dispatch:standard | done | pending |
-| 1 | 1.9 | promotions: `revertCodeUse` + `sales.order.cancelled` subscriber (C5) | dispatch:standard | todo | — |
+| 1 | 1.9 | promotions: `revertCodeUse` + `sales.order.cancelled` subscriber (C5) | dispatch:standard | done | pending |
 | 1 | 1.10 | promotions: un-hide `delivery_method` rule + `DELIVERY_DISCOUNT` effect (D-R5-17) | dispatch:standard | todo | — |
 | 1 | 1.11 | customer_groups: admin credit-account provisioning route + ledger-listing read route (G13/D-R5-5 gap-fill) | dispatch:standard | todo | — |
 | 1 | 1.12 | customer_groups: admin credit-account `/adjust` command route (G13/G20/D-R5-2 gap-fill) | dispatch:standard | todo | — |
@@ -115,6 +115,21 @@ commit `c92470d8d5`).
   rejected because it is an admin API route (validator, feature-gated route, command registration,
   audit/undo wiring), a different surface than this Step's notification/job/subscriber work, and
   the brief's own instruction named this exact trade-off and asked to prefer the gap-fill.
+- Step 1.9 (C5): `CodeUsage` (`promotion_code_usages`) stored nothing identifying which cart or
+  order a use belonged to — not even the `cartId` `useCode` already receives as input — so
+  `revertCodeUse({ cartId?, orderId? })` had nothing to look up. The Step's own brief anticipated
+  this ("reverses the RIGHT thing... consult the actual useCode write path") but did not spell out
+  a schema change. Added additive, nullable columns (`cart_id`, `order_id`, `generated_code_id`,
+  `reverted_at`) to `CodeUsage` plus an additive, optional `orderId` on `UseCodeInput`, rather than
+  stopping the run to ask — this is the same class of "additive columns on an unused-in-production
+  table, nothing else touches this write path" judgment call Step 1.5's `CustomerGroupTerms`
+  columns and Step 1.8's credit columns already made without escalating. Alternative considered:
+  make `revertCodeUse` accept only `orderId` and require every future caller to already know the
+  order — rejected because `useCode` itself only ever receives a `cartId` (checkout's own Phase 4
+  submit calls it with both once the order exists, but the type must support a cart-only caller
+  too, matching the brief's own `{ cartId | orderId }` signature), so the column was needed either
+  way; adding `cartId` too, rather than `orderId`-only, closes the gap completely instead of half of
+  it.
 
 ## External References
 

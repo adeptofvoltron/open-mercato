@@ -97,3 +97,39 @@
   "Decisions taken without the owner" for the full reasoning. Without it, exposure can be lowered
   automatically (cancel-release) but never manually, which is a real functional hole for a tenant
   with no payments integration calling `settleCredit`.
+
+## 2026-10-26T14:30:00Z — Step 1.9 landed
+- `promotions`: found that `CodeUsage` (`promotion_code_usages`) stored none of `code_id`,
+  `customer_id`, `organization_id`, `tenant_id`, `used_at` that could key a reversal to a specific
+  cart or order — `useCode`'s own `em.create(CodeUsage, {...})` call wrote none of `cartId`,
+  `orderId`, or which `GeneratedCode` a dynamic use deactivated. `revertCodeUse({ cartId?,
+  orderId? })` had nothing to look up without one. Added additive, nullable columns `cart_id`,
+  `order_id`, `generated_code_id`, `reverted_at` to `CodeUsage` (migration
+  `Migration20261026161603_promotions`) and an additive, optional `orderId` on `UseCodeInput` so a
+  future checkout caller (Phase 4, which calls `useCode` AFTER document creation per the C5
+  finding) can record it immediately — see PLAN.md "Decisions taken without the owner" for the
+  full reasoning and the alternative considered.
+- `revertCodeUse` (new, `lib/code-service.ts`) reverses the exact inverse of `useCode`'s own flip
+  under the same row-lock pattern (`LockMode.PESSIMISTIC_WRITE` on `Code`/`GeneratedCode` inside
+  `withAtomicFlush`): reactivates the specific `GeneratedCode` for a dynamic use, or decrements
+  `Code.used` and reactivates the code once `hasRemainingGlobalUses` is true again for a static
+  use. Marks the `CodeUsage` row `reverted_at` — never deletes (append-only log, same precedent as
+  `PromotionUsage.reverted_at`). Idempotent (only unreverted rows match) and tenant/organization-
+  scoped on every lookup and lock, proven by a dedicated cross-tenant-id-collision test. Registered
+  as command `promotions.code.use.revert` (additive sixth command to §A.2a's own five) and exposed
+  on the `promotionsService` facade, mirroring `releaseCode`/`revertUsage`.
+- `subscribers/order-cancelled-usage-revert.ts` (new, persistent): on `sales.order.cancelled`,
+  resolves `promotionUsageService`/`promotionCodeService` directly from the container (no `auth`/
+  command-bus wrapping needed — same direct-service-call idiom as `customer_groups`'s own
+  `order-cancelled-credit-release.ts` subscriber for this exact event) and calls `revertUsage`
+  then `revertCodeUse`, both keyed by the event's `orderId`. Reads only `orderId`/`tenantId`/
+  `organizationId` off the payload; never imports a `sales` entity. Both calls are independently
+  idempotent on redelivery; the subscriber adds no dedupe of its own.
+- SPEC-055 did not document `revertCodeUse` or a cancellation subscriber anywhere (confirmed by
+  grep — the only prior mention of reversal was `revertUsage`'s own, and §3.3's withdrawn "`sales`
+  calls `revertUsage`" line). Added an additive amendment (v2.3.0): §Code Lifecycle diagram +
+  prose, the `CodeUsage` data-model table, the Commands & Events table, the Public TypeScript
+  Contract, and a Changelog row — no full rewrite.
+- Did NOT touch checkout (no caller exists yet) or cart's `codeService.releaseCode` wiring in the
+  expire/mark-abandoned sweepers (that is Step 2.11/K11's separate reservation-release mechanism,
+  not this Step's use-time reversal).
