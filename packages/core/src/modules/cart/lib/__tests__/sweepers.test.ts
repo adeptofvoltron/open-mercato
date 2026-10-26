@@ -10,13 +10,14 @@ jest.mock('../../events', () => ({
   emitCartEvent: jest.fn(async () => undefined),
 }))
 
-import { Cart, CartMergeLog } from '../../data/entities'
+import { Cart, CartLine, CartMergeLog, CartPromotionApplication } from '../../data/entities'
 import { emitCartEvent } from '../../events'
 import {
   purgeExpiredCarts,
   releaseStaleCartLocks,
   sweepAbandonedCarts,
   sweepExpiredCarts,
+  type CartCodeServiceLike,
 } from '../sweepers'
 
 const emitMock = emitCartEvent as jest.MockedFunction<typeof emitCartEvent>
@@ -32,6 +33,13 @@ function makeCart(overrides: Partial<Cart> = {}): Cart {
     organizationId: ORG,
     kind: 'basket',
     status: 'active',
+    channel: 'storefront',
+    storeId: null,
+    customerId: null,
+    customerUserId: null,
+    email: null,
+    currencyCode: 'EUR',
+    grandTotalGrossAmount: null,
     lastActivityAt: NOW,
     expiresAt: new Date(NOW.getTime() + 7 * 24 * 60 * 60 * 1000),
     resolvedAt: null,
@@ -60,6 +68,33 @@ function makeMergeLog(overrides: Partial<CartMergeLog> = {}): CartMergeLog {
     createdAt: NOW,
     ...overrides,
   } as CartMergeLog
+}
+
+function makeCartLine(overrides: Partial<CartLine> = {}): CartLine {
+  return {
+    id: `line-${Math.random().toString(36).slice(2)}`,
+    tenantId: TENANT,
+    organizationId: ORG,
+    cartId: 'unset',
+    deletedAt: null,
+    ...overrides,
+  } as CartLine
+}
+
+function makeCartPromotionApplication(overrides: Partial<CartPromotionApplication> = {}): CartPromotionApplication {
+  return {
+    id: `application-${Math.random().toString(36).slice(2)}`,
+    tenantId: TENANT,
+    organizationId: ORG,
+    cartId: 'unset',
+    promotionId: 'promotion-1',
+    codeId: null,
+    ...overrides,
+  } as CartPromotionApplication
+}
+
+function makeCodeService(): jest.Mocked<CartCodeServiceLike> {
+  return { releaseCode: jest.fn(async () => undefined) }
 }
 
 // Evaluates one MikroORM-style filter value ($in/$lt/$gt/$ne, ANDed when combined on one key).
@@ -95,13 +130,24 @@ function matchesWhere(row: Record<string, unknown>, where: Record<string, unknow
 // exact WHERE shape the sweep under test issues; `nativeUpdate`/`nativeDelete` apply the same
 // guard to the matching rows. Mirrors
 // push_notifications/lib/__tests__/push-reaper.test.ts's own `makeEm` helper.
-function makeEm(initialCarts: Cart[], initialMergeLogs: CartMergeLog[] = []) {
+//
+// (K11) `lines`/`applications` back `releaseCartCodeReservations`'s own reads
+// (`CartLine` for K9's `lineCount`, `CartPromotionApplication` for the codes to release) —
+// read-only tables for this stub, since the sweep under test never writes either.
+function makeEm(
+  initialCarts: Cart[],
+  initialMergeLogs: CartMergeLog[] = [],
+  initialLines: CartLine[] = [],
+  initialApplications: CartPromotionApplication[] = [],
+) {
   let carts = initialCarts
   let mergeLogs = initialMergeLogs
+  const lines = initialLines
+  const applications = initialApplications
 
   return {
     find: jest.fn(async (entity: unknown, where: Record<string, unknown>, options?: { limit?: number; orderBy?: Record<string, 'ASC' | 'DESC'>; fields?: string[] }) => {
-      const table = entity === CartMergeLog ? mergeLogs : carts
+      const table = entity === CartMergeLog ? mergeLogs : entity === CartLine ? lines : entity === CartPromotionApplication ? applications : carts
       let matched = table.filter((row) => matchesWhere(row as unknown as Record<string, unknown>, where))
       if (options?.orderBy) {
         const entries = Object.entries(options.orderBy)
@@ -149,7 +195,7 @@ describe('sweepAbandonedCarts', () => {
     const stale = makeCart({ id: 'stale-1', lastActivityAt: new Date(NOW.getTime() - 25 * 60 * 60 * 1000) })
     const em = makeEm([stale])
 
-    const result = await sweepAbandonedCarts(em as never, { tenantId: TENANT }, NOW)
+    const result = await sweepAbandonedCarts(em as never, { tenantId: TENANT }, makeCodeService(), NOW)
 
     expect(result).toEqual({ transitioned: 1 })
     expect(stale.status).toBe('abandoned')
@@ -157,16 +203,78 @@ describe('sweepAbandonedCarts', () => {
     expect(stale.updatedAt).toEqual(NOW)
     expect(emitMock).toHaveBeenCalledWith(
       'cart.cart.abandoned',
-      { cartId: 'stale-1' },
+      {
+        cartId: 'stale-1',
+        tenantId: TENANT,
+        organizationId: ORG,
+        storeId: null,
+        channel: 'storefront',
+        customerId: null,
+        customerUserId: null,
+        hasEmail: false,
+        currencyCode: 'EUR',
+        grandTotalGrossAmount: null,
+        lineCount: 0,
+        lastActivityAt: stale.lastActivityAt,
+      },
       { persistent: true, tenantId: TENANT, organizationId: ORG },
     )
+  })
+
+  // K9: every field named by §11's rev-10 payload, with non-default values on every one
+  // that has a meaningful default (`storeId`/`customerId`/`customerUserId` null,
+  // `hasEmail` false, `grandTotalGrossAmount` null, `lineCount` 0) so this test actually
+  // exercises the mapping rather than confirming defaults pass through unchanged. Never
+  // the raw `email` string anywhere in the payload — only the derived `hasEmail` boolean.
+  it('emits the full K9 payload shape, including a line count and hasEmail derived from the stored email', async () => {
+    const richCart = makeCart({
+      id: 'rich-1',
+      lastActivityAt: new Date(NOW.getTime() - 25 * 60 * 60 * 1000),
+      channel: 'pos',
+      storeId: 'store-1',
+      customerId: 'customer-1',
+      customerUserId: 'customer-user-1',
+      email: 'buyer@example.com',
+      currencyCode: 'USD',
+      grandTotalGrossAmount: '42.5000',
+    })
+    const lines = [
+      makeCartLine({ cartId: 'rich-1' }),
+      makeCartLine({ cartId: 'rich-1' }),
+      makeCartLine({ cartId: 'other-cart' }),
+    ]
+    const em = makeEm([richCart], [], lines)
+
+    const result = await sweepAbandonedCarts(em as never, { tenantId: TENANT }, makeCodeService(), NOW)
+
+    expect(result).toEqual({ transitioned: 1 })
+    expect(emitMock).toHaveBeenCalledWith(
+      'cart.cart.abandoned',
+      {
+        cartId: 'rich-1',
+        tenantId: TENANT,
+        organizationId: ORG,
+        storeId: 'store-1',
+        channel: 'pos',
+        customerId: 'customer-1',
+        customerUserId: 'customer-user-1',
+        hasEmail: true,
+        currencyCode: 'USD',
+        grandTotalGrossAmount: '42.5000',
+        lineCount: 2,
+        lastActivityAt: richCart.lastActivityAt,
+      },
+      { persistent: true, tenantId: TENANT, organizationId: ORG },
+    )
+    const payload = emitMock.mock.calls[0][1] as Record<string, unknown>
+    expect(payload.email).toBeUndefined()
   })
 
   it('leaves a basket with recent activity alone', async () => {
     const fresh = makeCart({ id: 'fresh-1', lastActivityAt: new Date(NOW.getTime() - 60 * 60 * 1000) })
     const em = makeEm([fresh])
 
-    const result = await sweepAbandonedCarts(em as never, { tenantId: TENANT }, NOW)
+    const result = await sweepAbandonedCarts(em as never, { tenantId: TENANT }, makeCodeService(), NOW)
 
     expect(result).toEqual({ transitioned: 0 })
     expect(fresh.status).toBe('active')
@@ -181,7 +289,7 @@ describe('sweepAbandonedCarts', () => {
     })
     const em = makeEm([proposal])
 
-    const result = await sweepAbandonedCarts(em as never, { tenantId: TENANT }, NOW)
+    const result = await sweepAbandonedCarts(em as never, { tenantId: TENANT }, makeCodeService(), NOW)
 
     expect(result).toEqual({ transitioned: 0 })
     expect(proposal.status).toBe('active')
@@ -196,7 +304,7 @@ describe('sweepAbandonedCarts', () => {
     })
     const em = makeEm([alreadyAbandoned])
 
-    const result = await sweepAbandonedCarts(em as never, { tenantId: TENANT }, NOW)
+    const result = await sweepAbandonedCarts(em as never, { tenantId: TENANT }, makeCodeService(), NOW)
 
     expect(result).toEqual({ transitioned: 0 })
     expect(emitMock).not.toHaveBeenCalled()
@@ -207,7 +315,7 @@ describe('sweepAbandonedCarts', () => {
     const justOverOneHour = makeCart({ id: 'short-window-1', lastActivityAt: new Date(NOW.getTime() - 90 * 60 * 1000) })
     const em = makeEm([justOverOneHour])
 
-    const result = await sweepAbandonedCarts(em as never, { tenantId: TENANT }, NOW)
+    const result = await sweepAbandonedCarts(em as never, { tenantId: TENANT }, makeCodeService(), NOW)
 
     expect(result).toEqual({ transitioned: 1 })
     expect(justOverOneHour.status).toBe('abandoned')
@@ -231,17 +339,64 @@ describe('sweepAbandonedCarts', () => {
       return result
     })
 
-    const result = await sweepAbandonedCarts(em as never, { tenantId: TENANT }, NOW)
+    const result = await sweepAbandonedCarts(em as never, { tenantId: TENANT }, makeCodeService(), NOW)
 
     expect(result).toEqual({ transitioned: 1 })
     expect(raceWon.status).toBe('abandoned')
     expect(raceWon.resolvedAt).toEqual(NOW)
     expect(emitMock).toHaveBeenCalledTimes(1)
-    expect(emitMock).toHaveBeenCalledWith(
-      'cart.cart.abandoned',
-      { cartId: 'race-won' },
-      { persistent: true, tenantId: TENANT, organizationId: ORG },
-    )
+    const [, raceWonPayload] = emitMock.mock.calls[0]
+    expect((raceWonPayload as Record<string, unknown>).cartId).toBe('race-won')
+  })
+
+  // K11: the core new behaviour — every distinct code a transitioned basket still holds a
+  // `CartPromotionApplication` reservation for gets released by `cartId`, exactly once per
+  // code, via the injected `codeService` — never a static `promotions` entity import.
+  it('releases every distinct code reservation on an abandoned basket, exactly once each', async () => {
+    const stale = makeCart({ id: 'stale-codes-1', lastActivityAt: new Date(NOW.getTime() - 25 * 60 * 60 * 1000) })
+    const applications = [
+      makeCartPromotionApplication({ cartId: 'stale-codes-1', codeId: 'code-1' }),
+      // A second promotion's placeholder row referencing the SAME code (§4.3's own "a
+      // code referenced by more than one promotion's rule tree resolves to all of them")
+      // must not release twice.
+      makeCartPromotionApplication({ cartId: 'stale-codes-1', codeId: 'code-1', promotionId: 'promotion-2' }),
+      makeCartPromotionApplication({ cartId: 'stale-codes-1', codeId: 'code-2' }),
+      makeCartPromotionApplication({ cartId: 'other-cart', codeId: 'code-should-not-release' }),
+    ]
+    const em = makeEm([stale], [], [], applications)
+    const codeService = makeCodeService()
+
+    const result = await sweepAbandonedCarts(em as never, { tenantId: TENANT }, codeService, NOW)
+
+    expect(result).toEqual({ transitioned: 1 })
+    expect(codeService.releaseCode).toHaveBeenCalledTimes(2)
+    expect(codeService.releaseCode).toHaveBeenCalledWith(em, 'code-1', 'stale-codes-1', { tenantId: TENANT, organizationId: ORG })
+    expect(codeService.releaseCode).toHaveBeenCalledWith(em, 'code-2', 'stale-codes-1', { tenantId: TENANT, organizationId: ORG })
+  })
+
+  it('never calls releaseCode for a basket with no code reservations', async () => {
+    const stale = makeCart({ id: 'stale-no-codes-1', lastActivityAt: new Date(NOW.getTime() - 25 * 60 * 60 * 1000) })
+    const em = makeEm([stale])
+    const codeService = makeCodeService()
+
+    const result = await sweepAbandonedCarts(em as never, { tenantId: TENANT }, codeService, NOW)
+
+    expect(result).toEqual({ transitioned: 1 })
+    expect(codeService.releaseCode).not.toHaveBeenCalled()
+  })
+
+  it('does not let a failed code release block the event emission or the sweep tick', async () => {
+    const stale = makeCart({ id: 'stale-release-fails-1', lastActivityAt: new Date(NOW.getTime() - 25 * 60 * 60 * 1000) })
+    const applications = [makeCartPromotionApplication({ cartId: 'stale-release-fails-1', codeId: 'code-1' })]
+    const em = makeEm([stale], [], [], applications)
+    const codeService = makeCodeService()
+    codeService.releaseCode.mockRejectedValueOnce(new Error('promotions unavailable'))
+
+    const result = await sweepAbandonedCarts(em as never, { tenantId: TENANT }, codeService, NOW)
+
+    expect(result).toEqual({ transitioned: 1 })
+    expect(stale.status).toBe('abandoned')
+    expect(emitMock).toHaveBeenCalled()
   })
 })
 
@@ -252,7 +407,7 @@ describe('sweepExpiredCarts', () => {
       const expired = makeCart({ id: `expired-${status}`, status, expiresAt: new Date(NOW.getTime() - 1000) })
       const em = makeEm([expired])
 
-      const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, NOW)
+      const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, makeCodeService(), NOW)
 
       expect(result).toEqual({ transitioned: 1 })
       expect(expired.status).toBe('expired')
@@ -269,7 +424,7 @@ describe('sweepExpiredCarts', () => {
     const notYet = makeCart({ id: 'not-yet-1', expiresAt: new Date(NOW.getTime() + 1000) })
     const em = makeEm([notYet])
 
-    const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, NOW)
+    const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, makeCodeService(), NOW)
 
     expect(result).toEqual({ transitioned: 0 })
     expect(notYet.status).toBe('active')
@@ -280,7 +435,7 @@ describe('sweepExpiredCarts', () => {
     const merged = makeCart({ id: 'merged-1', status: 'merged', expiresAt: new Date(NOW.getTime() - 1000) })
     const em = makeEm([converted, merged])
 
-    const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, NOW)
+    const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, makeCodeService(), NOW)
 
     expect(result).toEqual({ transitioned: 0 })
     expect(converted.status).toBe('converted')
@@ -291,10 +446,59 @@ describe('sweepExpiredCarts', () => {
     const proposal = makeCart({ id: 'proposal-exp-1', kind: 'proposal', expiresAt: new Date(NOW.getTime() - 1000) })
     const em = makeEm([proposal])
 
-    const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, NOW)
+    const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, makeCodeService(), NOW)
 
     expect(result).toEqual({ transitioned: 0 })
     expect(proposal.status).toBe('active')
+  })
+
+  // K11: same wiring as `sweepAbandonedCarts`, closing the Release 4 deferral this file
+  // used to carry for `expire-carts` specifically.
+  it('releases every distinct code reservation on an expired basket', async () => {
+    const expired = makeCart({ id: 'expired-codes-1', expiresAt: new Date(NOW.getTime() - 1000) })
+    const applications = [
+      makeCartPromotionApplication({ cartId: 'expired-codes-1', codeId: 'code-1' }),
+      makeCartPromotionApplication({ cartId: 'other-cart', codeId: 'code-should-not-release' }),
+    ]
+    const em = makeEm([expired], [], [], applications)
+    const codeService = makeCodeService()
+
+    const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, codeService, NOW)
+
+    expect(result).toEqual({ transitioned: 1 })
+    expect(codeService.releaseCode).toHaveBeenCalledTimes(1)
+    expect(codeService.releaseCode).toHaveBeenCalledWith(em, 'code-1', 'expired-codes-1', { tenantId: TENANT, organizationId: ORG })
+  })
+
+  it('never calls releaseCode for an expiring basket with no code reservations', async () => {
+    const expired = makeCart({ id: 'expired-no-codes-1', expiresAt: new Date(NOW.getTime() - 1000) })
+    const em = makeEm([expired])
+    const codeService = makeCodeService()
+
+    const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, codeService, NOW)
+
+    expect(result).toEqual({ transitioned: 1 })
+    expect(codeService.releaseCode).not.toHaveBeenCalled()
+  })
+
+  // Regression check (unchanged by this Step): a racing tenant's own candidates and
+  // transitions never cross into this tenant's tick, same scoping every sweep in this
+  // file already enforces via `scope.tenantId` on every `find`/`nativeUpdate`.
+  it('never transitions or releases codes for a basket under a different tenant', async () => {
+    const otherTenantCart = makeCart({
+      id: 'other-tenant-1',
+      tenantId: 'tenant-other',
+      organizationId: 'org-other',
+      expiresAt: new Date(NOW.getTime() - 1000),
+    })
+    const em = makeEm([otherTenantCart])
+    const codeService = makeCodeService()
+
+    const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, codeService, NOW)
+
+    expect(result).toEqual({ transitioned: 0 })
+    expect(otherTenantCart.status).toBe('active')
+    expect(codeService.releaseCode).not.toHaveBeenCalled()
   })
 })
 

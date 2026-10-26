@@ -785,3 +785,83 @@
   `'admin_reprice'` field-application branch; `tryResolveCustomerPurchaseApprovalService` kept
   despite `customer_groups` being a hard dependency; and `lib/adminCartScope.ts` duplicating
   (never importing) `customer_groups`' own module-private scope helper.
+
+## 2026-10-27T00:30:00Z — Step 2.11 landed (closes Phase 2's `cart` track)
+
+- `cart.cart.abandoned` (K9, §11 as revised) grows from `{ cartId }` to the full Release 5
+  shape: `{ cartId, tenantId, organizationId, storeId, channel, customerId, customerUserId,
+  hasEmail, currencyCode, grandTotalGrossAmount, lineCount, lastActivityAt }`. `hasEmail` is a
+  derived boolean (`Boolean(cart.email)`) — the decrypted `email` string itself never appears on
+  the payload (no PII leak, this run's established redaction discipline). `grandTotalGrossAmount`
+  reads Step 2.10's generated column directly rather than recomputing from the `totals` jsonb.
+  `lineCount` is batched in ONE `CartLine` query per sweep page (never N+1), mirroring the exact
+  pattern `api/carts/route.ts`'s own `afterList` hook already established for the same field
+  (Step 2.10). `cart.cart.expired`'s own payload is unchanged — K9 only names `.abandoned`.
+- K11: `mark-abandoned-carts` and `expire-carts` now release every distinct code reservation a
+  transitioned basket holds, by `cartId` — closing the Release 4 deferral `lib/sweepers.ts`
+  carried at this exact spot since Step 4.8/7.2. Implemented as a new local helper,
+  `releaseCartCodeReservations`, which enumerates the basket's `CartPromotionApplication.codeId`
+  values (deduped — a code referenced by more than one promotion's rule tree gets exactly one
+  release call, mirroring `commands/promotions.ts#removePromotionCommand`'s own pattern) and
+  calls `codeService.releaseCode(em, codeId, cartId, scope)` for each, immediately after that
+  cart's own lifecycle-event emission in the same per-cart loop (no extra transaction — matches
+  this file's existing "the DB transition already committed, side effects run after" shape).
+  Best-effort: a release failure is logged and swallowed, never re-thrown to retry an already-
+  landed status transition — the exact same reasoning this file's own `emitCartLifecycleEvent`
+  already documents for itself, now applied identically to the new call; `promotions`' own
+  `code-reservation-sweeper.ts` (TTL-based, independent) is the safety net for whatever this
+  call does not reach.
+- `codeService` is injected, never DI-resolved inside `lib/sweepers.ts` itself — a new exported
+  duck type, `CartCodeServiceLike` (`releaseCode(em, codeId, cartId, scope): Promise<void>`),
+  matching `promotions/lib/code-service.ts#PromotionCodeService.releaseCode`'s exact signature
+  with zero static `promotions` entity import. Both `sweepAbandonedCarts`/`sweepExpiredCarts`
+  gained a new required `codeService: CartCodeServiceLike` parameter (ahead of the existing
+  `now` default), and both workers (`mark-abandoned.worker.ts`/`expire.worker.ts`) now resolve
+  it via `ctx.resolve<CartCodeServiceLike>('promotionCodeService')` — `promotions`' own frozen DI
+  token (§Release 4 Contract Freeze) — before calling the sweep. `cart`'s `index.ts` already
+  lists `promotions` as a hard `requires`, so this resolve can never fail for "module not
+  installed" the way a soft `tryResolve` would need to guard against.
+- **Verified, not a gap:** `expire-carts`/`mark-abandoned-carts` are the only two sweepers K11
+  names, and they are also the only two `kind = 'basket'` transitions that ever set `resolvedAt`
+  BEFORE `purge-expired-carts` can see a cart — `release-stale-locks` doesn't touch `resolvedAt`
+  at all (a `locked -> active` row stays non-terminal). So neither of K11's two targets is a
+  real gap for `purgeExpiredCarts` to additionally cover.
+- **Gap found and deliberately left open (not silently expanded into this Step's scope):**
+  `purgeExpiredCarts`'s own `WHERE` (`kind: 'basket'`, `resolvedAt` past the 90-day cutoff) has
+  no `status` filter, and TWO other transitions write `resolvedAt` directly without ever passing
+  through `expire`/`mark-abandoned` first — `cart.markConverted` (`commands/lock.ts:~506-507`,
+  `status = 'converted'`) and `cart.merge`'s absorbed-cart finalization (`commands/merge.ts:
+  ~595-597`, `status = 'merged'`). A converted or merged basket that still held an open
+  `CartPromotionApplication`/`CodeReservation` pair at that moment (today: always true for
+  `markConverted`, since no caller in this worktree calls `promotions.code.use` before it —
+  that lands in checkout's own Phase 4 submit, Steps 4.1–4.2) will reach `purgeExpiredCarts`'s
+  90-day cutoff with that reservation never released by THIS file's mechanism. K11's own text
+  names only `expire`/`mark-abandoned`, not `purge`, `markConverted`, or `merge` — extending the
+  release call to either of those two commands, or to `purgeExpiredCarts` itself, is a materially
+  different change (a NEW call site in `commands/lock.ts`/`commands/merge.ts`, not a sweeper
+  the brief already named) than this Step was asked to make, so it was left alone rather than
+  silently grown. In practice this is non-fatal today: `promotions`' own
+  `code-reservation-sweeper.ts` is an independent, TTL-based safety net that releases a lapsed
+  `CodeReservation` row regardless of the cart's own state, and once checkout's real submit
+  sequence lands (Phase 4) a converted cart's codes will already be consumed via
+  `promotions.code.use` (which deletes the `CodeReservation` row itself, same transaction) before
+  `markConverted` is ever called — so the gap is real today but time-bound, not a correctness
+  defect in what K11 asked for. Flagged here per the task brief's own instruction rather than
+  expanding scope to fix it.
+- Files: `packages/core/src/modules/cart/lib/sweepers.ts` (`CartCodeServiceLike`,
+  `releaseCartCodeReservations`, both sweepers' new `codeService` parameter, the K9 payload,
+  the purge doc-comment), `packages/core/src/modules/cart/workers/mark-abandoned.worker.ts` +
+  `expire.worker.ts` (resolve `promotionCodeService`, pass it through). Tests:
+  `lib/__tests__/sweepers.test.ts` — rewrote the `cart.cart.abandoned` assertions to the full K9
+  shape, added a dedicated full-field-coverage test (non-default values on every field, asserts
+  `email` itself never appears on the payload), added K11 coverage for both sweepers (releases
+  every distinct code once each, a reservation-free basket calls `releaseCode` zero times, a
+  `releaseCode` rejection never blocks the transition or the event), and a tenant-isolation
+  regression check for `sweepExpiredCarts`. `makeEm`'s stub grew two new read-only in-memory
+  tables (`CartLine`, `CartPromotionApplication`) and two new fixture builders.
+- Checks (local mode, from `packages/core`): `TMPDIR=/tmp yarn jest src/modules/cart/lib/
+  __tests__/sweepers.test.ts` — 27/27 passing. Full `src/modules/cart` jest suite — 23/23
+  suites, 287/287 tests, zero regressions (260 pre-existing + 27 new/changed). `src/modules/
+  promotions` jest suite — 28/28 suites, 333/333 tests, unaffected (confirms `PromotionCodeService
+  .releaseCode`'s own signature/behavior was read, never edited). `TMPDIR=/tmp yarn typecheck`
+  (scoped to `packages/core`) — clean, exit 0. `npx eslint` on all four touched files — clean.

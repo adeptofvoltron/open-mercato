@@ -2,11 +2,68 @@ import type { FilterQuery } from '@mikro-orm/core'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import { findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 import { createLogger } from '@open-mercato/shared/lib/logger'
-import { Cart, CartMergeLog } from '../data/entities'
+import { Cart, CartLine, CartMergeLog, CartPromotionApplication } from '../data/entities'
 import { emitCartEvent } from '../events'
 import { DAY_MS, PURGE_RETENTION_DAYS, resolveCartInactivityWindowMs } from './sweepConfig'
 
 const logger = createLogger('cart')
+
+// K11 (ANALYSIS-2026-10-26-cart-module-release-5.md, §12 as revised): `expire`/
+// `mark-abandoned` must release the promotions-side code RESERVATION a basket holds, by
+// `cartId` (`promotions/lib/code-service.ts#PromotionCodeService.releaseCode`), closing
+// the Release 4 deferral this file used to carry at this exact spot. Duck-typed onto that
+// service's own surface — never a static `promotions` entity import — same cross-module
+// discipline `availability`'s `WmsReservationServiceLike` (Step 2.3) already established
+// for this run's sibling sweepers.
+export type CartCodeServiceLike = {
+  releaseCode(
+    em: EntityManager,
+    codeId: string,
+    cartId: string,
+    scope: { tenantId: string; organizationId: string },
+  ): Promise<void>
+}
+
+/**
+ * Enumerates the distinct code reservations a basket still holds
+ * (`CartPromotionApplication.codeId`, one row per applied promotion — §4.3) and releases
+ * each one by `cartId`, mirroring `commands/promotions.ts#removePromotionCommand`'s own
+ * "release happens by cartId on cart expiry, abandonment or code removal" (§6). Best-
+ * effort, same reasoning as `emitCartLifecycleEvent` below: the cart's own status
+ * transition already committed by the time this runs, so a failed release must not be
+ * re-thrown (which would retry a transition that already landed) nor treated as a failed
+ * sweep — `promotions`' own `code-reservation-sweeper.ts` (its TTL-based independent
+ * safety net) is still there to catch whatever this call does not reach.
+ */
+async function releaseCartCodeReservations(
+  em: EntityManager,
+  codeService: CartCodeServiceLike,
+  cart: Cart,
+  workerLabel: string,
+): Promise<void> {
+  const applications = await em.find(
+    CartPromotionApplication,
+    { cartId: cart.id, tenantId: cart.tenantId, organizationId: cart.organizationId },
+    { fields: ['codeId'] },
+  )
+  const codeIds = Array.from(
+    new Set(applications.map((application) => application.codeId).filter((id): id is string => !!id)),
+  )
+  for (const codeId of codeIds) {
+    try {
+      await codeService.releaseCode(em, codeId, cart.id, {
+        tenantId: cart.tenantId,
+        organizationId: cart.organizationId,
+      })
+    } catch (error) {
+      logger.warn(`${workerLabel} failed to release code reservation`, {
+        cartId: cart.id,
+        codeId,
+        error: error instanceof Error ? error.message : error,
+      })
+    }
+  }
+}
 
 // The active-cart backlog grows with the tenant, so every sweep walks it in pages instead of
 // loading every matching row into memory at once. Mirrors
@@ -53,10 +110,15 @@ async function emitCartLifecycleEvent(
  * No cursor needed: each page's `nativeUpdate` flips every selected row's `status` away from
  * `'active'`, so the identical next `find` call naturally excludes them and returns the next
  * batch — there is nothing left for a page to re-select.
+ *
+ * (rev 10 — K9/K11) `cart.cart.abandoned`'s payload grows to the full Release 5 shape
+ * (§11), and every transitioned basket's code reservations are released by `cartId`
+ * (`releaseCartCodeReservations` above, K11).
  */
 export async function sweepAbandonedCarts(
   em: EntityManager,
   scope: CartSweepScope,
+  codeService: CartCodeServiceLike,
   now: Date = new Date(),
 ): Promise<CartSweepResult> {
   const cutoff = new Date(now.getTime() - resolveCartInactivityWindowMs())
@@ -94,13 +156,40 @@ export async function sweepAbandonedCarts(
       {},
       { tenantId: scope.tenantId },
     )
+
+    // K9: `lineCount` is never denormalized onto `Cart` — batched in ONE query across
+    // every row THIS page transitioned, mirroring `api/carts/route.ts`'s own `afterList`
+    // "never N+1" discipline for the identical field.
+    const transitionedIds = transitionedCarts.map((cart) => cart.id)
+    const lines = transitionedIds.length
+      ? await em.find(CartLine, { cartId: { $in: transitionedIds }, tenantId: scope.tenantId, deletedAt: null }, { fields: ['cartId'] })
+      : []
+    const lineCountByCartId = new Map<string, number>()
+    for (const line of lines) {
+      lineCountByCartId.set(line.cartId, (lineCountByCartId.get(line.cartId) ?? 0) + 1)
+    }
+
     for (const cart of transitionedCarts) {
       await emitCartLifecycleEvent(
         'cart.cart.abandoned',
-        { cartId: cart.id },
+        {
+          cartId: cart.id,
+          tenantId: cart.tenantId,
+          organizationId: cart.organizationId,
+          storeId: cart.storeId ?? null,
+          channel: cart.channel,
+          customerId: cart.customerId ?? null,
+          customerUserId: cart.customerUserId ?? null,
+          hasEmail: Boolean(cart.email),
+          currencyCode: cart.currencyCode,
+          grandTotalGrossAmount: cart.grandTotalGrossAmount ?? null,
+          lineCount: lineCountByCartId.get(cart.id) ?? 0,
+          lastActivityAt: cart.lastActivityAt,
+        },
         { tenantId: cart.tenantId, organizationId: cart.organizationId },
         'cart:mark-abandoned',
       )
+      await releaseCartCodeReservations(em, codeService, cart, 'cart:mark-abandoned')
     }
     transitioned += affected
     if (candidates.length < SWEEP_PAGE_SIZE) break
@@ -113,13 +202,15 @@ export async function sweepAbandonedCarts(
  * §12 `expire-carts` (hourly): `kind = 'basket' AND status IN ('active','abandoned','locked')
  * AND expiresAt < now()` → `status = 'expired'`, `resolvedAt = now()`.
  *
- * The spec's §12 prose also says this sweep "releases promotion code reservations" — skipped
- * here on purpose. Per-cart promotion code reservations do not exist in this worktree yet
- * (promotions-cart integration is Phase 7); flagged in NOTIFY.md rather than stubbed.
+ * (rev 10 — K11) Every transitioned basket's code reservations are released by `cartId`
+ * (`releaseCartCodeReservations` above), closing the Release 4 deferral this file used to
+ * carry at this exact spot. `cart.cart.expired`'s own payload is unchanged (K9 only grows
+ * `cart.cart.abandoned`, §11).
  */
 export async function sweepExpiredCarts(
   em: EntityManager,
   scope: CartSweepScope,
+  codeService: CartCodeServiceLike,
   now: Date = new Date(),
 ): Promise<CartSweepResult> {
   let transitioned = 0
@@ -169,6 +260,7 @@ export async function sweepExpiredCarts(
         { tenantId: cart.tenantId, organizationId: cart.organizationId },
         'cart:expire',
       )
+      await releaseCartCodeReservations(em, codeService, cart, 'cart:expire')
     }
     transitioned += affected
     if (candidates.length < SWEEP_PAGE_SIZE) break
@@ -251,6 +343,13 @@ function purgePageWhere(base: FilterQuery<Cart>, cursor: PurgeCursor): FilterQue
  * A two-step fetch-then-filter against `CartMergeLog` rather than a single `NOT EXISTS` query —
  * `CartMergeLog` won't even have rows until Phase 7/merge ships, so this is not worth fighting
  * the ORM's query builder for.
+ *
+ * (Step 2.11/K11 scope check) This sweep's own WHERE (`kind: 'basket'`, `resolvedAt` past the
+ * retention cutoff) carries no `status` filter, so it also reaches `converted`/`merged` rows —
+ * neither of which passes through `sweepAbandonedCarts`/`sweepExpiredCarts` first (`cart.
+ * markConverted`/`cart.merge` set `resolvedAt` directly). K11 names only `expire`/`mark-
+ * abandoned`; this sweep deliberately does NOT call `releaseCartCodeReservations` — see
+ * NOTIFY.md for why that is a real, scoped-out gap rather than a verified no-op.
  */
 export async function purgeExpiredCarts(
   em: EntityManager,

@@ -40,7 +40,7 @@
 | 2 | 2.8 | cart: lock contract — `lockTtlMs`, idempotent extend by `checkoutSessionId`, `unlock`/`markConverted` match (C1) | dispatch:standard | done | pending |
 | 2 | 2.9 | cart: D-R5-21/D-R5-22 identity binding on `/current/*` + trusted `resolveForBuyer` path for pay_link/api/agent | dispatch:standard | done | pending |
 | 2 | 2.10 | cart: `markConverted` additive inputs (`salesOrderId`/`lineMap`/`salesQuoteId`, K8/D-R5-26); admin list + detail + reprice (K6) | dispatch:standard | done | pending |
-| 2 | 2.11 | cart: abandonment payload (K9) + code-reservation release on expire/abandon (K11) | dispatch:standard | todo | — |
+| 2 | 2.11 | cart: abandonment payload (K9) + code-reservation release on expire/abandon (K11) | dispatch:standard | done | pending |
 | 2 | 2.12 | checkout: B.1 session entity + step machine + token hash + C14 minimum (rate limits, encryption, redaction) | dispatch:standard | todo | — |
 | 2 | 2.13 | checkout: B.3 delivery + payment step (rate quoting C13, delivery-promotions evaluation C8) | dispatch:standard | todo | — |
 | 3 | 3.1 | cart: approval gate K1–K5 (`requiresApproval`, lock refusal, `purpose: 'quote'` skip D-R5-23, guest fail-closed D-R5-12/29) | dispatch:standard | todo | — |
@@ -647,6 +647,30 @@ commit `c92470d8d5`).
   for this exact duplication (its own comment: "Hand-written routes resolve an
   `OrganizationScope` themselves; this derives the `organizationIds` list exactly the way
   `makeCrudRoute` derives `ctx.organizationIds`").
+
+- Step 2.11 (K11, §12 as revised): `purgeExpiredCarts` does NOT gain a `releaseCartCodeReservations`
+  call, even though its own `WHERE` (`kind: 'basket'`, `resolvedAt` past the 90-day cutoff) has
+  no `status` filter and can reach a `converted` or `merged` basket that never passed through
+  `expire`/`mark-abandoned` first (`cart.markConverted` and `cart.merge`'s absorbed-cart
+  finalization both set `resolvedAt` directly, bypassing both sweepers K11 names). Checked and
+  confirmed this is a REAL gap, not a false alarm — today, nothing in this worktree calls
+  `promotions.code.use` before `cart.markConverted` (that lands in checkout's own Phase 4 submit,
+  Steps 4.1–4.2), so a converted basket's open code reservation can genuinely still be sitting
+  there when the 90-day purge cutoff arrives. Left it open rather than silently expanding this
+  Step's scope: K11's own text names only `expire`/`mark-abandoned`, and closing the gap properly
+  means a NEW release call site in `commands/lock.ts`'s `markConverted` and/or `commands/merge.ts`
+  (release-on-conversion/merge is a materially different change than wiring an existing sweeper),
+  not something `purgeExpiredCarts` itself should paper over with a release call of its own 90
+  days late. Non-fatal in the meantime: `promotions`' own `code-reservation-sweeper.ts` is an
+  independent, TTL-based safety net that releases a lapsed `CodeReservation` row regardless of
+  the cart's own state, and once checkout's real Phase 4 submit sequence lands, `promotions.code.
+  use` will have already deleted the reservation (same transaction as recording the use) before
+  `markConverted` is ever reached. Full reasoning and the exact call-site line numbers are in
+  NOTIFY.md's Step 2.11 entry. Alternative considered: add the release call to `purgeExpiredCarts`
+  itself as a defensive catch-all regardless of root cause — rejected as treating a symptom (a
+  cart purged 90 days late) rather than the cause (two commands that can resolve a basket without
+  ever releasing its codes), and as a sweeper quietly growing a responsibility (per-command
+  lifecycle cleanup) this Step was never asked to give it.
 
 ## External References
 
