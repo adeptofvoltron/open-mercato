@@ -3,6 +3,17 @@
 > Decisions taken by the owner on the open questions raised by the Release 5 pre-implementation analyses.
 > Ids are `D-R5-n`. Each row names the analysis finding it closes.
 > Scope and ordering: `ANALYSIS-2026-10-26-ecommerce-release-5-scope.md`.
+>
+> **Audit trail only (since the spec revision pass of 2026-10-26).** Every decision below has been applied to the specs in scope:
+> - customer groups;
+> - availability;
+> - cart;
+> - assisted selling;
+> - checkout;
+> - the e-commerce roadmap ADRs;
+> - SPEC-029.
+>
+> **The specs are now the source of truth.** Where this register and a spec differ, the spec wins; a change to a decided behaviour is made in the spec and its changelog. This file records who decided what and why, and is not edited further except to append new decisions.
 
 ## Customer groups Phases 3–4 (2026-10-26)
 
@@ -85,6 +96,8 @@ Source: `ANALYSIS-2026-10-26-ecommerce-release-5-cross-spec.md`, findings X1–X
 | D-R5-34 | X20, C25, A18 | **Grants.** `employee` gets `checkout.sessions.view`; `checkout.sessions.manage` stays with `admin` (least privilege, like D-R5-7). The admin reservations list (A18) is outside Release 5. | checkout `acl.ts`/`setup.ts`; availability §11 | Owner, package accept; recommended |
 | D-R5-35 | X20, C13 | **Flat-rate delivery fallback location.** Store settings for storefront carts, link settings for link carts. | checkout §5.3 | Owner, package accept; recommended |
 | D-R5-36 | X20, S20 | **Module registration.** `assisted_selling` is enabled in `apps/mercato/src/modules.ts` and commented out in the create-app template (D22 precedent), with `yarn template:sync:fix`. | assisted-selling §11 Phase 1 | Owner, package accept; recommended |
+| D-R5-37 | Spec revision review (customer groups §8.4) | **A threshold without a currency is read in the organization's base currency.** When no group in the chain sets `terms_currency_code`, `resolveTerms` falls back to the base currency of the buyer's organization (`currencies.Currency.is_base`) and records `sources.termsCurrencyCode = 'base_currency'`. Thresholds stored in Phase 2 without a currency therefore keep working for a single-currency tenant after the upgrade instead of sending every cart to approval. `null` remains only when the organization has no base currency, and then D-R5-4's fail-closed rule applies. | customer-groups §5.3, §6 `ResolvedTerms`, §8.4, §13; cart §9a, `TC-CART-APR-05` | Owner, after reviewing the revised specs; chose the proposed alternative over fail-closed |
+| — | Spec revision review (SPEC-029 §6.3) | **Confirmed, no new id:** `resolveForBuyer` refuses a store outside the tenant **and** the organization (stricter than the D-R5-22 wording, matching SPEC-029's portal-token rule D4). | SPEC-029 §6.3 as revised | Owner, after reviewing the revised specs |
 
 Wording fix (no new decision): D-R5-5's "prepayment or a quote" reads as "prepayment or, where `allow_quote_requests` allows it, `request_quote`" (D-R5-20).
 
