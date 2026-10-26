@@ -327,3 +327,49 @@
   deferred — checkout never takes that path (D-R5-8); the service/command split (plain
   DI-resolved lib functions + thin `isUndoable: false` command wrappers) mirrors Step 1.3/1.6's
   own precedent rather than the spec's abbreviated single-argument pseudocode.
+
+## 2026-10-26T21:00:00Z — Step 2.3 landed (closes Phase 2's availability track)
+
+- `availability.reservation.expired` declared in `events.ts` (`availability/events.ts`) — the
+  last of the four lifecycle ids Step 2.2 left undeclared for this Step; `.created`/`.released`/
+  `.committed`/`shortfall.detected` were already emitted by Step 2.2's `reserve`/`release`/
+  `commit` and are untouched here.
+- `lib/reservationSweep.ts`: `expireAvailabilityReservations` (A11) — one-minute, tenant-scoped
+  tick; pages `active` holds past `expires_at` (the §5.3 partial index), CAS to `expired` +
+  `wmsReservationService.releaseInTransaction` in one transaction per hold, `emitSideEffects`
+  then `.expired` after commit; a lost CAS (another transition already won) is skipped, never
+  double-processed.
+- `reconcileAvailabilityReservations` (A12) — hourly, tenant-scoped; repairs all three redefined
+  drift cases per their own transaction + CAS: (a) active hold whose wms rows are released or
+  missing → release the rest, CAS the hold to `released` (`reason: 'reconciled'`), emit
+  `.released`; (b) an active `'checkout'` wms row no hold's `wmsReservationIds` references,
+  older than the 3600 s max TTL → release it directly; (c) a committed hold whose wms rows are
+  still `'checkout'` → `convertInTransaction` to `'order'`. Every repair is logged AND
+  `reportError`-ed (never silent), same convention Step 1.8's exposure-audit job established.
+- `wmsReservationService` gains two additive read methods (`findReservationsByIds`,
+  `listActiveReservationsBySourceType`) — the reconciliation job's only way to see a hold's own
+  wms rows, or every active cross-organization `'checkout'` row for a tenant, without a static
+  `wms` entity import. See PLAN.md "Decisions taken without the owner" for the cross-org scope
+  reasoning.
+- Scheduling: `lib/scheduling.ts#registerAvailabilityReservationSweeperSchedules` (60 s / 3600 s
+  interval schedules, tenant-scoped, mirrors `cart`'s own sweeper registration exactly), wired
+  into `setup.ts#seedDefaults` (new tenants) and a new `availability.register-reservation-
+  sweep-schedules` upgrade action (existing tenants, `configs/lib/upgrade-actions.ts`, version
+  `0.10.0`) plus its 5-locale i18n keys — see PLAN.md for why the upgrade action was added
+  despite not being named explicitly in this Step's own brief.
+- Tests: new `availability/lib/__tests__/reservationSweep.test.ts` (7 cases) — the expiry job's
+  false-positive guard (only a past-due `active` hold transitions and releases its wms row;
+  active-not-due/committed/released/already-expired holds are untouched) plus a genuine lost-CAS
+  race simulation; each of the three reconciliation drift cases with a concrete fixture, plus a
+  clean-state no-op case; and an explicit A13 discipline test asserting every event these jobs
+  emit is `availability.reservation.expired`/`.released`, carries `tenantId`/`organizationId`
+  (X11), and is never `availability.shortfall.detected` (reserve/commit's own signal, a
+  different trigger) nor anything resembling `wms.inventory.reservation_shortfall` (a different
+  module's order-automation signal).
+- Checks: `yarn workspace @open-mercato/core typecheck` clean. Full `src/modules/wms` +
+  `src/modules/configs` (78 suites, 524 tests) and the targeted `src/modules/availability`
+  suites pass — zero regressions from Step 2.2's work. `yarn i18n:check-hardcoded` shows no new
+  findings under `core/availability` (the two pre-existing hits are Step 2.1/2.2's `commands/
+  policies.ts`, untouched here).
+- Phase 2's `availability` track is now feature-complete per PLAN.md's Phase 2 heading, pending
+  the run's final gate (Step 6.4).

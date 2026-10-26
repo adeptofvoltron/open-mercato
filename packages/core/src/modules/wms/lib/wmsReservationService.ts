@@ -927,6 +927,66 @@ export class WmsReservationService {
   }
 
   /**
+   * Step 2.3 (A12, reconciliation drift a/c). Scoped-by-id lookup of `wms_inventory_reservations`
+   * rows — a read, never a mutation, so it carries no side effects. `availability`'s
+   * reconciliation job uses this to check whether a hold's own `wmsReservationIds` still
+   * resolve to `active` rows (drift a) or have moved off `'checkout'` (drift c), without a
+   * static `wms` entity import (duck-typed via `WmsReservationServiceLike`, cross-module rule).
+   */
+  async findReservationsByIds(
+    trx: EntityManager,
+    ctx: CommandRuntimeContext,
+    input: { tenantId: string; organizationId: string; ids: string[] },
+  ): Promise<InventoryReservation[]> {
+    if (input.ids.length === 0) return []
+    const scope: Scope = { tenantId: input.tenantId, organizationId: input.organizationId }
+    const rows = await findWithDecryption(
+      trx,
+      InventoryReservation,
+      { id: { $in: input.ids }, organizationId: input.organizationId, deletedAt: null },
+      undefined,
+      scope,
+    )
+    for (const row of rows) {
+      ensureTenantScope(ctx, row.tenantId)
+      ensureOrganizationScope(ctx, row.organizationId)
+    }
+    return rows
+  }
+
+  /**
+   * Step 2.3 (A12, reconciliation drift b). The ONE tenant-wide (cross-organization) read on
+   * this service — `availability`'s hourly reconciliation tick is itself tenant-scoped only
+   * (§10, D-R5-32: payload carries `{ tenantId }`, no `organizationId`), the same scope shape
+   * `cart`'s own sweeper schedules use. Tenant isolation is the `WHERE tenant_id = …` filter
+   * itself (filter-based, not an `ensureOrganizationScope` assertion — there is no single
+   * organization to assert against here), matching `cart/lib/sweepers.ts`'s own boundary.
+   * Takes no `ctx`: nothing here is scoped to one organization for an `ensure*` check to make
+   * sense against, and the caller builds a fresh per-row `ctx` once it knows which hold (and
+   * therefore which organization) a returned row belongs to.
+   */
+  async listActiveReservationsBySourceType(
+    trx: EntityManager,
+    input: { tenantId: string; sourceType: string; createdBefore: Date; cursor?: string | null; limit: number },
+  ): Promise<InventoryReservation[]> {
+    const where: Record<string, unknown> = {
+      tenantId: input.tenantId,
+      sourceType: input.sourceType,
+      status: 'active',
+      createdAt: { $lt: input.createdBefore },
+      deletedAt: null,
+    }
+    if (input.cursor) where.id = { $gt: input.cursor }
+    return findWithDecryption(
+      trx,
+      InventoryReservation,
+      where,
+      { orderBy: { id: 'asc' }, limit: input.limit },
+      { tenantId: input.tenantId },
+    )
+  }
+
+  /**
    * A19: runs the side effects a write collected, AFTER the caller's transaction has
    * committed — the same `emitCrudSideEffects` cache/query-index invalidation
    * `commands/inventory-actions.ts`'s thin command wrappers already run for

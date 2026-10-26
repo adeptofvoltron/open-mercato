@@ -32,7 +32,7 @@
 | 1 | 1.12 | customer_groups: admin credit-account `/adjust` command route (G13/G20/D-R5-2 gap-fill) | dispatch:standard | done | pending |
 | 2 | 2.1 | availability: `AvailabilityReservation` entity + migration (A3) | dispatch:standard | done | pending |
 | 2 | 2.2 | availability: reserve/release/commit via `wmsReservationService`, CAS, per-line outcomes, allocation (A6/A7/A14/A15) | dispatch:standard | done | pending |
-| 2 | 2.3 | availability: expiry job + reconciliation job + events (A11/A12/A13) | dispatch:standard | todo | — |
+| 2 | 2.3 | availability: expiry job + reconciliation job + events (A11/A12/A13) | dispatch:standard | done | pending |
 | 2 | 2.4 | customer_groups: `CustomerPurchaseApproval` entity + migration (actor-typed columns, policy snapshot) | dispatch:standard | todo | — |
 | 2 | 2.5 | customer_groups: approval service, CAS decide/withdraw (G6) + `expire-approvals` job (D-R5-27) | dispatch:standard | todo | — |
 | 2 | 2.6 | customer_groups: approval portal + staff routes + ACL + grants (G5/G7/D-R5-7/D-R5-34) | dispatch:standard | todo | — |
@@ -274,6 +274,43 @@ commit `c92470d8d5`).
     DI container, consistent with every sibling Release 5 service. The thin command wrappers
     exist so a future caller (checkout, Phase 4) can reach them through the command bus with
     `isUndoable: false` recorded, matching A14/D-R5-10 exactly.
+
+- Step 2.3 (A11/A12, §10): `wmsReservationService` gains two additive, read-only methods
+  (`findReservationsByIds`, `listActiveReservationsBySourceType`) — the reconciliation job
+  needs to read a hold's own `wms_inventory_reservations` rows (drift a/c) and, for drift (b),
+  list every active `'checkout'` row across an entire tenant's organizations, and no existing
+  method on the service (extracted in Step 1.3, extended in Step 2.2) exposes either read.
+  Both are duck-typed onto the SAME `WmsReservationServiceLike` surface
+  `lib/reservationCommands.ts` already defines, never a static `wms` entity import. Per A1-BC
+  ("name it and freeze it in §15" once Phase 3 ships), this is additive and in scope for the
+  same service this release is actively building out. Alternative considered: have
+  `availability` query `wms_inventory_reservations` directly via a raw SQL join — rejected as
+  the exact cross-module ORM-relationship violation `packages/core/AGENTS.md` forbids.
+- Step 2.3 (§10): the reconciliation job's drift-(b) listing (`listActiveReservationsBySourceType`)
+  is the one tenant-WIDE (no single organization) read on `wmsReservationService` — §10's own
+  text states both jobs are "one scheduled tick per tenant whose payload carries the scope
+  (`{ tenantId }`)", the same scope shape `cart`'s own sweeper schedules use, and tenant
+  isolation is enforced by the `WHERE tenant_id = …` filter itself rather than an
+  `ensureOrganizationScope` assertion (there is no single organization to assert against for a
+  cross-organization scan). `findReservationsByIds` (drift a/c), by contrast, is scoped to one
+  hold's own organization and keeps the `ensureTenantScope`/`ensureOrganizationScope` assertions
+  every other method on the service already uses.
+- Step 2.3 (§10, "schedules registered in setup.ts"): added the
+  `availability.register-reservation-sweep-schedules` upgrade action
+  (`configs/lib/upgrade-actions.ts`, version `0.10.0`) plus its `configs` i18n keys (all 5
+  locales) alongside `setup.ts`'s `seedDefaults` call — mirroring `cart.register-sweeper-
+  schedules`/`promotions.register-code-reservation-sweep-schedule` exactly, so an existing
+  (pre-Release-5) tenant also gets the new one-minute/hourly schedules registered, not only a
+  freshly onboarded one. Not spelled out as a deliverable in this Step's own brief, but the
+  spec's own §10 text names `setup.ts` registration explicitly, and every sibling sweeper this
+  release added (Step 1.8's credit-exposure-audit via org-scoped payload, Step 1.9's promotions
+  sweep) came with the matching upgrade action — omitting it here would leave every tenant that
+  existed before this Step with no path to the A11 release valve (A5's "the hold must outlive
+  payment" guarantee depends on the sweep eventually freeing an abandoned checkout hold) short
+  of a manual DB write. Alternative considered: ship only `seedDefaults` and skip the upgrade
+  action — rejected as leaving existing tenants permanently without the only process that frees
+  an abandoned checkout hold (§10's own words: "Nothing in `wms` processes `expires_at` today;
+  this job is the only release path").
 
 ## External References
 

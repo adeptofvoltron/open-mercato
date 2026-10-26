@@ -95,9 +95,21 @@ export type CommitAvailabilityResult = {
 // file actually calls.
 // ---------------------------------------------------------------------------
 
-type WmsSideEffectsLike = {
+export type WmsSideEffectsLike = {
   reservations?: Array<{ entity: unknown; action: 'created' | 'updated' }>
   balances?: Array<{ entity: unknown; action: 'updated' }>
+}
+
+// Step 2.3's own `availability_reservations`-vs-`wms_inventory_reservations` row shape — just
+// enough fields for the expiry/reconciliation jobs (`lib/reservationSweep.ts`) to read a wms
+// row's own status/sourceType without a static `wms` entity import (duck typing, same
+// cross-module rule `WmsReservationServiceLike` below already follows).
+export type WmsReservationRowLike = {
+  id: string
+  tenantId: string
+  organizationId: string
+  sourceType: string
+  status: string
 }
 
 type GateLineInput = {
@@ -115,7 +127,7 @@ type ReserveLinesForCheckoutResultLike =
   | { ok: true; lines: GateLineResult[]; sideEffects: WmsSideEffectsLike }
   | { ok: false; lines: GateShortfallLine[] }
 
-type WmsReservationServiceLike = {
+export type WmsReservationServiceLike = {
   reserveLinesForCheckout(
     trx: EntityManager,
     ctx: CommandRuntimeContext,
@@ -139,9 +151,26 @@ type WmsReservationServiceLike = {
     input: { tenantId: string; organizationId: string; reservationId: string; sourceType: 'order'; sourceId: string },
   ): Promise<{ reservationId: string; reservationEntity: unknown }>
   emitSideEffects(ctx: CommandRuntimeContext, sideEffects: WmsSideEffectsLike): Promise<void>
+  // Step 2.3 (A12). Scoped-by-id read, used by the reconciliation job to check whether a
+  // hold's own `wmsReservationIds` rows are still `active`/`checkout` (drift a/c) — never a
+  // mutation, so no side effects to replicate.
+  findReservationsByIds(
+    trx: EntityManager,
+    ctx: CommandRuntimeContext,
+    input: { tenantId: string; organizationId: string; ids: string[] },
+  ): Promise<WmsReservationRowLike[]>
+  // Step 2.3 (A12, drift b). Cross-organization, tenant-scoped listing of active `wms` rows
+  // of one `sourceType` — the ONLY tenant-wide (no single-organization) read on this
+  // duck-typed surface, matching the hourly job's own `{ tenantId }`-only scope (§10,
+  // D-R5-32). Tenant isolation is enforced by the `WHERE tenant_id = …` filter itself, the
+  // same filter-based (not assertion-based) boundary `cart`'s own tenant-scoped sweepers use.
+  listActiveReservationsBySourceType(
+    trx: EntityManager,
+    input: { tenantId: string; sourceType: string; createdBefore: Date; cursor?: string | null; limit: number },
+  ): Promise<WmsReservationRowLike[]>
 }
 
-function tryResolveWmsService(container: Resolver): WmsReservationServiceLike | undefined {
+export function tryResolveWmsService(container: Resolver): WmsReservationServiceLike | undefined {
   return tryResolve<WmsReservationServiceLike>(container, 'wmsReservationService')
 }
 
@@ -149,7 +178,7 @@ function tryResolvePolicyService(container: Resolver): PolicyResolutionService |
   return tryResolve<PolicyResolutionService>(container, 'policyResolutionService')
 }
 
-function buildServiceCtx(container: Resolver, scope: ReservationScope, reason: string): CommandRuntimeContext {
+export function buildServiceCtx(container: Resolver, scope: ReservationScope, reason: string): CommandRuntimeContext {
   const { ctx } = buildTrustedCommandContext({
     tenantId: scope.tenantId,
     organizationId: scope.organizationId,
@@ -159,7 +188,7 @@ function buildServiceCtx(container: Resolver, scope: ReservationScope, reason: s
   return { ...ctx, container: container as unknown as CommandRuntimeContext['container'] }
 }
 
-function mergeSideEffects(a: WmsSideEffectsLike, b: WmsSideEffectsLike): WmsSideEffectsLike {
+export function mergeSideEffects(a: WmsSideEffectsLike, b: WmsSideEffectsLike): WmsSideEffectsLike {
   return {
     reservations: [...(a.reservations ?? []), ...(b.reservations ?? [])],
     balances: [...(a.balances ?? []), ...(b.balances ?? [])],
