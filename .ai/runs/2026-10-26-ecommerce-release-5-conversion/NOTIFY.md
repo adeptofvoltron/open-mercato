@@ -219,3 +219,12 @@
   the command-minted idempotency key, reusing one method for both the forward write and its undo,
   the `.adjusted` event's emission-once-per-write gate, and adding the `x-om-operation` header so
   undo is actually reachable.
+
+## 2026-10-26T18:00:00Z — checkpoint 3 (Steps 1.11–1.12, closes Phase 1)
+- Range: `9c35d9af44`..`122ee35173`. Summary: credit account creation + ledger-listing routes
+  (rescued once after an unrelated provider rate limit, no code lost); manual /adjust settlement
+  route as a real command with inverse-entry undo (G20).
+- Checks: forced full typecheck (40/40, 0 cached) pass; full Phase-1 retrospective module sweep
+  (customer_groups+promotions+cart+wms+ecommerce) 214/215 suites, 2254/2256 tests, 1 expected skip.
+- Phase 1 is complete. All 12 Steps landed; one rescue needed (infrastructure, not quality); two
+  gap-fills appended and closed within the same phase. No fix-forward Steps needed.
