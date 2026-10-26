@@ -175,12 +175,14 @@ describe('DefaultCustomerGroupsService.resolveTerms', () => {
       allowPurchaseOnAccount: false,
       approvalRequiredAbove: null,
       minOrderValue: null,
+      approvalPolicy: 'buyer',
       sources: {
         priceKindId: null,
         paymentTermsDays: null,
         allowPurchaseOnAccount: null,
         approvalRequiredAbove: null,
         minOrderValue: null,
+        approvalPolicy: null,
       },
     })
     expect(em.findOne).toHaveBeenCalledTimes(1)
@@ -286,14 +288,35 @@ describe('DefaultCustomerGroupsService.resolveTerms', () => {
       allowPurchaseOnAccount: false,
       approvalRequiredAbove: null,
       minOrderValue: null,
+      approvalPolicy: 'buyer',
       sources: {
         priceKindId: null,
         paymentTermsDays: null,
         allowPurchaseOnAccount: null,
         approvalRequiredAbove: null,
         minOrderValue: null,
+        approvalPolicy: null,
       },
     })
+  })
+
+  it('inherits approvalPolicy from the parent when the child row leaves it unset, defaulting to "buyer" with no matching group at all (D-R5-1)', async () => {
+    const memberships = [makeMembership({ id: 'm-child', groupId: CHILD_ID })]
+    const groups = [
+      makeGroup({ id: CHILD_ID, code: 'child', name: 'Child', priority: 20, parentId: PARENT_ID }),
+      makeGroup({ id: PARENT_ID, code: 'parent', name: 'Parent', priority: 10, parentId: null }),
+    ]
+    const terms = [
+      makeTerms({ groupId: CHILD_ID, approvalPolicy: null }),
+      makeTerms({ groupId: PARENT_ID, approvalPolicy: 'both' }),
+    ]
+    const em = createEm({ memberships, groups, terms })
+    const service = new DefaultCustomerGroupsService(em as never)
+
+    const result = await service.resolveTerms({ customerId: CUSTOMER_ID, tenantId: TENANT_ID })
+
+    expect(result.approvalPolicy).toBe('both')
+    expect(result.sources.approvalPolicy).toBe(PARENT_ID)
   })
 
   it('resolves different fields on the same object from different groups in the hierarchy independently', async () => {

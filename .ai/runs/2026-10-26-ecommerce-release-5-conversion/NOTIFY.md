@@ -414,3 +414,69 @@
 - Checks: `yarn typecheck` (`packages/core`) clean. `yarn jest` in `packages/core` for the full
   `customer_groups` suite: 36/37 suites pass (394/396 tests), 1 suite with 2 DB-dependent tests
   skipped (no live Postgres in this environment, pre-existing, unrelated to this Step).
+
+## 2026-10-26T22:00:00Z — Step 2.5 landed (customer_groups: approval service + expire-approvals job)
+
+- Blocking gap found and fixed first: `customerGroupsService#resolveTerms` never resolved
+  `approvalPolicy` (Step 1.5 added the DB column only, not the resolution-loop plumbing) —
+  `requestApproval` cannot snapshot a policy that never resolves. Added `approvalPolicy` to
+  `TERMS_FIELD_NAMES`/`ResolvedTerms`/`tenantDefaultTerms`/`termsFieldIsSet`/`applyTermsField`
+  (tenant default `'buyer'`, D-R5-1), deliberately NOT the other three new §6.0 fields
+  (`termsCurrencyCode`/`allowQuoteRequests`/`requiresPoNumber` — no caller in this Step). Updated
+  `resolveTerms.test.ts`'s two exact-object snapshots and added one inheritance test. Full
+  reasoning and the explain-terms route's own non-exhaustive `satisfies` check: PLAN.md
+  "Decisions taken without the owner".
+- `services/customerPurchaseApprovalService.ts` (new): `requestApproval`/`getApproval`/
+  `getActiveApprovalForSubject`/`withdrawApproval`/`decideApproval` per spec §6's authoritative
+  contract (G3's floor). Every transition (`decideApproval`'s slot CAS + the dependent overall-
+  status CAS, `withdrawApproval`'s CAS) is a plain `em.nativeUpdate` inside `em.transactional`,
+  never `enforceCommandOptimisticLock` — G6's exact SQL pattern, with the overall-status flip
+  computed from a same-transaction re-read (`computeOverallStatus`, generic over all three
+  policies via a `not_required`-is-always-satisfied rule) so a `both`-policy race between the two
+  sides lands correctly regardless of commit order. `requestApproval` is idempotent per
+  `(subjectType, subjectId)` while pending (pre-check + `isUniqueViolation` race fallback, same
+  pattern Step 1.6's `reserveCredit` established for G12). `decideApproval` enforces G24
+  (self-decision refused; a `customer_user` actor's REAL company re-derived from
+  `customer_accounts.CustomerUser` by actor id via a new `lib/creditIdentity.ts#
+  resolveCustomerUserCompanyId` helper — never trusted from the caller-supplied
+  `ApprovalActor.customerEntityId` field alone, per the task brief's explicit defense-in-depth
+  instruction) — both violations answer the SAME `approval_not_found` shape spec §9.2 requires
+  (no disclosure). `buyer_decision_note`/`merchant_decision_note` are registered in
+  `encryption.ts` (G22) and read back through `findOneWithDecryption`/`findWithDecryption` since
+  (unlike credit) the spec requires notes to round-trip to callers.
+- `lib/expireApprovals.ts` + `workers/expire-approvals.worker.ts` (new): hourly, tenant-scoped,
+  the SAME CAS pattern (`status = 'pending' AND expires_at <= now()` → `expired`), a lost race to
+  a concurrent decide/withdraw is skipped silently (never reported as an error, §11 "safe to
+  re-run"). Reads the already-stored `expires_at` only — never re-resolves the tenant's expiry
+  window. Registered an hourly tenant-scoped schedule in `setup.ts#seedDefaults` (no upgrade
+  action added for existing tenants — see PLAN.md).
+- `events.ts`: declared and emit all five `customer_groups.approval.*` ids now
+  (`requested`/`approved`/`rejected`/`expired`/`withdrawn`), each `portalBroadcast: true`
+  (D-R5-6) — unlike the sibling `credit.*` events, which Steps 1.8/1.12 left undeclared absent a
+  consumer. Reasoning for the asymmetry: PLAN.md.
+- `di.ts`: new `customerPurchaseApprovalService` key (G26), soft-resolving an optional
+  `moduleConfigService` (same `softCradle` pattern `catalog/di.ts` uses for
+  `catalogOmnibusService`) for D-R5-27's per-tenant expiry-days override, default 14.
+- Tests: `services/__tests__/customerPurchaseApprovalService.test.ts` (29 cases, fake EM) —
+  every policy transition (`both`/`buyer`/`merchant`), G24's two guards (self-decision,
+  cross-company incl. a forged-`customerEntityId` case), G8 idempotency incl. a simulated
+  unique-violation race, withdraw's requester/system/non-pending rules, tenant/org isolation, the
+  error body's `details` shape. `services/__tests__/customerPurchaseApprovalService.concurrency.
+  pg.test.ts` (new, gated on `OM_CUSTOMER_GROUPS_PG_URL`, 6 cases) — ran for real against a
+  disposable local Postgres (`om_cgrp_approval_test`, dropped after): N=20 concurrent decides on
+  a single-slot policy AND N=20 on one slot of a `both`-policy approval (the harder case, since a
+  lone slot decision leaves the overall `status` at `pending`, so only the slot-specific CAS
+  condition — not the overall-status one — can be what excludes a second decider) both land
+  exactly one winner; simultaneous buyer+merchant approvals and a simultaneous approve/reject
+  pair, both from real, independent connections; decide-vs-expire at the boundary; N=20 concurrent
+  `requestApproval` for the same subject create exactly one row. Mutation-tested the `both`-policy
+  same-slot race specifically (not the single-slot one, which the overall-status guard alone
+  already protects): temporarily removed just the `[fields.decision]: 'pending'` WHERE condition,
+  re-ran — all 20 concurrent calls "won" and overwrote each other's slot, confirming the test is
+  not vacuous; restored immediately and re-verified the full pg suite green before committing.
+  `lib/__tests__/expireApprovals.test.ts` (new, fake EM, 4 cases) — the false-positive guard, a
+  lost-CAS-race skip with no error report, tenant isolation, a clean no-op tick.
+- Checks: `yarn workspace @open-mercato/core typecheck` clean. Full `src/modules/customer_groups`
+  jest suite: 38/40 suites pass (428 tests; 2 suites skipped — 1 pg-gated suite intentionally run
+  separately above then re-skipped by default, 1 pre-existing unrelated DB-dependent skip from
+  Step 2.4), zero regressions. No UI touched — no browser verification needed.

@@ -34,7 +34,7 @@
 | 2 | 2.2 | availability: reserve/release/commit via `wmsReservationService`, CAS, per-line outcomes, allocation (A6/A7/A14/A15) | dispatch:standard | done | pending |
 | 2 | 2.3 | availability: expiry job + reconciliation job + events (A11/A12/A13) | dispatch:standard | done | pending |
 | 2 | 2.4 | customer_groups: `CustomerPurchaseApproval` entity + migration (actor-typed columns, policy snapshot) | dispatch:standard | done | pending |
-| 2 | 2.5 | customer_groups: approval service, CAS decide/withdraw (G6) + `expire-approvals` job (D-R5-27) | dispatch:standard | todo | — |
+| 2 | 2.5 | customer_groups: approval service, CAS decide/withdraw (G6) + `expire-approvals` job (D-R5-27) | dispatch:standard | done | pending |
 | 2 | 2.6 | customer_groups: approval portal + staff routes + ACL + grants (G5/G7/D-R5-7/D-R5-34) | dispatch:standard | todo | — |
 | 2 | 2.7 | customer_groups: approval notifications (D-R5-6/D-R5-32/G15) | dispatch:standard | todo | — |
 | 2 | 2.8 | cart: lock contract — `lockTtlMs`, idempotent extend by `checkoutSessionId`, `unlock`/`markConverted` match (C1) | dispatch:standard | todo | — |
@@ -311,6 +311,75 @@ commit `c92470d8d5`).
   action — rejected as leaving existing tenants permanently without the only process that frees
   an abandoned checkout hold (§10's own words: "Nothing in `wms` processes `expires_at` today;
   this job is the only release path").
+
+- Step 2.5 (G3/G6/G8/G24, D-R5-27): found that `resolveTerms` (`customerGroupsService.ts`,
+  shipped Phases 1-2, revised by Step 1.5's additive columns) was never extended to resolve
+  `CustomerGroupTerms.approvalPolicy` — Step 1.5 added the DB column and the validator, and
+  spec §6.0 explicitly names `approvalPolicy` (plus `termsCurrencyCode`/`allowQuoteRequests`/
+  `requiresPoNumber`) as fields `TERMS_FIELD_NAMES` must grow to cover, but the actual
+  resolution-loop plumbing (the `const` array, `ResolvedTerms`'s type, `tenantDefaultTerms`,
+  `termsFieldIsSet`, `applyTermsField`) was left untouched. `requestApproval` cannot snapshot a
+  policy that never resolves, so this blocked the Step outright. Fixed the minimal necessary
+  slice — added ONLY `approvalPolicy` (tenant default `'buyer'`, D-R5-1) to all five of those
+  spots in `customerGroupsService.ts`, plus the two existing `resolveTerms.test.ts` `toEqual`
+  snapshots and one new inheritance test. Did NOT add `termsCurrencyCode`/`allowQuoteRequests`/
+  `requiresPoNumber` — nothing in this Step needs them, and the generic per-field loop means
+  adding one field is safe in isolation; the next Step that reads one of the other three (cart's
+  approval gate, §3.1, needs `termsCurrencyCode`; checkout B.5, §5.1, needs the other two) must
+  add it the SAME way, not invent a parallel mechanism. Alternative considered: add all four now
+  since they're the same mechanical change — rejected as scope creep past this Step's own
+  approval-service brief, and as speculative work for callers (cart/checkout) that don't exist
+  yet in this release's wave order. Also deliberately did NOT add `approvalPolicy` to the
+  `explain-terms` route's `TERMS_FIELDS`/response schema (`api/customer-groups/explain-terms/
+  route.ts`) — that file's `satisfies readonly (keyof ResolvedTermsSources)[]` only checks a
+  SUBSET relationship, not exhaustiveness, so the new field compiles fine either way, and surfacing
+  it in the admin explain-terms UI is a presentation concern for whichever Step builds the
+  Approvals admin UI (§7.3), not this one.
+- Step 2.5 (§10/§10.1, D-R5-6/D-R5-32): declared and emit all five `customer_groups.approval.*`
+  events now (`requested`/`approved`/`rejected`/`expired`/`withdrawn`), unlike the sibling
+  `credit.*` events (Steps 1.8/1.12), which stayed undeclared until a concrete consumer existed.
+  Chose to declare the full family here because: (a) the service CANNOT function per its own
+  G9/G24 contract without emitting at least `.requested`/`.approved`/`.rejected`/`.withdrawn` —
+  the whole point of a CAS-guarded lifecycle is that OTHER systems (cart's `awaiting_approval_
+  since` subscriber, Step 3.2; `customer_groups`'s own future notification wiring, Step 2.7) react
+  to these transitions, so "no consumer yet" does not apply the way it did for credit's
+  `reserved`/`released`/`settled` (which genuinely have no reader anywhere in this release); (b)
+  the spec's own §10.1 payload table is already fully specified for this exact event family,
+  unlike credit's `reserved`/`released`/`settled`, which the spec never gave a payload shape to.
+  Reviewed Step 1.8's own reasoning for the sibling `credit.*` events and confirmed this is not
+  the same situation. `portalBroadcast: true` on every one of the five per D-R5-6's explicit text
+  ("available to a portal client of the approval's company"). No in-app/e-mail notification
+  wiring was added — that stays Step 2.7's scope exactly as the Step brief states; this Step only
+  declares and emits the signals.
+- Step 2.5 (§11, the job's own schedule): the Step brief named the service and the job but not
+  its scheduling — added an hourly, tenant-scoped `schedulerService.register` call to `setup.ts`'s
+  `seedDefaults`, mirroring Step 1.8's `credit-exposure-audit` schedule and Step 2.3's
+  `availability` sweeper schedules exactly (same `stableScheduleUuid` helper, same `isEnabled:
+  true` so existing tenants pick it up on their next `seedDefaults` pass). Without this, the job
+  exists as code but nothing would ever enqueue it. Did NOT add a companion `configs/lib/
+  upgrade-actions.ts` entry for ALREADY-provisioned tenants (unlike Step 2.3's availability
+  sweepers) — `setup.ts`'s own `seedDefaults` is already re-run idempotently for every tenant on
+  `yarn initialize`/tenant re-seed per this module's existing `credit-exposure-audit` precedent
+  (Step 1.8 shipped with no upgrade action either), and no Step in this run's Phase 1/2 scope
+  currently depends on an EXISTING pre-Release-5 tenant having this schedule before Phase 6's
+  gate; revisit if Step 6.1's integration-coverage pass finds a gap.
+- Step 2.5 (G24): the cross-company guard re-derives the buyer-side decider's company from
+  `customer_accounts.CustomerUser.customer_entity_id` by actor id (`lib/creditIdentity.ts`'s new
+  `resolveCustomerUserCompanyId`, FK-id + raw-SQL coupling, no ORM import), rather than trusting
+  the caller-supplied `ApprovalActor.customerEntityId` field the spec's own type carries. The
+  spec's service-contract prose explicitly calls for this ("the service enforces everything that
+  depends on the record... a customer_user actor's customerEntityId must equal the approval's
+  customer_id") but its TYPE signature takes `customerEntityId` as a plain field on the actor,
+  which a route could populate from a forged or stale value without the service ever re-checking
+  it against the actual `CustomerUser` row. Treated the task brief's own explicit instruction
+  ("the service itself must still defensively re-check company membership given the actor id, not
+  just trust the caller blindly") as settling this in favor of the defensive re-check, with the
+  type's own `customerEntityId` field now effectively advisory/unused by the service (still
+  required at the type level since Step 2.6's portal route construction will want it for its own
+  checks). Alternative considered: trust `actor.customerEntityId` directly, matching the type
+  literally — rejected per the brief's explicit "defense in depth" instruction and because it
+  would make the cross-company guard only as strong as whatever the Step 2.6 route happens to
+  verify, with no second layer.
 
 ## External References
 

@@ -34,6 +34,16 @@ function stableCreditExposureAuditScheduleId(organizationId: string): string {
   return stableScheduleUuid(`customer_groups:credit-exposure-audit:${organizationId}`)
 }
 
+// Release 5 Phase 4 (D-R5-27, §11): "expire-approvals | hourly". Tenant-scoped like
+// `availability`'s own sweeper schedules (`availability/lib/scheduling.ts`'s
+// `registerAvailabilityReservationSweeperSchedules`) — the job filters every row by its
+// own `tenant_id`, so one schedule per tenant covers every organization under it; the
+// stable id is keyed on `tenantId`, not `organizationId`, unlike the sibling
+// credit-exposure-audit schedule above.
+function stableExpireApprovalsScheduleId(tenantId: string): string {
+  return stableScheduleUuid(`customer_groups:expire-approvals:${tenantId}`)
+}
+
 export const setup: ModuleSetupConfig = {
   defaultRoleFeatures: {
     superadmin: ['customer_groups.*'],
@@ -85,6 +95,29 @@ export const setup: ModuleSetupConfig = {
       })
     } catch (error) {
       logger.warn('[customer_groups] Failed to register credit exposure audit schedule', {
+        error: error instanceof Error ? error.message : error,
+      })
+    }
+
+    try {
+      await schedulerService.register({
+        id: stableExpireApprovalsScheduleId(tenantId),
+        name: 'Customer purchase approval expiry sweep',
+        description: 'Hourly, per-tenant: CAS every pending purchase approval past its expires_at to expired (D-R5-27).',
+        scopeType: 'tenant',
+        tenantId,
+        scheduleType: 'interval',
+        scheduleValue: '3600s',
+        timezone: 'UTC',
+        targetType: 'queue',
+        targetQueue: 'customer_groups.expire_approvals',
+        targetPayload: { scope: { tenantId } },
+        sourceType: 'module',
+        sourceModule: 'customer_groups',
+        isEnabled: true,
+      })
+    } catch (error) {
+      logger.warn('[customer_groups] Failed to register expire-approvals schedule', {
         error: error instanceof Error ? error.message : error,
       })
     }

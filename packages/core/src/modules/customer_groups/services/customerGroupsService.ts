@@ -1,8 +1,19 @@
 import type { EntityManager } from '@mikro-orm/postgresql'
 import { unionScopes } from '@open-mercato/shared/lib/catalog-visibility'
 import type { AssortmentScope, EffectiveAssortmentScope } from '@open-mercato/shared/lib/catalog-visibility'
-import { CustomerGroup, CustomerGroupMembership, CustomerGroupTerms } from '../data/entities'
+import { CustomerGroup, CustomerGroupMembership, CustomerGroupTerms, type CustomerGroupApprovalPolicy } from '../data/entities'
 import { CUSTOMER_GROUP_MAX_ANCESTOR_DEPTH } from '../data/validators'
+
+// Release 5 Phase 4 (D-R5-1, §6.0): "approvalPolicy" is added to TERMS_FIELD_NAMES so it
+// resolves through the exact same per-field, highest-priority-group-with-a-non-null-value
+// algorithm every other scalar term already uses (§6.1) — `customerPurchaseApprovalService
+// #requestApproval` snapshots this value at creation. §6.0 also names `termsCurrencyCode`,
+// `allowQuoteRequests` and `requiresPoNumber` for the same TERMS_FIELD_NAMES treatment;
+// those three have no caller in this Step and are deliberately left unresolved here — see
+// PLAN.md "Decisions taken without the owner" — the next Step that reads one of them
+// (cart's approval gate for `termsCurrencyCode`, checkout B.5 for the other two) must add
+// it the same way this one adds `approvalPolicy`, not invent a parallel mechanism.
+const DEFAULT_APPROVAL_POLICY: CustomerGroupApprovalPolicy = 'buyer'
 
 export type GroupResolution = {
   groupIds: string[]
@@ -19,6 +30,7 @@ const TERMS_FIELD_NAMES = [
   'allowPurchaseOnAccount',
   'approvalRequiredAbove',
   'minOrderValue',
+  'approvalPolicy',
 ] as const
 type TermsFieldName = (typeof TERMS_FIELD_NAMES)[number]
 
@@ -39,6 +51,8 @@ export type ResolvedTerms = {
   allowPurchaseOnAccount: boolean
   approvalRequiredAbove: number | null
   minOrderValue: number | null
+  // Release 5 Phase 4 (D-R5-1): tenant default 'buyer' — see DEFAULT_APPROVAL_POLICY.
+  approvalPolicy: CustomerGroupApprovalPolicy
   sources: ResolvedTermsSources
 }
 
@@ -201,12 +215,14 @@ function tenantDefaultTerms(): ResolvedTerms {
     allowPurchaseOnAccount: false,
     approvalRequiredAbove: null,
     minOrderValue: null,
+    approvalPolicy: DEFAULT_APPROVAL_POLICY,
     sources: {
       priceKindId: null,
       paymentTermsDays: null,
       allowPurchaseOnAccount: null,
       approvalRequiredAbove: null,
       minOrderValue: null,
+      approvalPolicy: null,
     },
   }
 }
@@ -232,6 +248,8 @@ function termsFieldIsSet(terms: CustomerGroupTerms, field: TermsFieldName): bool
       return terms.approvalRequiredAbove != null
     case 'minOrderValue':
       return terms.minOrderValue != null
+    case 'approvalPolicy':
+      return terms.approvalPolicy != null
   }
 }
 
@@ -256,6 +274,9 @@ function applyTermsField(
       break
     case 'minOrderValue':
       result.minOrderValue = toNumberOrNull(terms.minOrderValue)
+      break
+    case 'approvalPolicy':
+      result.approvalPolicy = (terms.approvalPolicy ?? DEFAULT_APPROVAL_POLICY) as CustomerGroupApprovalPolicy
       break
   }
   result.sources[field] = sourceGroupId
