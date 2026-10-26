@@ -282,6 +282,10 @@ export class PromotionsServiceImpl implements PromotionsService {
       cartWeight: input.cartWeight,
       codes: input.codes,
       ...(currencyFractionDigits !== undefined ? { currencyFractionDigits } : {}),
+      // D-R5-17: pass-through only — absent on every caller that does not supply it
+      // (every cart-stage call today), so this facade never invents delivery context.
+      ...(input.deliveryMethodCode !== undefined ? { deliveryMethodCode: input.deliveryMethodCode } : {}),
+      ...(input.deliveryCost !== undefined ? { deliveryCost: input.deliveryCost } : {}),
     }
 
     return evaluatePromotions(promotions, evaluationInput)

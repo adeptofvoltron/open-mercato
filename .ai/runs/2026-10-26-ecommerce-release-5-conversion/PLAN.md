@@ -27,7 +27,7 @@
 | 1 | 1.7 | customer_groups: credit admin API + UI + ACL + encryption.ts (G13/G16/G22) | dispatch:standard | done | pending |
 | 1 | 1.8 | customer_groups: credit notifications + exposure-audit job + cancel-release subscriber (D-R5-2/G15/G21) | dispatch:standard | done | pending |
 | 1 | 1.9 | promotions: `revertCodeUse` + `sales.order.cancelled` subscriber (C5) | dispatch:standard | done | pending |
-| 1 | 1.10 | promotions: un-hide `delivery_method` rule + `DELIVERY_DISCOUNT` effect (D-R5-17) | dispatch:standard | todo | — |
+| 1 | 1.10 | promotions: un-hide `delivery_method` rule + `DELIVERY_DISCOUNT` effect (D-R5-17) | dispatch:standard | done | pending |
 | 1 | 1.11 | customer_groups: admin credit-account provisioning route + ledger-listing read route (G13/D-R5-5 gap-fill) | dispatch:standard | todo | — |
 | 1 | 1.12 | customer_groups: admin credit-account `/adjust` command route (G13/G20/D-R5-2 gap-fill) | dispatch:standard | todo | — |
 | 2 | 2.1 | availability: `AvailabilityReservation` entity + migration (A3) | dispatch:standard | todo | — |
@@ -130,6 +130,16 @@ commit `c92470d8d5`).
   too, matching the brief's own `{ cartId | orderId }` signature), so the column was needed either
   way; adding `cartId` too, rather than `orderId`-only, closes the gap completely instead of half of
   it.
+- Step 1.10 (D-R5-17): `benefitRequiresSingleEligibleCurrency` (`data/validators.ts`, D-R4-27) listed
+  `product_discount`/`cart_discount`/`buy_x_get_y` with `discountType: 'fixed'` as requiring exactly
+  one `eligibleCurrencies` entry — `delivery_discount` was absent because it was still hidden at the
+  time D-R4-27 was written. Un-hiding it now exposes the exact same shape (`appliesTo: 'order'`,
+  `discountType: 'fixed' | 'percentage'`) `cart_discount` already has, and a fixed delivery discount
+  is just as currency-denominated — added `delivery_discount` to the same fixed-amount branch rather
+  than leaving a fixed-amount delivery discount uncovered by D-R4-27's guard. Alternative considered:
+  leave it out and let a multi-currency fixed delivery discount pass validation silently — rejected
+  as reintroducing the exact bug class D-R4-27 exists to close, for no stated reason to treat this
+  benefit type differently from its closest sibling.
 
 ## External References
 
