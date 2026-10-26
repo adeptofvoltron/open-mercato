@@ -31,7 +31,7 @@
 | 1 | 1.11 | customer_groups: admin credit-account provisioning route + ledger-listing read route (G13/D-R5-5 gap-fill) | dispatch:standard | done | pending |
 | 1 | 1.12 | customer_groups: admin credit-account `/adjust` command route (G13/G20/D-R5-2 gap-fill) | dispatch:standard | done | pending |
 | 2 | 2.1 | availability: `AvailabilityReservation` entity + migration (A3) | dispatch:standard | done | pending |
-| 2 | 2.2 | availability: reserve/release/commit via `wmsReservationService`, CAS, per-line outcomes, allocation (A6/A7/A14/A15) | dispatch:standard | todo | — |
+| 2 | 2.2 | availability: reserve/release/commit via `wmsReservationService`, CAS, per-line outcomes, allocation (A6/A7/A14/A15) | dispatch:standard | done | pending |
 | 2 | 2.3 | availability: expiry job + reconciliation job + events (A11/A12/A13) | dispatch:standard | todo | — |
 | 2 | 2.4 | customer_groups: `CustomerPurchaseApproval` entity + migration (actor-typed columns, policy snapshot) | dispatch:standard | todo | — |
 | 2 | 2.5 | customer_groups: approval service, CAS decide/withdraw (G6) + `expire-approvals` job (D-R5-27) | dispatch:standard | todo | — |
@@ -204,6 +204,76 @@ commit `c92470d8d5`).
   no optimistic-lock header," which directly answers the root AGENTS.md scoping question the task
   brief raised rather than leaving it a judgment call. `updated_at` is still an `onUpdate` column so
   Step 2.2's CAS `WHERE status = 'active' AND …` transitions can observe it.
+
+- Step 2.2 (A1/A6/A7/A14/A15, §4.1/§4.1b/§4.4): several deliberate scope reductions, each
+  bounded so the core guarantee (the parallel last-unit test, this Step's own stated top
+  gate) holds exactly, with the gaps left for a documented follow-up:
+  - **Product-pool allocation (A7's pool check) is NOT implemented in the gate.** `wms`'s
+    `reserveLinesForCheckout` computes `computeSellableQuantities` with `productRollups: []`
+    — every line is checked against its OWN per-variant sellable only, never summed
+    against a product-level `safety_stock` pool row. This Step's own test-priority list
+    (8 items) does not name the product-pool scenario (that is A20/§12's extended coverage,
+    explicitly Step 6.1's scope), and implementing it correctly would require locking EVERY
+    other active variant of a pooled product too (not just the ones in the call), a
+    materially larger change. Per-variant correctness — the actual last-unit guarantee — is
+    unaffected either way. Alternative considered: implement the pool subtraction now since
+    `computeSellableQuantities` already supports `productRollups` structurally — rejected as
+    scope creep past the 8-test gate this Step is judged against, with a real risk of
+    under-testing a half-built feature under the same time pressure that already found one
+    correctness bug (below).
+  - **§4.4's "confirmed-first" collision handling is NOT implemented in
+    `convertInTransaction`.** The spec's three-point fix (automation races the live hold,
+    key collision with an automation row, partial-release bucket shrink) only matters for an
+    integrator who confirms the order BEFORE calling `commit` — checkout itself never takes
+    this path (D-R5-8: commit always precedes confirmation). `convertInTransaction` does the
+    straightforward in-place rewrite (sourceType/sourceId/key rebuild, `expires_at` cleared)
+    and nothing more. Alternative considered: build the full three-point fix now — rejected
+    as speculative work for a caller that does not exist yet in this release's scope; revisit
+    if/when an integrator-facing confirmed-first path is actually built.
+  - **A16's cosmetic pieces (i18n label on `wms` reservation listings, `UPGRADE_NOTES.md`
+    entry) are not shipped.** The functional half of A16 — widening
+    `InventoryReservationSourceType` to add `'checkout'` and rejecting it on the public
+    `wms.inventory.reserve` command/route with `400 checkout_reservation_is_system_only` —
+    IS shipped and tested. `ReserveInventoryDialog` already only offers
+    `manual`/`order`/`transfer` (no change needed). The translated-label-on-listings polish
+    and the `UPGRADE_NOTES.md` entry are named explicitly as Step 6.2's scope in PLAN.md
+    ("A16, G26") — left for that Step rather than duplicated here.
+  - **Correctness finding, fixed in the same commit, not deferred:** the first implementation
+    locked candidate balance rows with a raw `em.getConnection().execute('... FOR UPDATE')`
+    statement and read the aggregate back with another raw statement (reusing
+    `wms/lib/availabilityCalculation.ts#loadBalanceAggregates`, the A2 shared SQL builder, as
+    instructed). Against a REAL Postgres instance under real concurrency (N=20 parallel
+    `reserve` calls for a single unit of stock), this let every caller see the SAME
+    pre-consumption snapshot and oversold the last unit — verified directly: this installed
+    MikroORM version's `AbstractSqlConnection.execute` falls back to the pool's plain client
+    whenever its `ctx` (transaction-context) parameter is omitted, and `em.getConnection()`
+    never supplies one, so a raw SQL statement issued this way NEVER participates in the
+    ambient ORM transaction, lock or no lock, regardless of which transactional `EntityManager`
+    fork it is called from. The fix replaces both the lock and the aggregate read with the
+    SAME proven ORM-level pattern `reserveInTransaction`'s own `listCandidateBalances` already
+    uses successfully (`findWithDecryption(..., { lockMode: LockMode.PESSIMISTIC_WRITE }, ...)`),
+    computing the sellable arithmetic client-side from the now-correctly-locked entities (still
+    calling the A2 builder's PURE function, `computeSellableQuantities`, just fed from locked
+    entities instead of a second raw-SQL query). Proven via mutation testing: temporarily
+    removing the `lockMode` from this path reproduces the exact oversell failure the N=20 pg
+    test (`availability/lib/__tests__/reservationCommands.concurrency.pg.test.ts`) exists to
+    catch, confirming the test is not vacuous; the lock was then restored and the full pg suite
+    re-run green. This is now the documented reason `wms/lib/availabilityCalculation.ts`'s own
+    doc comment ("a caller that already holds row locks... sees the locked rows for free") is
+    only valid for its EXISTING caller (the lock-free read provider) and must NOT be reused
+    as-is by a future lock-holding caller without the same fix.
+  - **`availability.reserve`/`.release`/`.commit` are plain DI-resolved library functions
+    (`lib/reservationCommands.ts`), each with a thin `registerCommand` wrapper
+    (`commands/reservations.ts`, `isUndoable: false`) — not pure `CommandHandler`s with all
+    the logic inline.** This mirrors Step 1.3's own `wmsReservationService` precedent (a
+    plain service class) AND Step 1.6's `customerCreditService` precedent (a plain service
+    taking its dependencies explicitly) more closely than the spec's own abbreviated
+    `reserveAvailability(input)` pseudocode, which omits DI wiring entirely. The lib
+    functions take the resolver container as an explicit first argument (not literally
+    matching the spec's single-argument signature) so they are unit-testable without a real
+    DI container, consistent with every sibling Release 5 service. The thin command wrappers
+    exist so a future caller (checkout, Phase 4) can reach them through the command bus with
+    `isUndoable: false` recorded, matching A14/D-R5-10 exactly.
 
 ## External References
 

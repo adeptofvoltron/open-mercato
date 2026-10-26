@@ -31,6 +31,8 @@ import type { EntityManager } from '@mikro-orm/postgresql'
 import type { CommandRuntimeContext } from '@open-mercato/shared/lib/commands'
 import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 import { findOneWithDecryption, findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
+import { emitCrudSideEffects } from '@open-mercato/shared/lib/commands/helpers'
+import type { DataEngine } from '@open-mercato/shared/lib/data/engine'
 import { LockMode } from '@mikro-orm/core'
 import { emitWmsEvent } from '../events'
 import {
@@ -38,6 +40,7 @@ import {
   InventoryLot,
   InventoryMovement,
   InventoryReservation,
+  ProductInventoryProfile,
   Warehouse,
   type InventoryStrategy,
 } from '../data/entities'
@@ -52,11 +55,21 @@ import {
   type InventoryStrategyBucket,
 } from './inventoryPolicy'
 import { buildReservationIdempotencyKey } from './inventoryIdempotency'
+import { computeSellableQuantities } from './availabilityCalculation'
+import {
+  resolvePrimaryWarehouseId,
+  sortWarehouseAvailabilityForReservation,
+  type WarehouseAvailability,
+} from './primaryWarehousePolicy'
 import {
   ensureOrganizationScope,
   ensureTenantScope,
   findExactBalanceForUpdate,
   getAvailableQuantity,
+  inventoryBalanceCrudEvents,
+  inventoryBalanceCrudIndexer,
+  inventoryReservationCrudEvents,
+  inventoryReservationCrudIndexer,
   isUniqueConstraintError,
   loadProfileForVariant,
   requireWarehouse,
@@ -114,6 +127,166 @@ export type ConvertInTransactionInput = {
   reservationId: string
   tenantId: string
   organizationId: string
+  /** Only `'order'` is a real caller today — `availability.commit` (A1/A5/§4.4). */
+  sourceType: 'order'
+  sourceId: string
+}
+
+export type ConvertInTransactionResult = {
+  reservationId: string
+  reservationEntity: InventoryReservation
+}
+
+// =============================================================================
+// Release 5 Phase 3 (A1/A6/A7/A19) — the gate's own allocator and side-effect
+// replicator. `reserveLinesForCheckout`/`emitSideEffects` have no command of
+// their own (§4.1b): only `availability`'s `reserve`/`release`/`commit` call
+// them, in-process, inside their OWN transaction.
+// =============================================================================
+
+export type WmsSideEffects = {
+  reservations?: Array<{ entity: InventoryReservation; action: 'created' | 'updated' }>
+  balances?: Array<{ entity: InventoryBalance; action: 'updated' }>
+}
+
+export type ReserveLinesForCheckoutLineInput = {
+  key: string
+  catalogProductId: string
+  catalogVariantId: string
+  quantity: number
+  /** 'up_to_sellable' = backorder line (hold min(requested, sellable)); 'exact' = everything else. */
+  mode: 'exact' | 'up_to_sellable'
+}
+
+export type ReserveLinesForCheckoutLineResult = {
+  key: string
+  sellable: number
+  heldQuantity: number
+  reservationIds: string[]
+}
+
+export type ReserveLinesForCheckoutShortfallLine = {
+  key: string
+  requested: number
+  sellable: number
+}
+
+export type ReserveLinesForCheckoutInput = {
+  scope: Scope
+  lines: ReserveLinesForCheckoutLineInput[]
+  sourceType: 'checkout' | 'order'
+  sourceId: string
+  expiresAt: Date | null
+  warehouseIds?: string[] | null
+}
+
+export type ReserveLinesForCheckoutResult =
+  | { ok: true; lines: ReserveLinesForCheckoutLineResult[]; sideEffects: WmsSideEffects }
+  | { ok: false; lines: ReserveLinesForCheckoutShortfallLine[] }
+
+// §4.1b step 2: locks every balance row of every variant the call touches with
+// `LockMode.PESSIMISTIC_WRITE`, ordered by id, in ONE statement — through the ORM
+// (`findWithDecryption`, the SAME call shape `listCandidateBalances` above already uses
+// successfully under concurrency), never a raw `em.getConnection().execute()`. MikroORM's
+// raw SQL escape hatch does NOT bind to the ambient transaction unless the driver's
+// transaction context is threaded through explicitly (verified against this installed
+// MikroORM version's `AbstractSqlConnection.execute`: an omitted `ctx` always falls back to
+// the pool's plain client) — a lock taken that way, or an aggregate read issued that way,
+// would silently run outside this method's own transaction and see a stale, pre-lock
+// snapshot under real concurrency. `em.find`/`findWithDecryption` do not have this problem:
+// every ORM-level query is already transaction-bound by `wms`'s own proven lock path
+// (`reserveInTransaction`'s `listCandidateBalances`). Product-pool expansion (locking every
+// OTHER active variant of a pooled product) is deferred — see this Step's "Decisions taken
+// without the owner" note; per-variant correctness (the parallel last-unit guarantee) holds
+// either way.
+async function lockCandidateBalances(
+  em: EntityManager,
+  ctx: CommandRuntimeContext,
+  scope: Scope,
+  variantIds: string[],
+  warehouseIds?: string[] | null,
+): Promise<InventoryBalance[]> {
+  if (variantIds.length === 0) return []
+  const where: Record<string, unknown> = { catalogVariantId: { $in: variantIds }, deletedAt: null }
+  if (warehouseIds && warehouseIds.length > 0) where.warehouse = { $in: warehouseIds }
+  const balances = await findWithDecryption(
+    em,
+    InventoryBalance,
+    where,
+    { populate: ['lot', 'warehouse'], lockMode: LockMode.PESSIMISTIC_WRITE, orderBy: { id: 'asc' } },
+    scope,
+  )
+  for (const balance of balances) {
+    ensureTenantScope(ctx, balance.tenantId)
+    ensureOrganizationScope(ctx, balance.organizationId)
+  }
+  return balances
+}
+
+type SafetyStockProfileRow = {
+  catalog_product_id: string
+  catalog_variant_id: string | null
+  safety_stock: string | number | null
+  reorder_point: string | number | null
+}
+
+// STRICT variant-level safety-stock rows only (no product-pool row), matching A2's
+// `computeSellableQuantities` contract — the gate never falls back to the pool row for a
+// single variant's own buffer. Not concurrency-sensitive (profiles are configuration, not
+// raced by concurrent reserves), so a plain `em.find` — no lock — is enough; it still goes
+// through the ORM so it reads this transaction's own view consistently.
+async function loadVariantSafetyStockRows(
+  em: EntityManager,
+  scope: Scope,
+  variantIds: string[],
+): Promise<SafetyStockProfileRow[]> {
+  if (variantIds.length === 0) return []
+  const rows = await findWithDecryption(
+    em,
+    ProductInventoryProfile,
+    { catalogVariantId: { $in: variantIds }, deletedAt: null },
+    undefined,
+    scope,
+  )
+  return rows.map((row) => ({
+    catalog_product_id: row.catalogProductId,
+    catalog_variant_id: row.catalogVariantId ?? null,
+    safety_stock: row.safetyStock,
+    reorder_point: row.reorderPoint,
+  }))
+}
+
+// Sums the ALREADY-LOCKED balance rows (§4.2: eligible lots only), client-side — the SQL
+// half of the shared sellable builder (`availabilityCalculation.ts#loadBalanceAggregates`)
+// cannot be reused here for the reason `lockCandidateBalances` explains above; this is the
+// same arithmetic, fed from the locked entities instead of a second (non-transactional) query.
+function aggregateAvailableByVariant(balances: InventoryBalance[], now: Date): Map<string, number> {
+  const result = new Map<string, number>()
+  for (const balance of balances) {
+    if (!balanceHasEligibleLot(balance, now)) continue
+    result.set(balance.catalogVariantId, (result.get(balance.catalogVariantId) ?? 0) + getAvailableQuantity(balance))
+  }
+  return result
+}
+
+// Per-(variant, warehouse) raw available quantity (eligible lots only), for
+// `sortWarehouseAvailabilityForReservation` ordering ONLY — never the sellable budget,
+// which the gate enforces once at the variant-aggregate level above.
+function warehouseAvailabilityForVariant(
+  balances: InventoryBalance[],
+  now: Date,
+  catalogVariantId: string,
+): WarehouseAvailability[] {
+  const byWarehouse = new Map<string, number>()
+  for (const balance of balances) {
+    if (balance.catalogVariantId !== catalogVariantId) continue
+    if (!balanceHasEligibleLot(balance, now)) continue
+    const warehouseId = typeof balance.warehouse === 'string' ? balance.warehouse : balance.warehouse.id
+    byWarehouse.set(warehouseId, (byWarehouse.get(warehouseId) ?? 0) + getAvailableQuantity(balance))
+  }
+  return Array.from(byWarehouse.entries())
+    .map(([warehouseId, available]) => ({ warehouseId, available }))
+    .filter((bucket) => bucket.available > 0)
 }
 
 export function extractReservationMetadata(reservation: InventoryReservation): ReservationMetadata {
@@ -608,23 +781,187 @@ export class WmsReservationService {
   }
 
   /**
-   * Converts an active reservation's `sourceType`/`sourceId` in place — e.g. a
-   * checkout hold becoming an order hold at `availability.commit` (A1/A5) —
-   * without releasing and re-reserving. Stub: `InventoryReservationSourceType`
-   * is `'order' | 'transfer' | 'manual'` on this branch today (`'checkout'`
-   * lands in a later Step, A16), and no existing wms command converts a
-   * reservation's source in place, so there is no behaviour to extract yet.
-   * `availability`'s Phase 2 `commit` is this method's first real caller;
-   * until that Step lands, this intentionally throws rather than inventing a
-   * conversion contract no shipped caller exercises.
+   * Converts an active reservation's `sourceType`/`sourceId` in place — a checkout hold
+   * becoming an `order` hold at `availability.commit` (§4.1/§4.4, A1/A5/A16) — without
+   * releasing and re-reserving, so no window exists in which the stock is unheld. Rebuilds
+   * the row's `wms` idempotency key, since that key is derived from
+   * `sourceType|sourceId|variant|warehouse|quantity` (`buildReservationIdempotencyKey`) and
+   * goes stale the moment the first two change; `expires_at` is cleared, because nothing
+   * expires an `order` row.
+   *
+   * §4.4's "confirmed-first" collision case (the `sales.order.confirmed` automation having
+   * already created an `order` row with the SAME rebuilt key before `commit` runs) is
+   * deliberately NOT handled here — checkout always commits before any status that emits
+   * `sales.order.confirmed` (D-R5-8), so it never takes that path; this method is kept for
+   * `availability.commit`'s own caller, which is the only caller today.
    */
   async convertInTransaction(
-    _trx: EntityManager,
-    _ctx: CommandRuntimeContext,
-    _input: ConvertInTransactionInput,
-  ): Promise<never> {
-    throw new Error(
-      '[internal] wmsReservationService.convertInTransaction is not implemented — first real caller is availability.commit (Phase 2, A1/A5)',
-    )
+    trx: EntityManager,
+    ctx: CommandRuntimeContext,
+    input: ConvertInTransactionInput,
+  ): Promise<ConvertInTransactionResult> {
+    return runInTransaction(trx, async (innerTrx) => {
+      const scope = resolveScope(ctx, input)
+      const reservation = await requireReservation(innerTrx, ctx, input.reservationId, scope, true)
+      const warehouseId =
+        typeof reservation.warehouse === 'string' ? reservation.warehouse : reservation.warehouse.id
+      reservation.sourceType = input.sourceType
+      reservation.sourceId = input.sourceId
+      reservation.expiresAt = null
+      reservation.idempotencyKey = buildReservationIdempotencyKey({
+        sourceType: input.sourceType,
+        sourceId: input.sourceId,
+        catalogVariantId: reservation.catalogVariantId,
+        warehouseId,
+        quantity: toNumber(reservation.quantity),
+      })
+      await innerTrx.flush()
+      return { reservationId: reservation.id, reservationEntity: reservation }
+    })
+  }
+
+  /**
+   * §4.1b, A6/A7: the gate. In ONE `SELECT … FOR UPDATE` locks every balance row of every
+   * variant in the call, re-derives sellable from those locked rows with the §4.2 shared
+   * builder, and — only when every `'exact'`-mode line's `requested` fits its own sellable
+   * — allocates each line's `heldQuantity` across warehouses (primary first, A7) and
+   * inserts one `wms_inventory_reservations` row per `(variant, warehouse)` bucket via
+   * `reserveInTransaction` (same transaction, same locks, re-entrant). Any `'exact'` line
+   * that does not fit fails the WHOLE call: nothing is written, matching "all lines unheld
+   * when any line shortfalls" (A1). A `'up_to_sellable'` line (backorder) never shortfalls
+   * — it holds `min(requested, sellable)`, possibly zero.
+   *
+   * Returns the collected `sideEffects` instead of emitting them: this method runs INSIDE
+   * the caller's transaction, and side effects (cache invalidation, the `wms.inventory.*`
+   * events `emitSideEffects` fires) must only run after that transaction commits (A19) —
+   * the caller (`availability.reserve`/`.commit`) owns that boundary.
+   */
+  async reserveLinesForCheckout(
+    trx: EntityManager,
+    ctx: CommandRuntimeContext,
+    input: ReserveLinesForCheckoutInput,
+  ): Promise<ReserveLinesForCheckoutResult> {
+    return runInTransaction(trx, async (innerTrx) => {
+      const { scope, lines, sourceType, sourceId, expiresAt, warehouseIds } = input
+      if (lines.length === 0) {
+        return { ok: true as const, lines: [], sideEffects: {} }
+      }
+      const variantIds = Array.from(new Set(lines.map((line) => line.catalogVariantId)))
+      const now = new Date()
+
+      const lockedBalances = await lockCandidateBalances(innerTrx, ctx, scope, variantIds, warehouseIds)
+      const aggregates = aggregateAvailableByVariant(lockedBalances, now)
+      const profileRows = await loadVariantSafetyStockRows(innerTrx, scope, variantIds)
+      const sellableByVariant = computeSellableQuantities(
+        { balances: aggregates, profiles: profileRows },
+        { variantIds, productRollups: [] },
+      ).perVariant
+
+      const shortfalls: ReserveLinesForCheckoutShortfallLine[] = []
+      const toHold: Array<{ line: ReserveLinesForCheckoutLineInput; heldQuantity: number; sellableForLine: number }> = []
+      for (const line of lines) {
+        const sellableForLine = sellableByVariant.get(line.catalogVariantId) ?? 0
+        if (line.mode === 'exact') {
+          if (line.quantity > sellableForLine + 0.000001) {
+            shortfalls.push({ key: line.key, requested: line.quantity, sellable: sellableForLine })
+            continue
+          }
+          toHold.push({ line, heldQuantity: line.quantity, sellableForLine })
+        } else {
+          toHold.push({ line, heldQuantity: Math.min(line.quantity, sellableForLine), sellableForLine })
+        }
+      }
+      if (shortfalls.length > 0) {
+        return { ok: false as const, lines: shortfalls }
+      }
+
+      const primaryWarehouseId = await resolvePrimaryWarehouseId(innerTrx, scope)
+      const resultLines: ReserveLinesForCheckoutLineResult[] = []
+      const sideEffects: WmsSideEffects = { reservations: [], balances: [] }
+
+      for (const { line, heldQuantity, sellableForLine } of toHold) {
+        if (heldQuantity <= 0) {
+          resultLines.push({ key: line.key, sellable: sellableForLine, heldQuantity: 0, reservationIds: [] })
+          continue
+        }
+        const warehouseBuckets = sortWarehouseAvailabilityForReservation(
+          warehouseAvailabilityForVariant(lockedBalances, now, line.catalogVariantId),
+          primaryWarehouseId,
+        )
+        let remaining = heldQuantity
+        const reservationIds: string[] = []
+        for (const bucket of warehouseBuckets) {
+          if (remaining <= 0.000001) break
+          const take = Math.min(bucket.available, remaining)
+          if (take <= 0) continue
+          const bucketResult = await this.reserveInTransaction(innerTrx, ctx, {
+            tenantId: scope.tenantId,
+            organizationId: scope.organizationId,
+            warehouseId: bucket.warehouseId,
+            catalogVariantId: line.catalogVariantId,
+            quantity: take,
+            sourceType,
+            sourceId,
+            expiresAt: expiresAt ?? undefined,
+          })
+          reservationIds.push(bucketResult.reservationId)
+          if (!bucketResult.idempotentReplay) {
+            sideEffects.reservations!.push({ entity: bucketResult.reservationEntity, action: 'created' })
+            for (const balance of bucketResult.touchedBalances) {
+              sideEffects.balances!.push({ entity: balance, action: 'updated' })
+            }
+          }
+          remaining -= take
+        }
+        if (remaining > 0.000001) {
+          // The warehouse-level view came in lower than the variant-level aggregate
+          // (for example, an earlier line in this SAME call already consumed part of
+          // a shared bucket) — fail loudly instead of silently under-holding.
+          throw new CrudHttpError(409, { error: 'insufficient_stock' })
+        }
+        resultLines.push({ key: line.key, sellable: sellableForLine, heldQuantity, reservationIds })
+      }
+
+      return { ok: true as const, lines: resultLines, sideEffects }
+    })
+  }
+
+  /**
+   * A19: runs the side effects a write collected, AFTER the caller's transaction has
+   * committed — the same `emitCrudSideEffects` cache/query-index invalidation
+   * `commands/inventory-actions.ts`'s thin command wrappers already run for
+   * `wms.inventory.reserve`/`.release`, now also reachable by `reserveLinesForCheckout`'s
+   * in-process caller (`availability`). Re-resolving `dataEngine` defensively (never
+   * throwing when it is not registered) mirrors the existing wrappers' own behaviour.
+   */
+  async emitSideEffects(ctx: CommandRuntimeContext, sideEffects: WmsSideEffects): Promise<void> {
+    let de: DataEngine | null = null
+    try {
+      de = ctx.container.resolve('dataEngine') as DataEngine
+    } catch {
+      de = null
+    }
+    if (!de) return
+
+    for (const { entity, action } of sideEffects.reservations ?? []) {
+      await emitCrudSideEffects({
+        dataEngine: de,
+        action,
+        entity,
+        identifiers: { id: entity.id, organizationId: entity.organizationId, tenantId: entity.tenantId },
+        indexer: inventoryReservationCrudIndexer,
+        events: inventoryReservationCrudEvents,
+      })
+    }
+    for (const { entity, action } of sideEffects.balances ?? []) {
+      await emitCrudSideEffects({
+        dataEngine: de,
+        action,
+        entity,
+        identifiers: { id: entity.id, organizationId: entity.organizationId, tenantId: entity.tenantId },
+        indexer: inventoryBalanceCrudIndexer,
+        events: inventoryBalanceCrudEvents,
+      })
+    }
   }
 }

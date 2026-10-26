@@ -312,15 +312,35 @@ describe('WmsReservationService.releaseInTransaction', () => {
 })
 
 describe('WmsReservationService.convertInTransaction', () => {
-  it('is a documented stub — not implemented until availability.commit (Phase 2) is its first real caller', async () => {
+  // Step 2.2 (A1/A5/§4.4): `availability.commit` is this method's first real caller —
+  // converts a checkout hold into an `order` hold in place, rebuilding the wms
+  // idempotency key (which is derived from sourceType|sourceId|variant|warehouse|quantity
+  // and goes stale the moment sourceType/sourceId change) and clearing `expires_at`.
+  it('rewrites sourceType/sourceId, rebuilds the idempotency key, and clears expiresAt', async () => {
     const service = new WmsReservationService()
     const em = createEm()
-    await expect(
-      service.convertInTransaction(em, createCtx(em), {
-        reservationId: RESERVATION_ID,
-        tenantId: TENANT,
-        organizationId: ORG,
-      }),
-    ).rejects.toThrow(/not implemented/)
+    const reservation = makeReservation({ sourceType: 'checkout', sourceId: 'checkout-session-1', expiresAt: new Date('2024-01-01') })
+
+    findOneWithDecryption.mockImplementation((_em: unknown, entity: unknown) => {
+      if (entity === InventoryReservation) return reservation
+      return null
+    })
+
+    const result = await service.convertInTransaction(em, createCtx(em), {
+      reservationId: RESERVATION_ID,
+      tenantId: TENANT,
+      organizationId: ORG,
+      sourceType: 'order',
+      sourceId: ORDER_ID,
+    })
+
+    expect(result.reservationId).toBe(RESERVATION_ID)
+    expect(reservation.sourceType).toBe('order')
+    expect(reservation.sourceId).toBe(ORDER_ID)
+    expect(reservation.expiresAt).toBeNull()
+    expect(reservation.idempotencyKey).toBe(
+      `reservation|order|${ORDER_ID}|${VARIANT_ID}|${WAREHOUSE_ID}|8`,
+    )
+    expect(em.flush).toHaveBeenCalled()
   })
 })

@@ -571,6 +571,14 @@ const reserveInventoryCommand: CommandHandler<InventoryReservationCreateInput, R
   isUndoable: false,
   async execute(rawInput, ctx) {
     const input = inventoryReservationCreateSchema.parse(rawInput ?? {})
+    // A16: `'checkout'` is a system-only source written only by
+    // `wmsReservationService.reserveLinesForCheckout`/`convertInTransaction`
+    // (`availability`'s reserve/commit, called in-process, never through this command).
+    // Reject it here so the public route — and any other command-bus caller — can never
+    // create one by hand; the expiry sweep would otherwise release a hand-made row.
+    if (input.sourceType === 'checkout') {
+      throw new CrudHttpError(400, { error: 'checkout_reservation_is_system_only' })
+    }
     ensureTenantScope(ctx, input.tenantId)
     ensureOrganizationScope(ctx, input.organizationId)
     const em = resolveEm(ctx)

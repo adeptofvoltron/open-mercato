@@ -265,3 +265,65 @@
   coding-agent exception, snapshots reverted via `git checkout`. `yarn jest` in `packages/core`:
   new test file 7/7 pass; full `src/modules/availability` suite 108/108 pass (11 suites), no
   regressions.
+
+## 2026-10-26T20:00:00Z — Step 2.2 landed (the release's core mechanism)
+- `availability`: `reserveAvailability`/`releaseAvailability`/`commitAvailability`
+  (`lib/reservationCommands.ts`, new) built on `wmsReservationService` (Step 1.3), one
+  transaction per call via `em.transactional()`, CAS on `status = 'active'`, per-line outcome
+  classification (`held|not_tracked|preorder|backorder|shortfall`, D-R5-9 backorder holds
+  `min(requested, sellable)`), warehouse allocation preferring the primary warehouse (A7),
+  key-mismatch `409 idempotency_key_mismatch` (A15), `isUndoable: false` (A14/D-R5-10) on the
+  thin `commands/reservations.ts` command-bus wrappers (`availability.reserve`/`.release`/
+  `.commit`).
+- `wms`: `wmsReservationService` (Step 1.3) gained the gate itself —
+  `reserveLinesForCheckout` (locks every balance row of every variant in one statement,
+  re-derives sellable with the §4.2 shared builder, allocates across warehouses, inserts
+  `wms` rows per `(variant, warehouse)` bucket), a real `convertInTransaction` (was a stub —
+  this Step is its first real caller, converting a `'checkout'` hold to an `'order'` hold in
+  place with a rebuilt idempotency key, per §4.4), and `emitSideEffects` (A19 cache
+  invalidation parity with the existing `wms.inventory.reserve`/`.release` commands).
+  `InventoryReservationSourceType` gained `'checkout'` (additive); the public
+  `wms.inventory.reserve` command/route now explicitly reject it with `400
+  checkout_reservation_is_system_only` (A16's functional half — the cosmetic i18n label and
+  `UPGRADE_NOTES.md` entry are Step 6.2's named scope, not duplicated here).
+- **Correctness bug found and fixed in this same commit, not shipped broken**: the first
+  implementation of the gate's row lock used raw SQL (`em.getConnection().execute('...FOR
+  UPDATE')`) reusing the A2 shared SQL builder as instructed. Against a REAL Postgres
+  instance under N=20 real concurrent `reserve` calls for a single unit of stock, this
+  oversold the unit — every caller saw the same pre-consumption snapshot, because this
+  installed MikroORM version's raw `.execute()` never binds to the ambient ORM transaction
+  unless its `ctx` parameter is passed explicitly, which `em.getConnection()` never supplies.
+  Root-caused by reproducing the failure with verbose logging, then fixed by switching the
+  lock AND the aggregate read to the same proven ORM-level pattern (`findWithDecryption(...,
+  { lockMode: LockMode.PESSIMISTIC_WRITE }, ...)`) `wmsReservationService`'s own existing,
+  tested `reserveInTransaction` path already relies on — computing the sellable arithmetic
+  client-side from the now-correctly-locked entities (still calling the A2 builder's PURE
+  `computeSellableQuantities` function, just fed from locked entities instead of a second raw
+  query). Proved the fix is real, not a coincidence, by temporarily removing the lock mode and
+  re-running the same N=20 pg test: it reproduced the exact oversell, confirming the test is
+  not vacuous; the lock was restored immediately after and the full pg suite re-verified green
+  before committing. Full reasoning in PLAN.md "Decisions taken without the owner".
+- Tests: a new real-Postgres concurrency suite,
+  `availability/lib/__tests__/reservationCommands.concurrency.pg.test.ts` (gated on
+  `OM_AVAILABILITY_PG_URL`, 9 cases) — N=20 parallel reserve for the last unit (exactly one
+  succeeds), multi-line all-or-nothing, backorder `min(requested,sellable)`, not_tracked for a
+  non-stock-managed line, idempotency-key mismatch 409 + same-content replay, release
+  idempotency (A21: second release / committed-hold release / unknown-key release are all
+  no-ops), commit racing the expiry sweep (both the `recovered` and `stock_lost` branches,
+  simulated by setting the hold's status to `expired` directly since the real sweep is Step
+  2.3's scope), and cross-tenant/organization isolation. Plus a new unit test in
+  `wms/commands/__tests__/inventory-actions.reserve-release.test.ts` for the A16 guard, and
+  `wms/lib/__tests__/wmsReservationService.test.ts`'s `convertInTransaction` stub test
+  rewritten to exercise the real conversion (the stub itself is gone).
+- Checks: `yarn typecheck` in `packages/core` clean. Full `src/modules/wms` (65 suites, 429
+  tests) and `src/modules/availability` (12 suites, 117 tests incl. the new pg suite skipped
+  without the env var) pass — zero regressions. The gated pg suite itself: 9/9 pass against a
+  throwaway `postgres:18-alpine` container (via the existing `colima` runtime), confirmed via
+  mutation testing per the run brief's own instruction. `yarn build:packages` (`@open-mercato/
+  core` et al.) green.
+- Scope calls (all logged in PLAN.md "Decisions taken without the owner"): product-pool
+  allocation (A7's pool check) deferred — not in this Step's 8-test gate, named explicitly as
+  A20/Step 6.1 scope; §4.4's confirmed-first collision handling in `convertInTransaction`
+  deferred — checkout never takes that path (D-R5-8); the service/command split (plain
+  DI-resolved lib functions + thin `isUndoable: false` command wrappers) mirrors Step 1.3/1.6's
+  own precedent rather than the spec's abbreviated single-argument pseudocode.

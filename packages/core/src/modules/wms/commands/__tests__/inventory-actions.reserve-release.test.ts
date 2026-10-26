@@ -188,6 +188,24 @@ describe('wms inventory reserve command', () => {
     expect(em.flush).toHaveBeenCalled()
   })
 
+  // Release 5 Phase 3 (A16, Step 2.2, `.ai/specs/2026-08-14-availability-contract.md` §4.4):
+  // `'checkout'` is a system-only source written only by `wmsReservationService
+  // .reserveLinesForCheckout` (`availability`'s own reserve). The public command — and so
+  // the public `POST /api/wms/inventory/reserve` route, which validates with the SAME
+  // schema and calls this SAME command — must reject it before touching any balance, so a
+  // tenant can never hand-create a `'checkout'` row the expiry sweep would later release.
+  it('rejects sourceType "checkout" with 400 and writes nothing (A16)', async () => {
+    const em = createEm()
+
+    const handler = commandRegistry.get('wms.inventory.reserve')
+    await expect(
+      handler!.execute!(makeReserveInput({ sourceType: 'checkout' }), createCtx(em)),
+    ).rejects.toMatchObject({ status: 400, body: { error: 'checkout_reservation_is_system_only' } })
+
+    expect(em.persist).not.toHaveBeenCalled()
+    expect(em.flush).not.toHaveBeenCalled()
+  })
+
   it('throws insufficient_stock when no available quantity exists', async () => {
     const em = createEm()
     const balance = makeBalance({ quantityOnHand: '5', quantityReserved: '5' })
