@@ -133,3 +133,14 @@
 - Did NOT touch checkout (no caller exists yet) or cart's `codeService.releaseCode` wiring in the
   expire/mark-abandoned sweepers (that is Step 2.11/K11's separate reservation-release mechanism,
   not this Step's use-time reversal).
+
+## 2026-10-26T17:00:00Z — checkpoint 2 (Steps 1.6–1.10)
+- Range: `e94c9305dc`..`9a6703e162`. Summary: customer_groups credit service (row-lock concurrency,
+  mutation-tested) + admin widget/ACL/encryption + notifications/exposure-audit/cancel-release;
+  promotions revertCodeUse + cancellation subscriber + un-hidden delivery promotions.
+- Checks: forced full typecheck (40/40, 0 cached) pass; scoped tests pass (core
+  customer_groups+promotions+cart 79/80 suites, 910/912 tests — 1 expected skip, Postgres-gated).
+  No dev-server/browser UI smoke pass yet for the two UI surfaces touched (1.7, 1.10) — deferred,
+  not skipped silently; logged in checkpoint-2-checks.md.
+- Decisions/problems: two gap-fill Steps appended (1.11 credit-account provisioning, 1.12
+  manual /adjust settlement) — both logged in PLAN.md's "Decisions taken without the owner".
