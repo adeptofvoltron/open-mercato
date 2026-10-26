@@ -373,3 +373,44 @@
   policies.ts`, untouched here).
 - Phase 2's `availability` track is now feature-complete per PLAN.md's Phase 2 heading, pending
   the run's final gate (Step 6.4).
+
+## 2026-10-26T21:30:00Z — Step 2.4 landed (customer_groups: `CustomerPurchaseApproval` entity + migration)
+
+- `data/entities.ts`: `CustomerPurchaseApproval` (`customer_purchase_approvals`), exact column
+  set per spec §5.6 — `organizationId`/`tenantId`/`customerId` (company, FK-id only),
+  `requestedByActorType`/`requestedByActorId` (D-R5-1; `staff_user` reserved/unused for the
+  REQUESTER per X7), `subjectType` (`cart | quote`, `quote` reserved for acceptance per
+  D-R5-23/X6, `checkout_session` not in the enum at all), `subjectId`, `amountGross` (numeric
+  16,2 decimal string) + `currencyCode`, `approvalPolicy` (the `CustomerGroupTerms.approvalPolicy`
+  snapshot at creation), `status` (5-value lifecycle), the two decision slots
+  (`buyerDecision`/`buyerDecidedByActorType`/`buyerDecidedByActorId`/`buyerDecidedAt`/
+  `buyerDecisionNote` and the `merchant*` mirror, each slot `pending|approved|rejected|
+  not_required`), `decidedAt`, `withdrawnReason`, `expiresAt`, `createdAt`/`updatedAt` (no
+  `deletedAt` — an approval always transitions `status` instead of being soft-deleted).
+  Constraints exactly as spec'd: partial unique `(tenant_id, subject_type, subject_id) WHERE
+  status = 'pending'`, two `@Check` constraints pinning each decider's actor-type column to its
+  side, plus the two named indexes for the status lookup and the expiry job.
+- `data/validators.ts`: five new zod enum schemas mirroring the entity's TS unions
+  (`customerPurchaseApprovalActorType/SubjectType/Status/SlotDecision/WithdrawnReason`). No
+  create/update/delete trio — the spec names no public create route (service-only, Step 2.5)
+  and this is not a `makeCrudRoute` entity.
+- New test: `data/__tests__/purchaseApproval.test.ts` (9 cases) — entity/validator round-trip
+  for all three policies (`both`/`buyer`/`merchant`), a withdrawn-with-reason case, and an enum
+  rejection case per schema. Mirrors the `availability`/Step 2.1 `data/__tests__/reservation.test.ts`
+  convention.
+- Migration: `yarn db:generate` produced exactly one `customer_groups` migration
+  (`Migration20261026201625_customer_groups.ts`, create-table only, no `down()` — matches this
+  module's own create-table precedent) plus unrelated `forms`/`wms` drift (a stale index rename
+  and a pre-existing `wms` idempotency-column gap, reproduced on a second bare `db:generate` run
+  with zero `customer_groups` changes left) — discarded per the established coding-agent-
+  exception pattern (Steps 1.5/1.9/2.1).
+- Scope calls: none beyond the established discard pattern above — spec §5.6 names every column
+  literally, so no "two decision slots" design ambiguity to resolve (not logged in PLAN.md's
+  Decisions section for that reason). One minor implementation choice, not escalated: `status`/
+  `buyerDecision`/`merchantDecision` have no entity-level default and must be set explicitly by
+  every writer (Step 2.5's service) — a single hard-coded default would be wrong for some
+  `approvalPolicy` values (e.g. `not_required` vs. `pending` depends on which side the policy
+  requires), so leaving them required-with-no-default is safer than guessing one.
+- Checks: `yarn typecheck` (`packages/core`) clean. `yarn jest` in `packages/core` for the full
+  `customer_groups` suite: 36/37 suites pass (394/396 tests), 1 suite with 2 DB-dependent tests
+  skipped (no live Postgres in this environment, pre-existing, unrelated to this Step).

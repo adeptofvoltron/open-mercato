@@ -1,5 +1,5 @@
 import { OptionalProps } from '@mikro-orm/core'
-import { Entity, Index, ManyToOne, PrimaryKey, Property, Unique } from '@mikro-orm/decorators/legacy'
+import { Check, Entity, Index, ManyToOne, PrimaryKey, Property, Unique } from '@mikro-orm/decorators/legacy'
 import type { AssortmentScope } from '@open-mercato/shared/lib/catalog-visibility'
 
 export type CustomerGroupKind = 'b2c' | 'b2b' | 'internal' | 'partner'
@@ -12,6 +12,31 @@ export type CustomerCreditLedgerEntryType = 'reserve' | 'release' | 'settle' | '
 export type CustomerCreditLedgerSourceType = 'checkout' | 'order' | 'invoice' | 'payment' | 'manual'
 // Service calls made by checkout or a subscriber are `system`; `/adjust` is `staff_user`.
 export type CustomerCreditLedgerActorType = 'staff_user' | 'system'
+
+// Release 5 Phase 4 (§5.6). `requestedByActorType` carries the full enum (D-R5-1: "a
+// staff rep can author a cart through the proposal seam"), but Release 5 writes only
+// `customer_user` for a REQUESTER — X7: "`staff_user` stays in the enum, reserved and
+// unused, and no Release 5 route accepts it." The decider columns below reuse this same
+// union for their actor-type pair, but with a different reachable set: a merchant
+// decider (`staff_user`) is an ordinary, expected Release 5 actor, not a reserved/unused
+// value — don't conflate the two columns' reachability just because they share a type.
+export type CustomerPurchaseApprovalActorType = 'customer_user' | 'staff_user'
+// `cart` is the one canonical subject in Release 5 (D-R5-3). `quote` is reserved for
+// approval at quote acceptance (D-R5-23, X6) — outside Release 5 scope; no route in this
+// release creates a `quote`-subject row. `checkout_session` was considered and dropped
+// from the enum entirely (X6): the cart, not the session, is the subject.
+export type CustomerPurchaseApprovalSubjectType = 'cart' | 'quote'
+export type CustomerPurchaseApprovalStatus = 'pending' | 'approved' | 'rejected' | 'expired' | 'withdrawn'
+// Per-slot decision (`buyerDecision`/`merchantDecision` below). `not_required` is the
+// resting state of the slot the snapshotted `approvalPolicy` does not require a signature
+// from (policy `buyer` → merchant slot `not_required`; policy `merchant` → buyer slot
+// `not_required`; policy `both` → both slots start `pending`).
+export type CustomerPurchaseApprovalSlotDecision = 'pending' | 'approved' | 'rejected' | 'not_required'
+export type CustomerPurchaseApprovalWithdrawnReason =
+  | 'requester'
+  | 'cart_merged'
+  | 'cart_expired'
+  | 'cart_purged'
 
 // Groups are tenant-scoped, not organization-scoped — spec §5 note: "groups are
 // tenant-scoped here, consistent with `CatalogPriceKind`, which allows a null
@@ -424,4 +449,144 @@ export class CustomerCreditLedgerEntry {
 
   @Property({ name: 'created_at', type: Date, onCreate: () => new Date() })
   createdAt: Date = new Date()
+}
+
+// Release 5 Phase 4 (§5.6). Consent to spend up to `amountGross` in `currencyCode` on a
+// cart (D-R5-3). Two decision slots, one per side; `approvalPolicy` snapshots the
+// group's resolved `CustomerGroupTerms.approvalPolicy` (D-R5-1) at creation, so editing
+// the group's terms never changes a pending request's rules.
+//
+// `customerId` is the resolved **company** (§6.5 identity rule), a plain FK-id column
+// like every other cross-module reference in this module (e.g.
+// `CustomerGroupMembership.customerId`) — as are `subjectId` (crosses into `cart`, and
+// later a `sales` quote) and the four decider/requester actor-id columns (cross into
+// `customer_accounts.CustomerUser` or `auth.User`, selected by the sibling
+// `*ActorType` column).
+//
+// `buyerDecisionNote`/`merchantDecisionNote` stay plain `text`, typed for the same
+// future-encryption reason as `CustomerCreditAccount.holdReason` above (§5.6: "Free
+// text, encrypted (§16)") — encryption is a storage-time transform over a `text` column,
+// wired in a later Step, not a distinct column type now.
+//
+// No `deletedAt`: an approval is never soft-deleted — it always transitions `status`
+// instead (withdrawn/expired/rejected/approved), so every row stays visible for audit.
+//
+// Every field below is required with no entity-level default (no `[OptionalProps]`
+// beyond `createdAt`/`updatedAt`): `status`, `buyerDecision` and `merchantDecision` are
+// policy-dependent (§5.6: `not_required` vs. `pending` depends on the snapshotted
+// `approvalPolicy`), so a single hard-coded default would be wrong for some policies —
+// Step 2.5's service must set every one of them explicitly on create, the same
+// discipline `CustomerCreditLedgerEntry` above already requires for its required fields.
+@Entity({ tableName: 'customer_purchase_approvals' })
+@Index({
+  name: 'customer_purchase_approvals_tenant_org_customer_status_idx',
+  properties: ['tenantId', 'organizationId', 'customerId', 'status'],
+})
+@Index({
+  name: 'customer_purchase_approvals_tenant_status_expires_idx',
+  properties: ['tenantId', 'status', 'expiresAt'],
+})
+@Index({
+  // Spec §5.6: "a partial unique index (tenant_id, subject_type, subject_id) WHERE
+  // status = 'pending' — at most one pending request per subject, which makes
+  // requestApproval idempotent under concurrency (G8)." Partial, not `@Unique` (which has
+  // no WHERE clause), mirroring this module's other soft-delete-safe partial indexes —
+  // here the varying predicate is "resolved" rather than "deleted": a subject can
+  // accumulate many non-pending rows over time, only one pending one at a time.
+  name: 'customer_purchase_approvals_pending_subject_unique',
+  expression:
+    'create unique index "customer_purchase_approvals_pending_subject_unique" on "customer_purchase_approvals" ("tenant_id", "subject_type", "subject_id") where "status" = \'pending\'',
+})
+@Check({
+  // Spec §5.6: "Check constraints keep the slot actor types to their side."
+  name: 'customer_purchase_approvals_buyer_decider_actor_type_chk',
+  expression: `"buyer_decided_by_actor_type" is null or "buyer_decided_by_actor_type" = 'customer_user'`,
+})
+@Check({
+  name: 'customer_purchase_approvals_merchant_decider_actor_type_chk',
+  expression: `"merchant_decided_by_actor_type" is null or "merchant_decided_by_actor_type" = 'staff_user'`,
+})
+export class CustomerPurchaseApproval {
+  [OptionalProps]?: 'createdAt' | 'updatedAt'
+
+  @PrimaryKey({ type: 'uuid', defaultRaw: 'gen_random_uuid()' })
+  id!: string
+
+  @Property({ name: 'organization_id', type: 'uuid' })
+  organizationId!: string
+
+  @Property({ name: 'tenant_id', type: 'uuid' })
+  tenantId!: string
+
+  @Property({ name: 'customer_id', type: 'uuid' })
+  customerId!: string
+
+  @Property({ name: 'requested_by_actor_type', type: 'text' })
+  requestedByActorType!: CustomerPurchaseApprovalActorType
+
+  @Property({ name: 'requested_by_actor_id', type: 'uuid' })
+  requestedByActorId!: string
+
+  @Property({ name: 'subject_type', type: 'text' })
+  subjectType!: CustomerPurchaseApprovalSubjectType
+
+  @Property({ name: 'subject_id', type: 'uuid' })
+  subjectId!: string
+
+  @Property({ name: 'amount_gross', type: 'numeric', precision: 16, scale: 2 })
+  amountGross!: string
+
+  @Property({ name: 'currency_code', type: 'text' })
+  currencyCode!: string
+
+  @Property({ name: 'approval_policy', type: 'text' })
+  approvalPolicy!: CustomerGroupApprovalPolicy
+
+  @Property({ type: 'text' })
+  status!: CustomerPurchaseApprovalStatus
+
+  @Property({ name: 'buyer_decision', type: 'text' })
+  buyerDecision!: CustomerPurchaseApprovalSlotDecision
+
+  @Property({ name: 'buyer_decided_by_actor_type', type: 'text', nullable: true })
+  buyerDecidedByActorType?: CustomerPurchaseApprovalActorType | null
+
+  @Property({ name: 'buyer_decided_by_actor_id', type: 'uuid', nullable: true })
+  buyerDecidedByActorId?: string | null
+
+  @Property({ name: 'buyer_decided_at', type: Date, nullable: true })
+  buyerDecidedAt?: Date | null
+
+  @Property({ name: 'buyer_decision_note', type: 'text', nullable: true })
+  buyerDecisionNote?: string | null
+
+  @Property({ name: 'merchant_decision', type: 'text' })
+  merchantDecision!: CustomerPurchaseApprovalSlotDecision
+
+  @Property({ name: 'merchant_decided_by_actor_type', type: 'text', nullable: true })
+  merchantDecidedByActorType?: CustomerPurchaseApprovalActorType | null
+
+  @Property({ name: 'merchant_decided_by_actor_id', type: 'uuid', nullable: true })
+  merchantDecidedByActorId?: string | null
+
+  @Property({ name: 'merchant_decided_at', type: Date, nullable: true })
+  merchantDecidedAt?: Date | null
+
+  @Property({ name: 'merchant_decision_note', type: 'text', nullable: true })
+  merchantDecisionNote?: string | null
+
+  @Property({ name: 'decided_at', type: Date, nullable: true })
+  decidedAt?: Date | null
+
+  @Property({ name: 'withdrawn_reason', type: 'text', nullable: true })
+  withdrawnReason?: CustomerPurchaseApprovalWithdrawnReason | null
+
+  @Property({ name: 'expires_at', type: Date })
+  expiresAt!: Date
+
+  @Property({ name: 'created_at', type: Date, onCreate: () => new Date() })
+  createdAt: Date = new Date()
+
+  @Property({ name: 'updated_at', type: Date, onUpdate: () => new Date() })
+  updatedAt: Date = new Date()
 }

@@ -393,3 +393,41 @@ export const customerCreditAdjustCommandSchema = customerCreditAdjustBaseSchema
   .refine(adjustAmountNotZero, { message: 'amount must not be zero', path: ['amount'] })
 
 export type CustomerCreditAdjustCommandInput = z.infer<typeof customerCreditAdjustCommandSchema>
+
+// Release 5 Phase 4 (§5.6): entity-shape enum validators for `CustomerPurchaseApproval`.
+// No create/update/delete trio here — the spec names no public create route ("only cart
+// commands call this, with server-side totals", §6 `CustomerPurchaseApprovalService`),
+// and every transition is a service-owned conditional update (§6.6), not a `makeCrudRoute`
+// entity. Step 2.5 (the service) and Step 2.6 (the routes) own request/response shapes;
+// these enums exist now so the entity's own columns (`data/entities.ts`) have a validated
+// counterpart, matching this module's convention for every other entity.
+
+// Release 5 (D-R5-1/X7): `requestedByActorType` and the two decider `*ActorType` columns
+// share this union. Release 5 writes only `customer_user` for the REQUESTER (X7); the
+// decider columns have a different reachable set — `staff_user` is an ordinary merchant
+// decider, not a reserved value — enforced by the entity's own check constraints, not
+// this schema (a single shared enum does not know which column it is validating).
+export const customerPurchaseApprovalActorTypeValues = ['customer_user', 'staff_user'] as const
+export const customerPurchaseApprovalActorTypeSchema = z.enum(customerPurchaseApprovalActorTypeValues)
+
+// Release 5 (D-R5-3/D-R5-23/X6): `quote` is reserved for approval at quote acceptance,
+// outside Release 5 scope — nothing creates it yet. `checkout_session` was dropped from
+// the enum entirely (X6), not kept reserved.
+export const customerPurchaseApprovalSubjectTypeValues = ['cart', 'quote'] as const
+export const customerPurchaseApprovalSubjectTypeSchema = z.enum(customerPurchaseApprovalSubjectTypeValues)
+
+export const customerPurchaseApprovalStatusValues = ['pending', 'approved', 'rejected', 'expired', 'withdrawn'] as const
+export const customerPurchaseApprovalStatusSchema = z.enum(customerPurchaseApprovalStatusValues)
+
+// Per-slot decision (`buyerDecision`/`merchantDecision`). `not_required` is the resting
+// state of the slot the snapshotted `approvalPolicy` does not require a signature from.
+export const customerPurchaseApprovalSlotDecisionValues = ['pending', 'approved', 'rejected', 'not_required'] as const
+export const customerPurchaseApprovalSlotDecisionSchema = z.enum(customerPurchaseApprovalSlotDecisionValues)
+
+export const customerPurchaseApprovalWithdrawnReasonValues = [
+  'requester',
+  'cart_merged',
+  'cart_expired',
+  'cart_purged',
+] as const
+export const customerPurchaseApprovalWithdrawnReasonSchema = z.enum(customerPurchaseApprovalWithdrawnReasonValues)
