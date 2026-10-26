@@ -17,7 +17,7 @@ Phase A pay links keep their existing path end to end (checkout spec §2): a `Ch
 | `2026-08-14-customer-groups-and-b2b-terms.md` | 3 Credit (`CustomerCreditAccount`, ledger, `checkCredit`/`reserveCredit`/`releaseCredit`/`settleCredit`, admin credit UI, exposure audit) · 4 Approvals (`CustomerPurchaseApproval`, request/decision flow, approver resolution via `CustomerEntityRole`, notifications). Phases 1–2 shipped in #6709; Phase 5 is out of scope. | pending |
 | `2026-08-14-availability-contract.md` | 3 Reservations (`'checkout'` source type, `reserve`/`release`/`commit`, expiry and reconciliation jobs, shortfall events). Phases 1–2 shipped 2026-09-22. | pending |
 | `2026-08-14-cart-module.md` (rev 9) | 4 B2B and admin: approval routing, bulk lines, admin cart list, abandonment events, the proposal seam (§7a). Phases 1–3 shipped in #7592. | pending |
-| `2026-09-22-assisted-selling.md` (rev 5) | **Phase 1 only**, Foundation and the proposal seam, added by D-R5-11, plus its prerequisite SPEC-029 `storeContextService.resolveForBuyer`. Phases 2–5 are out of scope. | pending |
+| `2026-09-22-assisted-selling.md` (rev 5) | Added by D-R5-11. **Recommended by the analysis** (owner confirmation pending): Phase 1 (with `mode` limited to `rep \| off`, no AI entities); Phase 2 items 1, 2 (server side), 3 and 5; Phase 4 conditional on checkout B.4 supplying `lineMap`. Phase 2 item 4, Phase 3 and Phase 5 are out. Prerequisite: SPEC-029 `storeContextService.resolveForBuyer`. | `ANALYSIS-2026-10-26-assisted-selling-release-5.md` (S1–S25) |
 | `2026-03-19-checkout-simple-checkout.md` (v2.1) | B.1 Session and step machine · B.2 Cart-backed links · B.3 Delivery and payment · B.4 Submit · B.5 B2B. **B.6 Hardening is out of scope.** Phase A pay links are implemented and unchanged. | pending |
 
 ## Ordering constraints (to be confirmed by the analyses)
@@ -42,7 +42,7 @@ Phase A pay links keep their existing path end to end (checkout spec §2): a `Ch
 | Pre-implement analysis: customer groups F3–F4 | done (2026-10-26) — `ANALYSIS-2026-10-26-customer-groups-release-5.md` (G1–G26); owner decisions D-R5-1…7 in `ANALYSIS-2026-10-26-ecommerce-release-5-decisions.md` |
 | Pre-implement analysis: availability F3 | done (2026-10-26) — `ANALYSIS-2026-10-26-availability-release-5.md` (A1–A21); owner decisions D-R5-8…10 in `ANALYSIS-2026-10-26-ecommerce-release-5-decisions.md` |
 | Pre-implement analysis: cart F4 | done (2026-10-26) — `ANALYSIS-2026-10-26-cart-module-release-5.md` (K1–K17); owner decisions D-R5-11 (seam stays in Release 5, with assisted-selling Phase 1 added) and D-R5-12 |
-| Pre-implement analysis: assisted-selling Phase 1 (+ `resolveForBuyer`) | pending |
+| Pre-implement analysis: assisted selling (+ `resolveForBuyer`) | done (2026-10-26) — `ANALYSIS-2026-10-26-assisted-selling-release-5.md` (S1–S25); owner decisions pending: phase scope, S2, S11 |
 | Pre-implement analysis: checkout B.1–B.5 | pending |
 | Cross-spec consistency pass and decisions | pending |
 | Spec revision pass | pending |
