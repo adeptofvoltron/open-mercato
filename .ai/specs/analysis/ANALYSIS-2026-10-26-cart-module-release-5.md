@@ -235,7 +235,7 @@ All 13 surfaces were checked. Phase 4 is additive.
 
 ### Before Implementation (Must Do)
 
-1. **Owner decisions:**
+1. **Owner decisions, taken 2026-10-26 (`ANALYSIS-2026-10-26-ecommerce-release-5-decisions.md`): D-R5-11, the seam stays in Release 5 (build §7a plus K13–K16; assisted-selling Phase 1 added to scope); D-R5-12, option (b) plus an admin warning on the default group:**
    - split the proposal seam out of Release 5 (recommended);
    - K4: guest carts over the threshold, (a) or (b).
 2. **Spec revision of cart:**
