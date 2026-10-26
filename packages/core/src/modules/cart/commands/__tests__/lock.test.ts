@@ -394,6 +394,29 @@ describe('cart.lock', () => {
     expect((captured as { body?: Record<string, unknown> }).body).toMatchObject({ code: 'cart_locked', checkoutSessionId: 'existing-session' })
   })
 
+  // (C1) Regression guard: this step changes NOTHING about a re-lock from a different (or
+  // absent) checkoutSessionId — only the SAME-session case below is new. Exercises the
+  // no-session variant specifically, since the named test above only covers "different".
+  it('still refuses a re-lock attempt with NO checkoutSessionId at all against an already-locked cart with 423', async () => {
+    seededCarts = [makeCartFixture({ status: 'locked', checkoutSessionId: 'existing-session' })]
+    const handler = getHandler<CartLockInput, CartLockResult>('cart.lock')
+    const em = makeEm()
+    const ctx = makeCtx({ em })
+
+    let captured: unknown
+    try {
+      await handler.execute(
+        { cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, checkoutSessionId: undefined as unknown as string },
+        ctx,
+      )
+    } catch (err) {
+      captured = err
+    }
+
+    expect(isCrudHttpError(captured)).toBe(true)
+    expect((captured as { status: number }).status).toBe(423)
+  })
+
   it('refuses locking a non-active, non-locked cart with the generic 404', async () => {
     seededCarts = [makeCartFixture({ status: 'abandoned' })]
     const handler = getHandler<CartLockInput, CartLockResult>('cart.lock')
@@ -409,6 +432,128 @@ describe('cart.lock', () => {
 
     expect(isCrudHttpError(captured)).toBe(true)
     expect((captured as { status: number }).status).toBe(404)
+  })
+
+  it('rejects an out-of-bounds lockTtlMs with a 400, before touching the cart at all', async () => {
+    const handler = getHandler<CartLockInput, CartLockResult>('cart.lock')
+    const em = makeEm()
+    const ctx = makeCtx({ em })
+
+    let captured: unknown
+    try {
+      await handler.execute(
+        { cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, checkoutSessionId: 'checkout-session-1', lockTtlMs: 1_000 },
+        ctx,
+      )
+    } catch (err) {
+      captured = err
+    }
+
+    expect(isCrudHttpError(captured)).toBe(true)
+    expect((captured as { status: number }).status).toBe(400)
+    expect((captured as { body?: Record<string, unknown> }).body).toMatchObject({ code: 'invalid_lock_ttl_ms' })
+    // Never even loaded the cart via the pre-check path's lock/status logic.
+    expect(seededCarts.find((row) => row.id === CART_ID)!.status).toBe('active')
+  })
+
+  it('a fresh lock with an explicit lockTtlMs honours it instead of the env default', async () => {
+    const handler = getHandler<CartLockInput, CartLockResult>('cart.lock')
+    const em = makeEm()
+    const commandBus = makeFakeCommandBus()
+    const ctx = makeCtx({ em, commandBus })
+
+    const result = await handler.execute(
+      { cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, checkoutSessionId: 'checkout-session-1', lockTtlMs: 120_000 },
+      ctx,
+    )
+
+    expect(result.extended).toBe(false)
+    expect(result.cart.lockExpiresAt!.getTime() - result.cart.lockedAt!.getTime()).toBe(120_000)
+  })
+
+  describe('idempotent extend (C1/X15)', () => {
+    it('a second lock with the SAME checkoutSessionId on a locked cart extends lockExpiresAt and returns the cart, with extended: true', async () => {
+      const lockedAt = new Date('2026-03-01T00:00:00.000Z')
+      const originalExpiry = new Date('2026-03-01T00:30:00.000Z')
+      seededCarts = [
+        makeCartFixture({ status: 'locked', lockedAt, lockExpiresAt: originalExpiry, checkoutSessionId: 'checkout-session-1' }),
+      ]
+      const handler = getHandler<CartLockInput, CartLockResult>('cart.lock')
+      const em = makeEm()
+      const commandBus = makeFakeCommandBus()
+      const ctx = makeCtx({ em, commandBus })
+
+      const result = await handler.execute(
+        { cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, checkoutSessionId: 'checkout-session-1', lockTtlMs: 600_000 },
+        ctx,
+      )
+
+      expect(result.extended).toBe(true)
+      expect(result.cart.status).toBe('locked')
+      expect(result.cart.checkoutSessionId).toBe('checkout-session-1')
+      expect(result.priceChanges).toEqual([])
+      expect(result.cart.lockExpiresAt!.getTime()).toBeGreaterThan(originalExpiry.getTime())
+      expect(result.cart.lockExpiresAt!.getTime() - Date.now()).toBeLessThanOrEqual(600_000)
+      expect(result.cart.lockExpiresAt!.getTime() - Date.now()).toBeGreaterThan(600_000 - 5_000)
+
+      const cartRow = seededCarts.find((row) => row.id === CART_ID)!
+      expect(cartRow.lockExpiresAt.getTime()).toBe(result.cart.lockExpiresAt!.getTime())
+      // `lockedAt` itself is untouched by an extend — only `lockExpiresAt` moves.
+      expect(cartRow.lockedAt).toEqual(lockedAt)
+
+      // The core guarantee this test exists to prove: an extend re-runs NEITHER the re-price
+      // NOR the visibility pass — `cart.reprice` is never dispatched a second time.
+      expect((commandBus.execute as jest.Mock).mock.calls.filter(([id]) => id === 'cart.reprice')).toHaveLength(0)
+
+      expect(emitCartEventMock).toHaveBeenCalledWith(
+        'cart.lock.extended',
+        expect.objectContaining({ cartId: CART_ID, checkoutSessionId: 'checkout-session-1' }),
+      )
+      expect(emitCartEventMock).not.toHaveBeenCalledWith('cart.lock.acquired', expect.anything())
+    })
+
+    it('an extend with no explicit lockTtlMs falls back to the existing env default, same as a fresh lock', async () => {
+      seededCarts = [
+        makeCartFixture({ status: 'locked', lockedAt: new Date(), lockExpiresAt: new Date(), checkoutSessionId: 'checkout-session-1' }),
+      ]
+      const handler = getHandler<CartLockInput, CartLockResult>('cart.lock')
+      const em = makeEm()
+      const ctx = makeCtx({ em })
+
+      const before = Date.now()
+      const result = await handler.execute(
+        { cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, checkoutSessionId: 'checkout-session-1' },
+        ctx,
+      )
+
+      expect(result.extended).toBe(true)
+      const delta = result.cart.lockExpiresAt!.getTime() - before
+      expect(delta).toBeGreaterThan(resolveCartLockTimeoutMs() - 5_000)
+      expect(delta).toBeLessThanOrEqual(resolveCartLockTimeoutMs() + 5_000)
+    })
+
+    it('rejects an out-of-bounds lockTtlMs on an extend too', async () => {
+      seededCarts = [
+        makeCartFixture({ status: 'locked', checkoutSessionId: 'checkout-session-1' }),
+      ]
+      const handler = getHandler<CartLockInput, CartLockResult>('cart.lock')
+      const em = makeEm()
+      const ctx = makeCtx({ em })
+
+      let captured: unknown
+      try {
+        await handler.execute(
+          { cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, checkoutSessionId: 'checkout-session-1', lockTtlMs: 999_999_999 },
+          ctx,
+        )
+      } catch (err) {
+        captured = err
+      }
+
+      expect(isCrudHttpError(captured)).toBe(true)
+      expect((captured as { status: number }).status).toBe(400)
+      expect((captured as { body?: Record<string, unknown> }).body).toMatchObject({ code: 'invalid_lock_ttl_ms' })
+    })
   })
 })
 
@@ -450,6 +595,45 @@ describe('cart.unlock', () => {
 
     expect(isCrudHttpError(captured)).toBe(true)
     expect((captured as { status: number }).status).toBe(404)
+  })
+
+  // (C1) A matching checkoutSessionId unlocks exactly like the no-session call shape above.
+  it('with a matching checkoutSessionId: clears the lock columns and restores status to active', async () => {
+    seededCarts = [makeCartFixture({ status: 'locked', checkoutSessionId: 'checkout-session-1' })]
+    const handler = getHandler<CartUnlockInput, CartUnlockResult>('cart.unlock')
+    const em = makeEm()
+    const ctx = makeCtx({ em })
+
+    const result = await handler.execute(
+      { cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, checkoutSessionId: 'checkout-session-1' },
+      ctx,
+    )
+
+    expect(result.cart.status).toBe('active')
+    expect(result.cart.checkoutSessionId).toBeNull()
+  })
+
+  // (C1) A stale/mismatched checkoutSessionId cannot unlock a cart another session holds —
+  // uniform 404, same body a non-existent cart would get, so the response discloses nothing.
+  it('with a mismatched checkoutSessionId: refuses with the uniform 404, leaving the cart locked', async () => {
+    seededCarts = [makeCartFixture({ status: 'locked', checkoutSessionId: 'checkout-session-1' })]
+    const handler = getHandler<CartUnlockInput, CartUnlockResult>('cart.unlock')
+    const em = makeEm()
+    const ctx = makeCtx({ em })
+
+    let captured: unknown
+    try {
+      await handler.execute(
+        { cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, checkoutSessionId: 'someone-elses-session' },
+        ctx,
+      )
+    } catch (err) {
+      captured = err
+    }
+
+    expect(isCrudHttpError(captured)).toBe(true)
+    expect((captured as { status: number }).status).toBe(404)
+    expect(seededCarts.find((row) => row.id === CART_ID)!.status).toBe('locked')
   })
 })
 
@@ -509,5 +693,44 @@ describe('cart.markConverted', () => {
 
     expect(isCrudHttpError(captured)).toBe(true)
     expect((captured as { status: number }).status).toBe(404)
+  })
+
+  // (C1) A matching checkoutSessionId converts exactly like the no-session call shape above.
+  it('with a matching checkoutSessionId: sets status to converted and stamps resolvedAt', async () => {
+    seededCarts = [makeCartFixture({ status: 'locked', checkoutSessionId: 'checkout-session-1' })]
+    const handler = getHandler<CartMarkConvertedInput, CartMarkConvertedResult>('cart.markConverted')
+    const em = makeEm()
+    const ctx = makeCtx({ em })
+
+    const result = await handler.execute(
+      { cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, checkoutSessionId: 'checkout-session-1' },
+      ctx,
+    )
+
+    expect(result.cart.status).toBe('converted')
+    expect(result.cart.resolvedAt).toBeInstanceOf(Date)
+  })
+
+  // (C1) A stale/mismatched checkoutSessionId cannot convert a cart another session holds —
+  // uniform 404, so a race loser (or an attacker guessing the cart id) learns nothing.
+  it('with a mismatched checkoutSessionId: refuses with the uniform 404, leaving the cart locked', async () => {
+    seededCarts = [makeCartFixture({ status: 'locked', checkoutSessionId: 'checkout-session-1' })]
+    const handler = getHandler<CartMarkConvertedInput, CartMarkConvertedResult>('cart.markConverted')
+    const em = makeEm()
+    const ctx = makeCtx({ em })
+
+    let captured: unknown
+    try {
+      await handler.execute(
+        { cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, checkoutSessionId: 'someone-elses-session' },
+        ctx,
+      )
+    } catch (err) {
+      captured = err
+    }
+
+    expect(isCrudHttpError(captured)).toBe(true)
+    expect((captured as { status: number }).status).toBe(404)
+    expect(seededCarts.find((row) => row.id === CART_ID)!.status).toBe('locked')
   })
 })

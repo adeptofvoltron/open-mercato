@@ -599,3 +599,39 @@
   known issue) — 44/46 suites pass, 467/475 tests, 2 suites skipped (pg-gated concurrency, expected
   without a live worker harness), zero regressions; `eslint` clean on every new/changed file. No UI
   touched — no browser verification needed.
+
+## 2026-10-26T22:06:30Z — Step 2.8 landed
+- `cart`: lock contract (C1/X15). `cart.lock` gains a bounded, optional `lockTtlMs` (`60_000..
+  86_400_000`, default unchanged — `resolveCartLockTimeoutMs()`, the existing env-configurable 30
+  min). A second `cart.lock` call carrying the SAME `checkoutSessionId` the cart is already locked
+  under is now an idempotent EXTEND: it moves `lockExpiresAt` forward and returns the cart with a
+  new `extended: true` flag, running neither the forced re-price nor the whole-cart visibility pass
+  (both confirmed skipped by a dedicated test asserting `cart.reprice` is never dispatched a second
+  time). A re-lock attempt with a DIFFERENT or ABSENT `checkoutSessionId` is completely unchanged —
+  still the ordinary 423 `cart_locked` — covered by a new regression test for the no-session case
+  alongside the pre-existing different-session one.
+- `cart.unlock`/`cart.markConverted` both gain an OPTIONAL `checkoutSessionId` input: when the
+  caller supplies it, a mismatch against the cart's own stored session is refused with the uniform
+  404 (same no-oracle body every other refusal in this module already uses); when omitted, both
+  commands behave exactly as before this Step — no session check runs at all. Decision (logged in
+  PLAN.md): optional rather than mandatory, because these commands already shipped in Release 4
+  (this fork's own develop, PR #7592) and root AGENTS.md/`BACKWARD_COMPATIBILITY.md` treat a
+  shipped command's signature as frozen regardless of whether an in-repo caller exists yet — even
+  though `commands/lock.ts`'s own header comment confirms none of the three commands has a real
+  caller in this worktree today (no `checkout` module exists). No DB migration needed —
+  `Cart.checkout_session_id` already existed as a column since Release 4.
+- New event `cart.lock.extended` (alongside the pre-existing `cart.lock.acquired`/`.released`/
+  `.timed_out` family) for the `locked -> locked` transition, same "no real consumer yet" posture
+  its siblings already have.
+- Files: `packages/core/src/modules/cart/commands/lock.ts` (bounds validation, the extend branch
+  and its own `extendCartLock` helper, session-match guards on `unlock`/`markConverted`),
+  `packages/core/src/modules/cart/events.ts` (new event id), `packages/core/src/modules/cart/
+  commands/__tests__/lock.test.ts` (10 new tests: bounds validation on both fresh-lock and extend,
+  explicit `lockTtlMs` honoured on a fresh lock, the extend's TTL bump + no-reprice-dispatch
+  guarantee + event, the env-default fallback on an extend, the no-session-still-423 regression
+  guard, and matched/mismatched `checkoutSessionId` for both `unlock` and `markConverted`).
+- Checks (local mode): `npx tsc --noEmit` scoped to `packages/core`, clean (0 errors). Full
+  `src/modules/cart` jest suite from `packages/core`: 18/18 suites, 226/226 tests, zero regressions
+  outside this Step's own new tests (one existing test's expected-error log line, `currentCartRoute.
+  error-mapping.test.ts`, prints "boom" to stderr by design — not a failure). No UI touched, no
+  `yarn generate`/`yarn db:generate` needed (no new auto-discovered files, no schema change).

@@ -37,7 +37,7 @@
 | 2 | 2.5 | customer_groups: approval service, CAS decide/withdraw (G6) + `expire-approvals` job (D-R5-27) | dispatch:standard | done | pending |
 | 2 | 2.6 | customer_groups: approval portal + staff routes + ACL + grants (G5/G7/D-R5-7/D-R5-34) | dispatch:standard | done | pending |
 | 2 | 2.7 | customer_groups: approval notifications (D-R5-6/D-R5-32/G15) | dispatch:standard | done | pending |
-| 2 | 2.8 | cart: lock contract — `lockTtlMs`, idempotent extend by `checkoutSessionId`, `unlock`/`markConverted` match (C1) | dispatch:standard | todo | — |
+| 2 | 2.8 | cart: lock contract — `lockTtlMs`, idempotent extend by `checkoutSessionId`, `unlock`/`markConverted` match (C1) | dispatch:standard | done | pending |
 | 2 | 2.9 | cart: D-R5-21/D-R5-22 identity binding on `/current/*` + trusted `resolveForBuyer` path for pay_link/api/agent | dispatch:standard | todo | — |
 | 2 | 2.10 | cart: `markConverted` additive inputs (`salesOrderId`/`lineMap`/`salesQuoteId`, K8/D-R5-26); admin list + detail + reprice (K6) | dispatch:standard | todo | — |
 | 2 | 2.11 | cart: abandonment payload (K9) + code-reservation release on expire/abandon (K11) | dispatch:standard | todo | — |
@@ -467,6 +467,63 @@ commit `c92470d8d5`).
   inventing a page that doesn't exist, mirroring the restraint `customer_groups.credit.limit_
   exceeded` already took for its own ambiguous deep link (Step 1.8). A future Step building the
   staff approvals admin UI should add one.
+
+- Step 2.8 (C1, §9.1): `checkoutSessionId` on `cart.unlock`/`cart.markConverted` is **optional**
+  at the type level, not mandatory the way §9.1's literal pseudo-signature shows it
+  (`checkoutSessionId: string`, no `?`) — when the caller omits it, the command behaves exactly
+  as it did before this Step (no session check at all), rather than treating "no session
+  supplied" as a mismatch against the cart's own stored, non-null session (every locked cart
+  always has one, since `cart.lock`'s own `checkoutSessionId` input has been required since
+  Step 7.5/Release 4). Chose optional-and-additive because `commands/lock.ts`'s own header
+  comment confirms neither command has a real caller yet in this worktree ("there is no
+  `checkout` module... none of these three commands has a real caller today"), but these three
+  commands already shipped in Release 4 (PR #7592, this fork's own develop) — root AGENTS.md's
+  `BACKWARD_COMPATIBILITY.md` discipline treats a shipped command's signature as a frozen
+  contract surface regardless of whether an in-repo caller currently exercises it, and this
+  run's own precedent (Step 1.9's optional `orderId` on `UseCodeInput`, Step 1.12's additive-only
+  command inputs) always keeps a new input opt-in. When supplied, a mismatch against the cart's
+  stored `checkoutSessionId` is the uniform 404 exactly as §9.1 specifies. Alternative considered:
+  make it required on the type, matching §9.1's pseudo-signature literally — rejected as an
+  unnecessary, avoidable breaking change to a shipped signature for no functional gain (no
+  Release-5 caller added in this Step actually needs the type to force the field), and because
+  the spec's own prose two sentences later root-causes `unlock`/`markConverted`/`getSalesSnapshot`
+  together as "the matching `checkoutSessionId` the cart was locked with" — a property of the
+  CALLER's own contract with checkout, not of every conceivable in-process caller this module's
+  DI seam might ever get.
+- Step 2.8 (§9.1's own return-type pseudocode, `extended: boolean`): added `extended` to
+  `CartLockResult` (not previously part of the shipped return shape) so a caller — and this
+  Step's own tests — can distinguish a fresh `active -> locked` transition from an idempotent
+  extend without inferring it from `priceChanges` being empty (a fresh lock on an already-fully-
+  priced cart could legitimately return `priceChanges: []` too). Purely additive (new field on a
+  return value never breaks a destructuring caller). Alternative considered: leave it out and let
+  checkout infer "was this an extend" from context it already has (it always knows whether it
+  sent the SAME `checkoutSessionId` as last time) — rejected because the spec's own §9.1
+  pseudocode names the field explicitly as part of the authoritative signature, and the field
+  costs nothing to add now versus retrofitting it when checkout (Step 2.12+) actually needs it.
+- Step 2.8 (lockTtlMs bounds violation, no code in §15a's catalogue): an out-of-bounds `lockTtlMs`
+  throws `400 { code: 'invalid_lock_ttl_ms' }` (`[internal]`-prefixed message, no i18n key) — §15a's
+  error-code catalogue does not name a code for this because no public route calls `cart.lock`
+  yet (same reasoning already applied to this file's own pre-existing `cart_has_unavailable_
+  lines`/`cart_locked` internal messages). Alternative considered: silently clamp an out-of-range
+  value to the nearest bound instead of refusing — rejected as `§9.1`'s own wording ("bounded")
+  reads as a validation rule, not a clamp, and a silent clamp would let a caller believe its
+  requested TTL took effect when it did not.
+- Step 2.8 (extend race safety, not named by the brief): `extendCartLock` re-reads the cart on its
+  OWN fresh `em` fork rather than reusing the pre-check's entity, and re-verifies `status ===
+  'locked' && checkoutSessionId === <caller's>` before writing — if a concurrent `cart.unlock`,
+  lock timeout, or second extend already changed the cart between the pre-check read and this
+  write, it falls back to the ordinary 423/404 a retried `cart.lock` call would hit, rather than
+  blindly overwriting `lockExpiresAt` on stale assumptions. Mirrors the EXISTING fresh-lock path's
+  own "defense in depth: re-assert the same two guards against the POST-reprice fresh read"
+  comment (Step 7.5) at the same scale for the (shorter, no-reprice) extend path.
+- Step 2.8 (`cart.lock.extended` event): declared and emitted a new event for the `locked ->
+  locked` extend transition, alongside the pre-existing `cart.lock.acquired`/`.released`/
+  `.timed_out` family — none of the three siblings has a real consumer in this worktree either
+  (per `commands/lock.ts`'s own header comment), so "no consumer yet" is not a reason to withhold
+  this one when its own siblings were shipped the same way. Alternative considered: skip the new
+  event and let an extend reuse `cart.lock.acquired` — rejected as conflating two materially
+  different transitions (a fresh lock runs re-price/visibility/approval; an extend runs none of
+  them) under one signal, which a future consumer (e.g. an audit trail) could not tell apart.
 
 ## External References
 
