@@ -2,12 +2,18 @@ import { z } from 'zod'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import type { CrudCtx } from '@open-mercato/shared/lib/crud/factory'
 import { makeCrudRoute } from '@open-mercato/shared/lib/crud/factory'
-import { badRequest } from '@open-mercato/shared/lib/crud/errors'
+import { CrudHttpError, badRequest } from '@open-mercato/shared/lib/crud/errors'
 import { parseBooleanToken } from '@open-mercato/shared/lib/boolean'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
 import { E } from '#generated/entities.ids.generated'
 import { CustomerCreditAccount } from '../../../data/entities'
-import { customerCreditAccountUpdateSchema } from '../../../data/validators'
+import {
+  customerCreditAccountCreateRequestSchema,
+  customerCreditAccountUpdateSchema,
+  type CustomerCreditAccountCreateRequest,
+} from '../../../data/validators'
+import { findCustomerInScope } from '../../../lib/customerScope'
+import { clearCreateConflictRecheck, registerCreateConflictRecheck } from '../../../lib/createConflictRecheck'
 import type { CustomerCreditService } from '../../../services/customerCreditService'
 
 // Release 5 Phase 3 (Step 1.7). Admin-facing surface over the credit account Step 1.6
@@ -17,11 +23,10 @@ import type { CustomerCreditService } from '../../../services/customerCreditServ
 // encodes (`holdReason` required when `isOnHold = true`, spec §5.4) against the row's
 // resulting state rather than the raw partial payload — see `applyToEntity` below.
 //
-// No create/delete config: account provisioning (G13, D-R5-5) is operator-only and its
-// own route is out of this Step's scope (not in the task's own route list); ledger
-// listing and the `/adjust` command are their own future routes. Omitting `create`/`del`
-// makes `makeCrudRoute` answer POST/DELETE with `501 Not Implemented`, so `route.ts`
-// exports only GET/PUT.
+// Create (Step 1.11, G13/D-R5-5): accounts are provisioned by an operator only, through
+// `POST` below — nothing creates one lazily. No `del` config: Release 5 has no delete
+// route (§9), so `makeCrudRoute` answers DELETE with `501` and `route.ts` does not export
+// it. The ledger listing is its own `[id]/ledger` route; `/adjust` is Step 1.12's.
 //
 // Mirrors `../crud.ts` (`CustomerGroup`) and `memberships/crud.ts` exactly for the shared
 // (non-route) module convention: `route.ts` delegates to this one `makeCrudRoute`
@@ -49,6 +54,7 @@ export type CustomerCreditAccountListQuery = z.infer<typeof customerCreditAccoun
 
 export const customerCreditAccountRouteMetadata = {
   GET: { requireAuth: true, requireFeatures: ['customer_groups.credit.view'] },
+  POST: { requireAuth: true, requireFeatures: ['customer_groups.credit.manage'] },
   PUT: { requireAuth: true, requireFeatures: ['customer_groups.credit.manage'] },
 }
 
@@ -67,6 +73,97 @@ function actorUserIdFromContext(ctx: CrudCtx): string | null {
   return uuidSchema.safeParse(auth.sub).success ? auth.sub : null
 }
 
+type Translate = (key: string, fallback?: string) => string
+
+export const CREDIT_ACCOUNT_EXISTS_CODE = 'credit_account_exists'
+
+function creditAccountExistsError(translate: Translate): CrudHttpError {
+  return new CrudHttpError(409, {
+    error: translate(
+      'customer_groups.errors.credit_account_exists',
+      'A credit account already exists for this customer and currency.',
+    ),
+    code: CREDIT_ACCOUNT_EXISTS_CODE,
+  })
+}
+
+// The organization `makeCrudRoute` writes onto the new row (`orm.orgField`): the
+// caller's selected organization, falling back to their home organization.
+function createTargetOrganizationId(ctx: CrudCtx): string | null {
+  return ctx.selectedOrganizationId ?? ctx.auth?.orgId ?? null
+}
+
+// §5.4: the account's organization is the customer's organization. The factory always
+// writes the caller's target organization, so the customer must live in exactly that
+// organization — otherwise `checkCredit`, scoped by the cart's (= the customer's)
+// organization, could never find the account. A customer outside it reads as "does not
+// exist", the same 400 the membership routes answer, so nothing leaks across orgs.
+async function assertCreditAccountCustomerInTargetOrganization(
+  em: EntityManager,
+  ctx: CrudCtx,
+  customerId: string,
+  translate: Translate,
+): Promise<void> {
+  const tenantId = ctx.auth?.tenantId ?? null
+  const organizationId = createTargetOrganizationId(ctx)
+  const customer = tenantId && organizationId
+    ? await findCustomerInScope(em, customerId, { tenantId, organizationIds: [organizationId] })
+    : null
+  if (customer) return
+  throw badRequest(
+    translate('customer_groups.errors.creditAccountCustomerNotFound', 'The selected customer does not exist in this organization.'),
+  )
+}
+
+// The partial unique index (`tenant_id, organization_id, customer_id, currency_code`
+// where `deleted_at is null`, Step 1.5) is the real guard; this pre-check turns the
+// sequential duplicate into a translated `409 credit_account_exists`, and the
+// `withCreateConflictRecheck` wrapper in `route.ts` re-runs it when a concurrent insert
+// lost the race and the factory answered 500.
+async function assertCreditAccountUnique(
+  em: EntityManager,
+  scope: { tenantId: string; organizationId: string },
+  customerId: string,
+  currencyCode: string,
+  translate: Translate,
+): Promise<void> {
+  const existing = await em.count(CustomerCreditAccount, {
+    tenantId: scope.tenantId,
+    organizationId: scope.organizationId,
+    customerId,
+    currencyCode,
+    deletedAt: null,
+  })
+  if (existing > 0) throw creditAccountExistsError(translate)
+}
+
+export function toCustomerCreditAccountEntityData(
+  input: CustomerCreditAccountCreateRequest,
+  actorUserId: string | null,
+): Record<string, unknown> {
+  const isOnHold = input.isOnHold ?? false
+  return {
+    customerId: input.customerId,
+    currencyCode: input.currencyCode,
+    creditLimit: input.creditLimit.toFixed(2),
+    isOnHold,
+    holdReason: isOnHold ? input.holdReason ?? null : null,
+    updatedByUserId: actorUserId,
+  }
+}
+
+export function serializeCreatedCreditAccount(entity: CustomerCreditAccount) {
+  return {
+    id: entity.id,
+    organizationId: entity.organizationId,
+    customerId: entity.customerId,
+    currencyCode: entity.currencyCode,
+    creditLimit: entity.creditLimit,
+    isOnHold: entity.isOnHold,
+    updatedAt: entity.updatedAt instanceof Date ? entity.updatedAt.toISOString() : null,
+  }
+}
+
 const customerCreditAccountListFields = [
   'id',
   'organization_id',
@@ -82,7 +179,7 @@ const customerCreditAccountListFields = [
 ]
 
 export const customerCreditAccountCrud = makeCrudRoute<
-  RawCustomerCreditAccountInput,
+  CustomerCreditAccountCreateRequest,
   RawCustomerCreditAccountInput,
   CustomerCreditAccountListQuery
 >({
@@ -131,6 +228,12 @@ export const customerCreditAccountCrud = makeCrudRoute<
     // terms currently disallow purchase-on-account, `checkCredit` short-circuits before
     // summing the ledger and reports `exposure: null` even though the account's true
     // exposure may be nonzero — a historical account whose group's terms later changed.
+  },
+  create: {
+    schema: customerCreditAccountCreateRequestSchema,
+    mapToEntity: (input, ctx) =>
+      toCustomerCreditAccountEntityData(input, actorUserIdFromContext(ctx)),
+    response: (entity) => serializeCreatedCreditAccount(entity as CustomerCreditAccount),
   },
   update: {
     schema: rawBodySchema,
@@ -183,6 +286,28 @@ export const customerCreditAccountCrud = makeCrudRoute<
     response: () => ({ ok: true }),
   },
   hooks: {
+    beforeCreate: async (parsed, ctx) => {
+      const tenantId = ctx.auth?.tenantId ?? null
+      const organizationId = createTargetOrganizationId(ctx)
+      const em = (ctx.container.resolve('em') as EntityManager).fork()
+      const { translate } = await resolveTranslations()
+      await assertCreditAccountCustomerInTargetOrganization(em, ctx, parsed.customerId, translate)
+      if (!tenantId || !organizationId) return
+      const scope = { tenantId, organizationId }
+      await assertCreditAccountUnique(em, scope, parsed.customerId, parsed.currencyCode, translate)
+      registerCreateConflictRecheck(ctx.request, () =>
+        assertCreditAccountUnique(
+          (ctx.container.resolve('em') as EntityManager).fork(),
+          scope,
+          parsed.customerId,
+          parsed.currencyCode,
+          translate,
+        ),
+      )
+    },
+    afterCreate: async (_entity, ctx) => {
+      clearCreateConflictRecheck(ctx.request)
+    },
     afterList: async (res, ctx) => {
       const payload = res as { items?: unknown[] }
       const items = Array.isArray(payload.items) ? payload.items : []

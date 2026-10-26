@@ -28,7 +28,7 @@
 | 1 | 1.8 | customer_groups: credit notifications + exposure-audit job + cancel-release subscriber (D-R5-2/G15/G21) | dispatch:standard | done | pending |
 | 1 | 1.9 | promotions: `revertCodeUse` + `sales.order.cancelled` subscriber (C5) | dispatch:standard | done | pending |
 | 1 | 1.10 | promotions: un-hide `delivery_method` rule + `DELIVERY_DISCOUNT` effect (D-R5-17) | dispatch:standard | done | pending |
-| 1 | 1.11 | customer_groups: admin credit-account provisioning route + ledger-listing read route (G13/D-R5-5 gap-fill) | dispatch:standard | todo | — |
+| 1 | 1.11 | customer_groups: admin credit-account provisioning route + ledger-listing read route (G13/D-R5-5 gap-fill) | dispatch:standard | done | pending |
 | 1 | 1.12 | customer_groups: admin credit-account `/adjust` command route (G13/G20/D-R5-2 gap-fill) | dispatch:standard | todo | — |
 | 2 | 2.1 | availability: `AvailabilityReservation` entity + migration (A3) | dispatch:standard | todo | — |
 | 2 | 2.2 | availability: reserve/release/commit via `wmsReservationService`, CAS, per-line outcomes, allocation (A6/A7/A14/A15) | dispatch:standard | todo | — |
@@ -140,6 +140,26 @@ commit `c92470d8d5`).
   leave it out and let a multi-currency fixed delivery discount pass validation silently — rejected
   as reintroducing the exact bug class D-R4-27 exists to close, for no stated reason to treat this
   benefit type differently from its closest sibling.
+- Step 1.11 (G13/D-R5-5): `creditLimit` is **required** on `POST …/credit-accounts`, not optional
+  with a server-side fallback to the group's `default_credit_limit`. D-R5-5/§5.3 say the default
+  "only pre-fills the account form" and "never creates an account by itself", and
+  `customerGroupsService.resolveTerms` does not resolve `default_credit_limit`/`credit_currency_code`
+  at all (only its five scalar fields), so a server fallback would have needed a new inheritance
+  path for one convenience. The form pre-fill from the resolved group default belongs with the
+  D-R5-5 "missing accounts" banner (`GET …/credit-accounts/missing`, US-E2), which no Step yet
+  names; the create dialog shipped here starts empty. Alternative considered: optional
+  `creditLimit` resolved server-side from terms — rejected as contradicting the spec's own wording.
+- Step 1.11 (§5.4): the account's `organization_id` must be the customer's organization, but
+  `makeCrudRoute` always writes the caller's selected (else home) organization. Chose to refuse
+  (400, "customer does not exist in this organization") a create whose customer lives in any other
+  organization rather than writing an account `checkCredit` could never find. Alternative
+  considered: a hand-written POST that writes the customer's organization — rejected as leaving
+  the module's `makeCrudRoute` convention for an edge an operator fixes by switching organization.
+- Step 1.11 (§9.2): the `409` body is `{ error: <translated message>, code: 'credit_account_exists' }`
+  — the module's existing conflict shape plus a machine code, the same `code` field the
+  optimistic-lock 409 carries — rather than `{ error: 'credit_account_exists' }` literally, so
+  `createCrud`'s error surfacing shows a readable message. Alternative considered: the literal spec
+  shape — rejected because every other `customer_groups` error body carries a message in `error`.
 
 ## External References
 

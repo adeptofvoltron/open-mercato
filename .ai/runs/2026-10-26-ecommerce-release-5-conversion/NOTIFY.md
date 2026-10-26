@@ -144,3 +144,25 @@
   not skipped silently; logged in checkpoint-2-checks.md.
 - Decisions/problems: two gap-fill Steps appended (1.11 credit-account provisioning, 1.12
   manual /adjust settlement) — both logged in PLAN.md's "Decisions taken without the owner".
+
+## 2026-10-26T18:00:00Z — Step 1.11 landed
+- Rescue attempt: the first executor for this Step failed mid-implementation on a provider rate
+  limit; nothing had been committed, so no code was lost. This is an infrastructure retry on the
+  next tier up, not a quality escalation.
+- `customer_groups`: `POST /api/customer_groups/customer-groups/credit-accounts` (operator
+  provisioning, `credit.manage`, `.strict()` body `{ customerId, currencyCode, creditLimit,
+  isOnHold?, holdReason? }`) on the existing `makeCrudRoute` instance; duplicate customer+currency
+  answers `409` with `code: credit_account_exists` (pre-check plus `withCreateConflictRecheck` for
+  the concurrent race against the Step 1.5 partial unique index). `GET …/credit-accounts/:id/ledger`
+  (`credit.view`, newest first, `pageSize ≤ 100`, `note` decrypted via
+  `findAndCountWithDecryption`, account looked up inside the caller's organization scope — foreign
+  ids answer 404). Credit panel widget: "Create credit account" dialog (gated by `credit.manage`)
+  and a per-account read-only ledger toggle with prev/next paging.
+- `creditLimit` is required (no server-side `default_credit_limit` fallback); a create for a
+  customer outside the caller's selected organization answers 400. Both logged in PLAN.md
+  "Decisions taken without the owner".
+- Not in this Step: `GET …/credit-accounts/missing` (the D-R5-5 banner, US-E2) and the form pre-fill
+  from the group default that rides on it — no Step names them yet; worth a gap-fill decision
+  before Phase 6. TC-CGRP-032's ledger rows are inserted through `pg` with plaintext notes (no
+  ledger-writing route exists until Step 1.12), so ciphertext decryption on that route is first
+  exercised end to end once `/adjust` writes notes through the ORM.

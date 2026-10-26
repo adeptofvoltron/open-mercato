@@ -297,6 +297,42 @@ export const customerCreditAccountCreateSchema = customerCreditAccountCreateBase
 
 export type CustomerCreditAccountCreateInput = z.infer<typeof customerCreditAccountCreateSchema>
 
+// Release 5 Phase 3 (Step 1.11, G13/D-R5-5): the operator-facing body of
+// `POST …/credit-accounts`. Tenant, organization and `updatedByUserId` come from the
+// session, never the body, so the body is `.strict()` and rejects them. `creditLimit` is
+// required: `default_credit_limit` only pre-fills the form (D-R5-5) and is never applied
+// by the server. Money accepts a JSON number or a decimal string with up to 2 places.
+const creditLimitInputSchema = z
+  .union([
+    z.number(),
+    z.string().trim().regex(/^\d+(\.\d{1,2})?$/).transform((value) => Number(value)),
+  ])
+  .pipe(z.number().finite().min(0).max(NUMERIC_16_2_MAX))
+
+export const customerCreditAccountCreateRequestBaseSchema = z
+  .object({
+    customerId: uuid(),
+    currencyCode: z.string().trim().toUpperCase().regex(/^[A-Z]{3}$/),
+    creditLimit: creditLimitInputSchema,
+    isOnHold: z.boolean().optional(),
+    holdReason: clearableStringSchema(2000),
+  })
+  .strict()
+
+export const customerCreditAccountCreateRequestSchema = customerCreditAccountCreateRequestBaseSchema.refine(
+  creditAccountHoldReasonRequiredWhenOnHold,
+  { message: 'holdReason is required when isOnHold is true', path: ['holdReason'] },
+)
+
+export type CustomerCreditAccountCreateRequest = z.infer<typeof customerCreditAccountCreateRequestSchema>
+
+export const customerCreditLedgerListQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(20),
+})
+
+export type CustomerCreditLedgerListQuery = z.infer<typeof customerCreditLedgerListQuerySchema>
+
 const customerCreditAccountUpdateBaseSchema = z
   .object({
     id: uuid(),

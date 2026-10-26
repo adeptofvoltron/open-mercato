@@ -1,14 +1,15 @@
 "use client"
 
 import * as React from 'react'
-import { CreditCard, Pencil } from 'lucide-react'
+import { CreditCard, History, Pencil, Plus } from 'lucide-react'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
-import { updateCrud } from '@open-mercato/ui/backend/utils/crud'
+import { createCrud, updateCrud } from '@open-mercato/ui/backend/utils/crud'
 import { createCrudFormError } from '@open-mercato/ui/backend/utils/serverErrors'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { ErrorMessage, LoadingMessage } from '@open-mercato/ui/backend/detail'
 import { IconButton } from '@open-mercato/ui/primitives/icon-button'
+import { Button } from '@open-mercato/ui/primitives/button'
 import { EmptyState } from '@open-mercato/ui/primitives/empty-state'
 import { StatusBadge, type StatusBadgeVariant, type StatusMap } from '@open-mercato/ui/primitives/status-badge'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@open-mercato/ui/primitives/dialog'
@@ -36,6 +37,48 @@ type CreditAccountRow = {
   exposure: string | null
   available: string | null
   updatedAt: string | null
+}
+
+type CreditAccountCreateFormValues = {
+  currencyCode: string
+  creditLimit: number
+}
+
+type CreditLedgerEntryRow = {
+  id: string
+  entryType: string
+  amount: string
+  balanceAfter: string
+  note: string | null
+  createdAt: string | null
+}
+
+type CreditLedgerPage = {
+  items: CreditLedgerEntryRow[]
+  page: number
+  totalPages: number
+}
+
+const LEDGER_PAGE_SIZE = 20
+function useLedgerEntryTypeLabel(): (entryType: string) => string {
+  const t = useT()
+  return React.useCallback(
+    (entryType: string) => {
+      switch (entryType) {
+        case 'reserve':
+          return t('customer_groups.groups.creditTab.ledger.type.reserve', 'Reserve')
+        case 'release':
+          return t('customer_groups.groups.creditTab.ledger.type.release', 'Release')
+        case 'settle':
+          return t('customer_groups.groups.creditTab.ledger.type.settle', 'Settle')
+        case 'adjust':
+          return t('customer_groups.groups.creditTab.ledger.type.adjust', 'Adjustment')
+        default:
+          return entryType
+      }
+    },
+    [t],
+  )
 }
 
 type CreditAccountFormValues = {
@@ -111,6 +154,123 @@ function mapCreditAccountItems(items: unknown): CreditAccountRow[] {
   }, [])
 }
 
+function mapLedgerEntry(item: unknown): CreditLedgerEntryRow | null {
+  if (!item || typeof item !== 'object') return null
+  const record = item as Record<string, unknown>
+  const id = readStringField(record, 'id', 'id')
+  if (!id) return null
+  return {
+    id,
+    entryType: readStringField(record, 'entryType', 'entry_type'),
+    amount: readStringField(record, 'amount', 'amount') || '0.00',
+    balanceAfter: readStringField(record, 'balanceAfter', 'balance_after') || '0.00',
+    note: readNullableStringField(record, 'note', 'note'),
+    createdAt: readNullableStringField(record, 'createdAt', 'created_at'),
+  }
+}
+
+// Read-only (§5.5, US-E1): the ledger is append-only, so there is no row action here.
+function CreditLedgerList({ accountId }: { accountId: string }) {
+  const t = useT()
+  const entryTypeLabel = useLedgerEntryTypeLabel()
+  const [page, setPage] = React.useState(1)
+  const [ledger, setLedger] = React.useState<CreditLedgerPage | null>(null)
+  const [loading, setLoading] = React.useState(false)
+  const [error, setError] = React.useState<string | null>(null)
+
+  React.useEffect(() => {
+    let cancelled = false
+    const loadLedger = async () => {
+      setLoading(true)
+      setError(null)
+      try {
+        const res = await apiCall<{ items?: unknown[]; page?: number; totalPages?: number }>(
+          `/api/customer_groups/customer-groups/credit-accounts/${encodeURIComponent(accountId)}/ledger?page=${page}&pageSize=${LEDGER_PAGE_SIZE}`,
+        )
+        if (!res.ok || !res.result) throw new Error('[internal] credit ledger')
+        const items = Array.isArray(res.result.items)
+          ? res.result.items.reduce<CreditLedgerEntryRow[]>((acc, item) => {
+            const entry = mapLedgerEntry(item)
+            if (entry) acc.push(entry)
+            return acc
+          }, [])
+          : []
+        if (!cancelled) {
+          setLedger({
+            items,
+            page: typeof res.result.page === 'number' ? res.result.page : page,
+            totalPages: typeof res.result.totalPages === 'number' ? res.result.totalPages : 1,
+          })
+        }
+      } catch {
+        if (!cancelled) setError(t('customer_groups.groups.creditTab.ledger.errors.load', 'Failed to load the ledger.'))
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+    loadLedger()
+    return () => {
+      cancelled = true
+    }
+  }, [accountId, page, t])
+
+  if (loading && !ledger) {
+    return <LoadingMessage label={t('customer_groups.groups.creditTab.ledger.loading', 'Loading ledger…')} />
+  }
+  if (error) return <ErrorMessage label={error} />
+  if (!ledger || ledger.items.length === 0) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        {t('customer_groups.groups.creditTab.ledger.empty', 'No ledger entries yet.')}
+      </p>
+    )
+  }
+
+  return (
+    <div className="space-y-2">
+      <ul className="divide-y divide-border text-xs" aria-label={t('customer_groups.groups.creditTab.ledger.title', 'Ledger')}>
+        {ledger.items.map((entry) => (
+          <li key={entry.id} className="grid grid-cols-4 gap-2 py-1">
+            <span className="text-muted-foreground">
+              {entry.createdAt ? new Date(entry.createdAt).toLocaleString() : '—'}
+            </span>
+            <span className="text-foreground">
+              {entryTypeLabel(entry.entryType)}
+            </span>
+            <span className="text-foreground">{entry.amount}</span>
+            <span className="text-muted-foreground">
+              {t('customer_groups.groups.creditTab.ledger.balanceAfter', 'Balance after')}: {entry.balanceAfter}
+            </span>
+            {entry.note ? <span className="col-span-4 text-muted-foreground">{entry.note}</span> : null}
+          </li>
+        ))}
+      </ul>
+      {ledger.totalPages > 1 ? (
+        <div className="flex items-center justify-end gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={loading || ledger.page <= 1}
+            onClick={() => setPage((current) => Math.max(1, current - 1))}
+          >
+            {t('customer_groups.groups.creditTab.ledger.previous', 'Previous')}
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={loading || ledger.page >= ledger.totalPages}
+            onClick={() => setPage((current) => current + 1)}
+          >
+            {t('customer_groups.groups.creditTab.ledger.next', 'Next')}
+          </Button>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
 function CreditAccountRowItem({
   row,
   canManage,
@@ -121,6 +281,7 @@ function CreditAccountRowItem({
   onEdit: (row: CreditAccountRow) => void
 }) {
   const t = useT()
+  const [ledgerOpen, setLedgerOpen] = React.useState(false)
   const holdStatus: 'onHold' | 'active' = row.isOnHold ? 'onHold' : 'active'
   const holdLabel = t(
     row.isOnHold ? 'customer_groups.groups.creditTab.status.onHold' : 'customer_groups.groups.creditTab.status.active',
@@ -156,18 +317,38 @@ function CreditAccountRowItem({
             </div>
           ) : null}
         </div>
-        {canManage ? (
+        <div className="flex items-center gap-1">
           <IconButton
             type="button"
             variant="ghost"
             size="xs"
-            aria-label={t('customer_groups.groups.creditTab.edit', 'Edit credit account')}
-            onClick={() => onEdit(row)}
+            aria-label={t(
+              ledgerOpen ? 'customer_groups.groups.creditTab.ledger.hide' : 'customer_groups.groups.creditTab.ledger.show',
+              ledgerOpen ? 'Hide ledger' : 'Show ledger',
+            )}
+            aria-expanded={ledgerOpen}
+            onClick={() => setLedgerOpen((current) => !current)}
           >
-            <Pencil className="size-4" aria-hidden />
+            <History className="size-4" aria-hidden />
           </IconButton>
-        ) : null}
+          {canManage ? (
+            <IconButton
+              type="button"
+              variant="ghost"
+              size="xs"
+              aria-label={t('customer_groups.groups.creditTab.edit', 'Edit credit account')}
+              onClick={() => onEdit(row)}
+            >
+              <Pencil className="size-4" aria-hidden />
+            </IconButton>
+          ) : null}
+        </div>
       </div>
+      {ledgerOpen ? (
+        <div className="mt-2 border-t border-border pt-2">
+          <CreditLedgerList accountId={row.id} />
+        </div>
+      ) : null}
     </li>
   )
 }
@@ -177,6 +358,8 @@ export function CreditPanelWidget({ context }: InjectionWidgetComponentProps<unk
   const { payload: backendChromePayload, isReady: backendChromeReady } = useBackendChrome()
   const canManage = backendChromeReady && hasFeature(backendChromePayload?.grantedFeatures, CREDIT_MANAGE_FEATURE)
   const editDialogContentRef = React.useRef<HTMLDivElement | null>(null)
+  const createDialogContentRef = React.useRef<HTMLDivElement | null>(null)
+  const [createOpen, setCreateOpen] = React.useState(false)
   const [accounts, setAccounts] = React.useState<CreditAccountRow[]>([])
   const [loading, setLoading] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
@@ -295,10 +478,74 @@ export function CreditPanelWidget({ context }: InjectionWidgetComponentProps<unk
     onCancel: closeEditDialog,
   })
 
+  const createFields = React.useMemo<CrudField[]>(
+    () => [
+      {
+        id: 'currencyCode',
+        label: t('customer_groups.groups.creditTab.field.currency', 'Currency'),
+        type: 'text',
+        required: true,
+      },
+      {
+        id: 'creditLimit',
+        label: t('customer_groups.groups.creditTab.field.limit', 'Limit'),
+        type: 'number',
+        required: true,
+      },
+    ],
+    [t],
+  )
+
+  const closeCreateDialog = React.useCallback(() => setCreateOpen(false), [])
+
+  const handleCreateSubmit = React.useCallback(
+    async (values: CreditAccountCreateFormValues) => {
+      if (!customerId) return
+      const currencyCode = typeof values.currencyCode === 'string' ? values.currencyCode.trim().toUpperCase() : ''
+      if (!/^[A-Z]{3}$/.test(currencyCode)) {
+        const message = t('customer_groups.groups.creditTab.errors.currencyInvalid', 'Enter a 3-letter currency code.')
+        throw createCrudFormError(message, { currencyCode: message })
+      }
+      const creditLimit = Number(values.creditLimit)
+      if (!Number.isFinite(creditLimit) || creditLimit < 0) {
+        const message = t('customer_groups.groups.creditTab.errors.limitInvalid', 'Enter a limit of zero or more.')
+        throw createCrudFormError(message, { creditLimit: message })
+      }
+      await createCrud(
+        'customer_groups/customer-groups/credit-accounts',
+        { customerId, currencyCode, creditLimit },
+        {
+          errorMessage: t('customer_groups.groups.creditTab.errors.createFailed', 'Failed to create the credit account.'),
+        },
+      )
+      setCreateOpen(false)
+      flash(t('customer_groups.groups.creditTab.created', 'Credit account created.'), 'success')
+      await load()
+    },
+    [customerId, load, t],
+  )
+
+  const submitCreateForm = React.useCallback(
+    () => createDialogContentRef.current?.querySelector('form')?.requestSubmit(),
+    [],
+  )
+  const handleCreateDialogKeyDown = useDialogKeyHandler({
+    onConfirm: submitCreateForm,
+    onCancel: closeCreateDialog,
+  })
+
   if (!customerId) return null
 
   return (
     <div className="space-y-3">
+      {canManage ? (
+        <div className="flex justify-end">
+          <Button type="button" variant="outline" size="sm" onClick={() => setCreateOpen(true)}>
+            <Plus className="size-4" aria-hidden />
+            {t('customer_groups.groups.creditTab.create', 'Create credit account')}
+          </Button>
+        </div>
+      ) : null}
       {loading ? (
         <LoadingMessage label={t('customer_groups.groups.creditTab.loading', 'Loading credit account…')} />
       ) : error ? (
@@ -322,6 +569,28 @@ export function CreditPanelWidget({ context }: InjectionWidgetComponentProps<unk
           ))}
         </ul>
       )}
+
+      <Dialog
+        open={createOpen}
+        onOpenChange={(next) => {
+          if (!next) setCreateOpen(false)
+        }}
+      >
+        <DialogContent ref={createDialogContentRef} onKeyDown={handleCreateDialogKeyDown}>
+          <DialogHeader>
+            <DialogTitle>{t('customer_groups.groups.creditTab.createDialog.title', 'Create credit account')}</DialogTitle>
+          </DialogHeader>
+          {createOpen ? (
+            <CrudForm<CreditAccountCreateFormValues>
+              embedded
+              fields={createFields}
+              initialValues={{ currencyCode: '', creditLimit: 0 }}
+              submitLabel={t('customer_groups.groups.creditTab.createDialog.submit', 'Create')}
+              onSubmit={handleCreateSubmit}
+            />
+          ) : null}
+        </DialogContent>
+      </Dialog>
 
       <Dialog
         open={editingAccount != null}
