@@ -20,7 +20,7 @@
 | 0 | 0.1 | Run folder scaffold (this commit) | inline | todo | — |
 | 1 | 1.1 | shared: trusted command-context helper (X10) | dispatch:standard | done | 97e128cd49 |
 | 1 | 1.2 | ecommerce: `storeContextService.resolveForBuyer` (D-R5-22, SPEC-029) | dispatch:standard | done | 8ceb5e42ce |
-| 1 | 1.3 | wms: extract `wmsReservationService` (A1) | dispatch:standard | todo | — |
+| 1 | 1.3 | wms: extract `wmsReservationService` (A1) | dispatch:standard | done | pending |
 | 1 | 1.4 | availability: Phase 2 alignment — shared sellable builder (A2) | dispatch:standard | todo | — |
 | 1 | 1.5 | customer_groups: credit entities + migration + new `CustomerGroupTerms` columns | dispatch:standard | todo | — |
 | 1 | 1.6 | customer_groups: credit service, row-lock reserve/release/settle + N=20 test (G1/G2/G12/G14) | dispatch:standard | todo | — |

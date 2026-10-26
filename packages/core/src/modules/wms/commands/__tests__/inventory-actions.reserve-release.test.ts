@@ -10,6 +10,7 @@ import {
   ProductInventoryProfile,
   Warehouse,
 } from '../../data/entities'
+import { WmsReservationService } from '../../lib/wmsReservationService'
 
 jest.mock('@open-mercato/shared/lib/i18n/server', () => ({
   resolveTranslations: async () => ({
@@ -67,12 +68,23 @@ function createEm() {
   return em
 }
 
+// A1 extraction (`.ai/specs/analysis/ANALYSIS-2026-10-26-availability-release-5.md`):
+// `wms.inventory.reserve`/`.release` now resolve their core logic from the
+// `wmsReservationService` DI token (`commands/inventory-actions.ts`'s thin
+// wrappers) instead of running it inline, so the fake container here must be
+// able to resolve it too — same shape as the existing `em`/`dataEngine` stubs.
+// A real `WmsReservationService` instance is used (not a mock) because this
+// suite's whole point is to exercise that service's reserve/release logic
+// through the command, unchanged.
+const wmsReservationService = new WmsReservationService()
+
 function createCtx(em: ReturnType<typeof createEm>) {
   return {
     container: {
       resolve: (name: string) => {
         if (name === 'em') return em
         if (name === 'dataEngine') return {}
+        if (name === 'wmsReservationService') return wmsReservationService
         throw new Error(`Unexpected resolve: ${name}`)
       },
     },
