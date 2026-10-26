@@ -268,7 +268,7 @@ All 13 surfaces were checked. Phase 3 is additive if built as recommended.
 
 ### Before Implementation (Must Do)
 
-1. **Owner decisions:**
+1. **Owner decisions — taken 2026-10-26, see `ANALYSIS-2026-10-26-ecommerce-release-5-decisions.md` (D-R5-8 commit at document creation, D-R5-9 backorder holds sellable, D-R5-10 not undoable):**
    - A5: commit point (recommend at document creation);
    - A6: backorder line holding;
    - A14: undoable or counter-action commands.

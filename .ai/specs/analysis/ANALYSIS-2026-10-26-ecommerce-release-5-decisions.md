@@ -21,3 +21,13 @@ Source: `ANALYSIS-2026-10-26-customer-groups-release-5.md`, findings G4, G5, G7,
 ### Still open from the same analysis
 
 None of the owner decisions remain. The non-decision fixes (G1–G3, G6, G11, G12, G14, G17–G23, G25, G26) go straight into the spec revision pass.
+
+## Availability Phase 3 (2026-10-26)
+
+Source: `ANALYSIS-2026-10-26-availability-release-5.md`, findings A5, A6, A14. Walked through one decision at a time.
+
+| Id | Finding | Decision | Consequence for the specs |
+|---|---|---|---|
+| D-R5-8 | A5, A8 | **Commit at document creation.** Checkout runs `availability.commit` right after step 4 creates the order, before payment. The checkout hold becomes an `order` reservation, which nothing expires. A failed or abandoned payment is compensated by cancelling the order, and `wms` already releases `order` holds on `sales.order.cancelled`. Because commit always precedes confirmation, the §4.4 confirmed-first path leaves the checkout flow; it is kept only for integrators who confirm first. `commit` and the expiry sweep transition the hold by CAS on `status = 'active'`. A commit that still loses tries one fresh reserve and, on shortfall, raises `stock_lost_after_payment` for ops. | availability §4.1, §4.4, §7 (timeline: hold from submit to document, then order hold until payment or cancel), §10; checkout §7.2 (commit moves from steps 7/8 to after step 4), §7.3 (payment-failure compensation = cancel order, which releases stock), R3 |
+| D-R5-9 | A6 | **Backorder holds what is sellable.** A backorder-enabled line holds `min(requested, sellable)` and admits the rest as backorder with nothing held. The per-line result carries `heldQuantity` and `backorderQuantity`. Lines that are not stock-managed (or any line when `wms` is absent) return `not_tracked`, and preorder lines before `releaseAt` return `preorder`. Both hold nothing and do not fail the reserve. `reserved` is true when no line has a shortfall. | availability §4.1 (per-line `outcome`), §12; checkout §7.2 step 2 (abort only on `shortfall` lines), checkout Open Question 2 narrowed to non-backorder partial fulfilment |
+| D-R5-10 | A14 | **Not undoable.** `availability.reserve`, `.release` and `.commit` are registered with `isUndoable: false`, like `wms.inventory.reserve/release`. They are audited, and reversal is an explicit counter-action: release with a reason, or the checkout compensation table (§7.3). No audit-log Undo can return a committed order hold to `checkout` or release stock under a live session. | availability Reconciliation note, §4.1, §16 (command-pattern row), §17 US-D2 |
