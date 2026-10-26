@@ -193,7 +193,7 @@ There is no "Migration & Backward Compatibility" section; §12's BC row covers i
 
 ### Before Implementation (Must Do)
 
-1. **Owner decisions — S2 = (a), D-R5-13; S11 = re-author as the original author, D-R5-14 (both 2026-10-26). Still open: the phase scope.**
+1. **Owner decisions — S2 = (a), D-R5-13; S11 = re-author as the original author, D-R5-14 (both 2026-10-26). Phase scope decided by D-R5-15 (as recommended, full console) and D-R5-16 (Phase 4 in, `lineMap` mandatory).**
    - the phase scope below;
    - S2: identified-buyer binding, (a), (b) or (c);
    - S11: Q1 re-author default or supersede-only.
