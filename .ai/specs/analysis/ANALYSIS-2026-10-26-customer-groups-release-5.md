@@ -337,7 +337,7 @@ Each item: problem, then the concrete fix.
 
 ### Before Implementation (Must Do)
 
-1. **Owner decisions:**
+1. **Owner decisions — taken 2026-10-26, see `ANALYSIS-2026-10-26-ecommerce-release-5-decisions.md` (D-R5-1…7):**
    - G4/G5: who approves (buyer side, merchant side, or both);
    - G7: settlement trigger;
    - G8: line-level re-approval or amount only;

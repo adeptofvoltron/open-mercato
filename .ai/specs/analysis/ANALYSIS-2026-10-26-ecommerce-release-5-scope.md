@@ -37,7 +37,7 @@ Phase A pay links keep their existing path end to end (checkout spec §2): a `Ch
 | Step | State |
 |---|---|
 | Branch and fork PR | done |
-| Pre-implement analysis: customer groups F3–F4 | pending |
+| Pre-implement analysis: customer groups F3–F4 | done (2026-10-26) — `ANALYSIS-2026-10-26-customer-groups-release-5.md` (G1–G26); owner decisions D-R5-1…7 in `ANALYSIS-2026-10-26-ecommerce-release-5-decisions.md` |
 | Pre-implement analysis: availability F3 | pending |
 | Pre-implement analysis: cart F4 | pending |
 | Pre-implement analysis: checkout B.1–B.5 | pending |
