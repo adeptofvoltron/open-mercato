@@ -3067,3 +3067,10 @@ a throwaway `/tmp/seed-release5.mjs` outside the repo) — `git status --short` 
 **Recommendation:** re-run this browser-QA pass once the machine is under lighter load; the
 seeding plan above is ready to execute as soon as the dev server stays responsive long enough
 for Playwright to drive it.
+- Completion checklist finished: PR #16's description rewritten (scope, waves, gates, deviations
+  including the D-R5-23 quote-channel approval-gate scope limitation, the UI-QA machine-
+  contention gap, and the real useCode bug fixed during review), PR flipped from draft to ready
+  (`gh pr ready 16 --repo adeptofvoltron/open-mercato`, confirmed `isDraft: false`, no labels/
+  assignees to release — this run never held a claim lock since PR #16 was reused per the
+  brief's own override, not claimed via the normal auto-skill flow). HANDOFF.md rewritten to
+  reflect the finished state. Run complete.
