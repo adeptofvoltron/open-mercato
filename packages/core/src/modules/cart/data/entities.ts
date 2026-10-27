@@ -69,6 +69,7 @@ export class Cart {
     | 'promotionEffects'
     | 'requiresApproval'
     | 'approvalId'
+    | 'awaitingApprovalSince'
     | 'note'
     | 'metadata'
     | 'grandTotalGrossAmount'
@@ -204,9 +205,20 @@ export class Cart {
   @Property({ name: 'requires_approval', type: 'boolean', default: false })
   requiresApproval: boolean = false
 
-  /** `customer_groups.CustomerPurchaseApproval.id` (not yet a real entity in this repo). */
+  /** `customer_groups.CustomerPurchaseApproval.id`. */
   @Property({ name: 'approval_id', type: 'uuid', nullable: true })
   approvalId?: string | null
+
+  // (rev 10 — K5, §9a.4/§9a.5) Set by `cart.approval.request` the moment a NEW approval
+  // is created; cleared by the §9a.5 subscriber on a terminal `customer_groups.approval.*`
+  // event (approved/rejected/expired/withdrawn), or directly by a cart-initiated
+  // withdrawal (merge source, expire, purge) in the SAME write as the lifecycle
+  // transition. `approval_id` itself is NEVER touched by any of that clearing — only a
+  // fresh `cart.approval.request` call ever moves it (§9a.4: "Only one approval is
+  // authoritative... An older approved approval that still names this cart as its subject
+  // is never read"). `mark-abandoned-carts` skips every basket with this column set (K5).
+  @Property({ name: 'awaiting_approval_since', type: Date, nullable: true })
+  awaitingApprovalSince?: Date | null
 
   // Buyer-supplied free text; encrypted at rest alongside email.
   @Property({ name: 'note', type: 'text', nullable: true })

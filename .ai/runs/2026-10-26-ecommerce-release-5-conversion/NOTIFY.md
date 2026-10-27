@@ -1212,3 +1212,87 @@ payment methods listing)
   absolute proof — if a later Step's own typecheck disagrees with a prior checkpoint's result for
   the same committed tree, trust the fresh run and fix forward, as done here, rather than assuming
   the fresh run is wrong.
+
+## 2026-10-27T22:45:00Z — Step 3.2 landed (cart: request-approval route + K3/K4/K5/K7 lifecycle wiring)
+
+- `commands/approval.ts` (new): `cart.approval.request` — the ONLY way a cart's approval is
+  created (§9a.4). Local `loadMutableCart` (same shape as `commands/promotions.ts`'s own):
+  `423 cart_locked` → `409 cart_not_active` → abandoned-reactivates. Then K4's guest refusal
+  (`409 approval_requires_identified_buyer`), the soft-resolved `customerPurchaseApprovalService`
+  (`503` when absent), a fresh `resolveCartRequiresApproval` recompute, and §9a.4 step 2's
+  "an already-qualifying current approval is ALSO `approval_not_required`" rule (reuses the
+  new `lib/approvalGate.ts#approvalQualifies` shared formula — see PLAN.md's own decision for
+  why `cart.lock` was refactored onto the same helper). Step 3: a still-pending, still-covering
+  approval returns as-is (idempotent, G8 is the service's authority); a stale pending one is
+  withdrawn FIRST (REQUESTER actor, `withdrawnReason: 'requester'`, not the `system` actor the
+  lifecycle sweepers use) before a fresh `requestApproval` call. Writes `approvalId`/
+  `awaitingApprovalSince` in one `withAtomicFlush`, emits `cart.cart.updated` + (only on a
+  genuinely new approval) `cart.approval.requested` with the full 8-field §11 payload (see
+  PLAN.md's K7 decision — the brief's own 6-field paraphrase is stale against the revised spec).
+- `api/current/request-approval/route.ts` (new): structurally identical to `current/undo-merge/
+  route.ts` — empty `.strict()` body, standard optimistic-lock + mutation-guard + `CART_MUTATE`
+  rate limit, `buildCartResponseEnvelope` re-read on success. Did NOT wire the generic
+  `Idempotency-Key` replay cache (PLAN.md decision — out of that helper's own documented scope,
+  redundant with G8).
+- `data/entities.ts`: additive `Cart.awaitingApprovalSince` (nullable `timestamptz`), migration
+  `Migration20261027190000_cart.ts` + hand-edited `.snapshot-open-mercato.json` (same
+  "local Postgres holds unrelated drift" reasoning Step 2.10 gave for its own hand-authored
+  migration — not regenerated via `yarn db:generate`).
+- `lib/approvalGate.ts`: added `approvalQualifies` (the one qualification formula — approved +
+  same currency + amount covers goods gross), extracted out of `commands/lock.ts`'s own inline
+  check (refactored to call it) so `cart.lock`'s gate, `cart.approval.request`'s pre-check, and
+  `lib/cartView.ts`'s `CartView.approval.qualifies` field all share one implementation.
+- `lib/cartView.ts`: `CartApprovalView` was still a Step-5.2-era stub (`{ id, status: 'pending'
+  }` for ANY non-null `approvalId` — written before `CustomerPurchaseApproval` existed). Now
+  reads the approval LIVE through `customerPurchaseApprovalService.getApproval` (soft-resolved,
+  `null` on absence) per §9a.4's own "`CartView.approval` is read live" text, and returns the
+  full §10.1 shape (`amountGross`/`currencyCode`/`qualifies`). Added `awaitingApprovalSince`
+  to the envelope too. `commands/cart.ts`'s `CartSummary`/`toCartSummary` grew the same field.
+- `lib/approvalLifecycle.ts` (new): `withdrawPendingCartApproval` — the ONE system-actor,
+  idempotent-on-`approval_not_pending` withdrawal shared by `commands/merge.ts` (source side,
+  §7.4), and `lib/sweepers.ts`'s `sweepExpiredCarts`/`purgeExpiredCarts` (§12). `commands/
+  merge.ts`: on `absorbedCart.status = 'merged'`, withdraws a pending approval and clears
+  `awaitingApprovalSince` in the same flush as the rest of that cart's transition.
+  `lib/sweepers.ts`: `sweepAbandonedCarts` gained the K5 skip filter (`awaitingApprovalSince:
+  null` on both the candidate `find` and the `nativeUpdate` WHERE); `sweepExpiredCarts`/
+  `purgeExpiredCarts` gained a new `approvalService` parameter (soft-resolved by their worker
+  files, `expire.worker.ts`/`purge-expired.worker.ts`, mirroring the existing `codeService`
+  injection pattern) and withdraw-before-transition/delete logic, best-effort (caught, logged,
+  never re-thrown — same discipline as the existing code-reservation release).
+- Four new thin subscriber files (`subscribers/approval-{approved,rejected,expired,withdrawn}.ts`)
+  share `lib/approvalDecidedSubscriber.ts#createCartApprovalDecidedHandler` — filters
+  `subjectType === 'cart'`, then a single `nativeUpdate` keyed on `(id, tenantId,
+  organizationId, approvalId)` clearing ONLY `awaitingApprovalSince` (never `approvalId` — see
+  PLAN.md's K5 decision for why the task brief's own instruction to clear it too was NOT
+  followed). Mirrors `customer_groups/lib/approvalDecidedSubscriberHandler.ts`'s own
+  one-handler-per-event-id shape.
+- NOT done (see PLAN.md's own decisions for the full reasoning on each): the K3 fifth
+  lifecycle row ("Converted, pending, a `purpose: 'quote'` conversion → withdrawn") — no
+  caller reaches `cart.markConverted` with `salesQuoteId` set in this worktree yet (Step 5.1's
+  own scope); the admin list's `awaitingApproval` filter (§10.2 names it, Step 2.10's own
+  route file untouched here, since this Step never had a reason to open that file); any
+  `yarn db:generate`-based migration (hand-authored, same reasoning Step 2.10 gave).
+- Tests (priority order from the task brief, all passing): `commands/__tests__/approval.test.ts`
+  (new, 13 cases) — idempotent-while-pending, guest refusal, `approval_not_required` (both the
+  "no threshold" and "already qualifies" sub-cases), `423`/`409` lock-state `it.each`, the
+  full K7 payload assertion, stale-pending withdrawal-then-fresh-request, the
+  `approval_not_pending` race swallow, abandoned-reactivation, and the `503` absent-service
+  case. `lib/__tests__/approvalDecidedSubscriber.test.ts` (new, 16 cases via `describe.each`
+  over the four event ids) — clears-when-matching, no-op-when-moved-on, `approval_id` never
+  touched, ignores `subjectType: 'quote'`, incomplete-payload no-op. `commands/__tests__/
+  merge.test.ts` — 3 new cases: source-side withdrawal + `awaitingApprovalSince` clear,
+  no-approvalId no-op, and the undo-merge regression guard (approval stays withdrawn,
+  `approvalId` unchanged, `customerPurchaseApprovalService` never called by undo at all).
+  `lib/__tests__/sweepers.test.ts` — 7 new cases across `sweepAbandonedCarts`/
+  `sweepExpiredCarts`/`purgeExpiredCarts` (K5 skip; withdraw-and-clear; already-settled
+  race; no-approvalId no-op; failed-withdrawal-does-not-block-the-sweep, ×2).
+  `lib/__tests__/cartView.test.ts` — replaced the stale stub assertion with a live-read test
+  (`qualifies: true`), added the pending/unavailable-service and
+  `approvalId`-null/`awaitingApprovalSince`-passthrough cases.
+  Checks: `yarn workspace @open-mercato/core typecheck` clean (0 errors). Full
+  `src/modules/cart` suite: 26/26 suites, 354/354 tests (42 new), zero regressions. Full
+  `src/modules/customer_groups` suite: 44/46 suites (2 pre-existing pg-gated skips),
+  472/472 tests, zero regressions (unaffected — only its already-public
+  `CustomerPurchaseApprovalService`/`CustomerPurchaseApprovalServiceError` exports and
+  frozen `customer_groups.approval.*` event payload shape were consumed, nothing in that
+  module itself was touched).

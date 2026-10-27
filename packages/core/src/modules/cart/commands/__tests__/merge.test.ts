@@ -323,7 +323,14 @@ function makeDefaultCatalogScopedProductService() {
   }
 }
 
-function makeCtx(opts: { em: unknown; catalogScopedProductService?: unknown }): CommandRuntimeContext {
+function makeCtx(opts: {
+  em: unknown
+  catalogScopedProductService?: unknown
+  // Step 3.2 (K3) — undefined by default, matching every pre-existing test's `Unexpected
+  // DI token` throw caught internally by `tryResolveCustomerPurchaseApprovalService`,
+  // degrading to "nothing withdrawn" exactly as before this Step.
+  customerPurchaseApprovalService?: unknown
+}): CommandRuntimeContext {
   const dataEngine = makeDataEngine()
   const salesCalculationService = makeSalesCalculationService()
   return {
@@ -340,6 +347,10 @@ function makeCtx(opts: { em: unknown; catalogScopedProductService?: unknown }): 
         if (token === 'promotionsService') return { evaluate: jest.fn(async () => ({ appliedPromotions: [] })), extendReservation: jest.fn(), releaseCode: jest.fn() }
         if (token === 'policyResolutionService') throw new Error('no policy resolver registered in this test')
         if (token === 'catalogScopedProductService') return opts.catalogScopedProductService ?? makeDefaultCatalogScopedProductService()
+        if (token === 'customerPurchaseApprovalService') {
+          if (opts.customerPurchaseApprovalService !== undefined) return opts.customerPurchaseApprovalService
+          throw new Error(`Unexpected DI token: ${token}`)
+        }
         throw new Error(`Unexpected DI token: ${token}`)
       },
       register: jest.fn(),
@@ -898,6 +909,64 @@ describe('cart.merge — §6a.5 merge-time re-visibility pass (Step 7.4)', () =>
   })
 })
 
+// Step 3.2 (K3, §7.4) — "A source basket whose approval_id names a pending approval has it
+// withdrawn ... and its awaiting_approval_since is cleared." Uses row 2 (keep_target, the
+// guest cart is empty) as the minimal scenario: the absorbed cart still transitions to
+// `merged` regardless of whether any lines moved.
+describe('cart.merge — K3 source-side approval withdrawal (§7.4)', () => {
+  it('withdraws a pending approval on the absorbed (source) cart and clears its awaiting_approval_since', async () => {
+    seededCarts = [
+      makeCartFixture({ id: 'cart-target', tokenHash: 'target-token-hash' }),
+      makeCartFixture({
+        id: 'cart-guest',
+        tokenHash: hashCartToken('guest-plain-token'),
+        approvalId: 'approval-1',
+        awaitingApprovalSince: new Date('2026-02-28T00:00:00.000Z'),
+      }),
+    ]
+    seededCartLines = [makeLineFixture({ id: 'line-target-1', cartId: 'cart-target', productId: 'product-1', quantity: '2' })]
+
+    const handler = getMergeHandler()
+    const em = makeEm()
+    const withdrawApproval = jest.fn(async () => ({}))
+    const ctx = makeCtx({ em, customerPurchaseApprovalService: { withdrawApproval } })
+
+    await handler.execute(
+      { targetCartId: 'cart-target', tenantId: TENANT_ID, organizationId: ORG_ID, sourceToken: 'guest-plain-token', routeContext: makeRouteContext() },
+      ctx,
+    )
+
+    expect(withdrawApproval).toHaveBeenCalledWith({
+      scope: { tenantId: TENANT_ID, organizationId: ORG_ID },
+      approvalId: 'approval-1',
+      actor: { actorType: 'system', reason: 'cart_merged' },
+    })
+    const guestCart = seededCarts.find((row) => row.id === 'cart-guest')!
+    expect(guestCart.status).toBe('merged')
+    expect(guestCart.awaitingApprovalSince).toBeNull()
+  })
+
+  it('leaves awaiting_approval_since alone when the source cart has no approvalId', async () => {
+    seededCarts = [
+      makeCartFixture({ id: 'cart-target', tokenHash: 'target-token-hash' }),
+      makeCartFixture({ id: 'cart-guest', tokenHash: hashCartToken('guest-plain-token'), approvalId: null }),
+    ]
+    seededCartLines = [makeLineFixture({ id: 'line-target-1', cartId: 'cart-target', productId: 'product-1', quantity: '2' })]
+
+    const handler = getMergeHandler()
+    const em = makeEm()
+    const withdrawApproval = jest.fn()
+    const ctx = makeCtx({ em, customerPurchaseApprovalService: { withdrawApproval } })
+
+    await handler.execute(
+      { targetCartId: 'cart-target', tenantId: TENANT_ID, organizationId: ORG_ID, sourceToken: 'guest-plain-token', routeContext: makeRouteContext() },
+      ctx,
+    )
+
+    expect(withdrawApproval).not.toHaveBeenCalled()
+  })
+})
+
 describe('cart.mergeUndo', () => {
   it('restores a summed line back to its exact pre-merge quantity', async () => {
     seededCarts = [
@@ -955,6 +1024,54 @@ describe('cart.mergeUndo', () => {
 
     const line = seededCartLines.find((row) => row.id === 'line-target-new')!
     expect(line.deletedAt).not.toBeNull()
+  })
+
+  // Step 3.2 (K3, §7.4) regression guard — "Undo of a merge → target recomputes; approvals
+  // are not restored automatically." `restoreCartMerge` touches lines, the survivor's buyer
+  // identity (adoption only) and the merge log's own `undoneAt` — never `approvalId`/
+  // `awaitingApprovalSince` on either cart. The absorbed cart's approval, already withdrawn
+  // by the original merge (K3 source-side rule), stays withdrawn: undo restores the CART to
+  // `active`, never the approval to `pending`.
+  it('does not restore the absorbed cart\'s withdrawn approval, and never calls into customer_groups at all', async () => {
+    seededCarts = [
+      makeCartFixture({ id: 'cart-target', tokenHash: 'target-token-hash' }),
+      makeCartFixture({
+        id: 'cart-guest',
+        tokenHash: hashCartToken('guest-plain-token'),
+        status: 'merged',
+        mergedIntoCartId: 'cart-target',
+        // Already withdrawn by the original merge (K3) — `approval_id` stays pointed at
+        // the withdrawn approval (§9a.4: never cleared by cart-lifecycle events),
+        // `awaiting_approval_since` already null.
+        approvalId: 'approval-1',
+        awaitingApprovalSince: null,
+      }),
+    ]
+    seededMergeLogs = [
+      makeMergeLogFixture({
+        id: 'merge-log-approval-1',
+        sourceCartId: 'cart-guest',
+        targetCartId: 'cart-target',
+        strategy: 'keep_target',
+        outcome: [],
+        createdAt: new Date(Date.now() - 1 * 60 * 1000),
+      }),
+    ]
+
+    const handler = getUndoHandler()
+    const em = makeEm()
+    const withdrawApproval = jest.fn()
+    const requestApproval = jest.fn()
+    const ctx = makeCtx({ em, customerPurchaseApprovalService: { withdrawApproval, requestApproval } })
+
+    await handler.execute({ cartId: 'cart-target', tenantId: TENANT_ID, organizationId: ORG_ID, routeContext: makeRouteContext() }, ctx)
+
+    const guestCart = seededCarts.find((row) => row.id === 'cart-guest')!
+    expect(guestCart.status).toBe('active')
+    expect(guestCart.approvalId).toBe('approval-1')
+    expect(guestCart.awaitingApprovalSince).toBeNull()
+    expect(withdrawApproval).not.toHaveBeenCalled()
+    expect(requestApproval).not.toHaveBeenCalled()
   })
 
   it('refuses an undo attempt past the 15-minute window with a 409', async () => {

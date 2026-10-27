@@ -10,6 +10,10 @@ jest.mock('../../events', () => ({
   emitCartEvent: jest.fn(async () => undefined),
 }))
 
+import {
+  CustomerPurchaseApprovalServiceError,
+  type CustomerPurchaseApprovalService,
+} from '@open-mercato/core/modules/customer_groups/services/customerPurchaseApprovalService'
 import { Cart, CartLine, CartMergeLog, CartPromotionApplication } from '../../data/entities'
 import { emitCartEvent } from '../../events'
 import {
@@ -47,6 +51,8 @@ function makeCart(overrides: Partial<Cart> = {}): Cart {
     lockExpiresAt: null,
     checkoutSessionId: null,
     proposedToCartId: null,
+    approvalId: null,
+    awaitingApprovalSince: null,
     updatedAt: NOW,
     ...overrides,
   } as Cart
@@ -95,6 +101,13 @@ function makeCartPromotionApplication(overrides: Partial<CartPromotionApplicatio
 
 function makeCodeService(): jest.Mocked<CartCodeServiceLike> {
   return { releaseCode: jest.fn(async () => undefined) }
+}
+
+// Step 3.2 (K3) — a minimal `CustomerPurchaseApprovalService` double. Only
+// `withdrawApproval` is exercised by the sweepers under test (`sweepExpiredCarts`'s and
+// `purgeExpiredCarts`'s own pending-approval cleanup); every other method is unused here.
+function makeApprovalService(): jest.Mocked<Pick<CustomerPurchaseApprovalService, 'withdrawApproval'>> {
+  return { withdrawApproval: jest.fn(async () => ({}) as never) }
 }
 
 // Evaluates one MikroORM-style filter value ($in/$lt/$gt/$ne, ANDed when combined on one key).
@@ -398,6 +411,24 @@ describe('sweepAbandonedCarts', () => {
     expect(stale.status).toBe('abandoned')
     expect(emitMock).toHaveBeenCalled()
   })
+
+  // K5 (§9a.4/§9a.5/§12): "no abandonment while the buyer waits for approval" — a column
+  // filter only, never a call into `customer_groups` (the whole point of the column).
+  it('skips a basket whose awaiting_approval_since is set, even past the inactivity window', async () => {
+    const awaitingApproval = makeCart({
+      id: 'awaiting-approval-1',
+      lastActivityAt: new Date(NOW.getTime() - 25 * 60 * 60 * 1000),
+      approvalId: 'approval-1',
+      awaitingApprovalSince: new Date(NOW.getTime() - 60 * 60 * 1000),
+    })
+    const em = makeEm([awaitingApproval])
+
+    const result = await sweepAbandonedCarts(em as never, { tenantId: TENANT }, makeCodeService(), NOW)
+
+    expect(result).toEqual({ transitioned: 0 })
+    expect(awaitingApproval.status).toBe('active')
+    expect(emitMock).not.toHaveBeenCalled()
+  })
 })
 
 describe('sweepExpiredCarts', () => {
@@ -407,7 +438,7 @@ describe('sweepExpiredCarts', () => {
       const expired = makeCart({ id: `expired-${status}`, status, expiresAt: new Date(NOW.getTime() - 1000) })
       const em = makeEm([expired])
 
-      const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, makeCodeService(), NOW)
+      const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, makeCodeService(), null, NOW)
 
       expect(result).toEqual({ transitioned: 1 })
       expect(expired.status).toBe('expired')
@@ -424,7 +455,7 @@ describe('sweepExpiredCarts', () => {
     const notYet = makeCart({ id: 'not-yet-1', expiresAt: new Date(NOW.getTime() + 1000) })
     const em = makeEm([notYet])
 
-    const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, makeCodeService(), NOW)
+    const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, makeCodeService(), null, NOW)
 
     expect(result).toEqual({ transitioned: 0 })
     expect(notYet.status).toBe('active')
@@ -435,7 +466,7 @@ describe('sweepExpiredCarts', () => {
     const merged = makeCart({ id: 'merged-1', status: 'merged', expiresAt: new Date(NOW.getTime() - 1000) })
     const em = makeEm([converted, merged])
 
-    const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, makeCodeService(), NOW)
+    const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, makeCodeService(), null, NOW)
 
     expect(result).toEqual({ transitioned: 0 })
     expect(converted.status).toBe('converted')
@@ -446,7 +477,7 @@ describe('sweepExpiredCarts', () => {
     const proposal = makeCart({ id: 'proposal-exp-1', kind: 'proposal', expiresAt: new Date(NOW.getTime() - 1000) })
     const em = makeEm([proposal])
 
-    const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, makeCodeService(), NOW)
+    const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, makeCodeService(), null, NOW)
 
     expect(result).toEqual({ transitioned: 0 })
     expect(proposal.status).toBe('active')
@@ -463,7 +494,7 @@ describe('sweepExpiredCarts', () => {
     const em = makeEm([expired], [], [], applications)
     const codeService = makeCodeService()
 
-    const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, codeService, NOW)
+    const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, codeService, null, NOW)
 
     expect(result).toEqual({ transitioned: 1 })
     expect(codeService.releaseCode).toHaveBeenCalledTimes(1)
@@ -475,7 +506,7 @@ describe('sweepExpiredCarts', () => {
     const em = makeEm([expired])
     const codeService = makeCodeService()
 
-    const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, codeService, NOW)
+    const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, codeService, null, NOW)
 
     expect(result).toEqual({ transitioned: 1 })
     expect(codeService.releaseCode).not.toHaveBeenCalled()
@@ -494,11 +525,82 @@ describe('sweepExpiredCarts', () => {
     const em = makeEm([otherTenantCart])
     const codeService = makeCodeService()
 
-    const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, codeService, NOW)
+    const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, codeService, null, NOW)
 
     expect(result).toEqual({ transitioned: 0 })
     expect(otherTenantCart.status).toBe('active')
     expect(codeService.releaseCode).not.toHaveBeenCalled()
+  })
+
+  // K3 (§9/§9a.4): "cart expiry ends a request earlier than the 14-day approval expiry" —
+  // a pending approval on an expiring basket is withdrawn, system actor, and
+  // `awaiting_approval_since` is cleared in the same tick.
+  it('withdraws a pending approval on an expiring basket and clears awaiting_approval_since', async () => {
+    const expired = makeCart({
+      id: 'expired-pending-approval-1',
+      expiresAt: new Date(NOW.getTime() - 1000),
+      approvalId: 'approval-1',
+      awaitingApprovalSince: new Date(NOW.getTime() - 60 * 60 * 1000),
+    })
+    const em = makeEm([expired])
+    const approvalService = makeApprovalService()
+
+    const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, makeCodeService(), approvalService as never, NOW)
+
+    expect(result).toEqual({ transitioned: 1 })
+    expect(approvalService.withdrawApproval).toHaveBeenCalledWith({
+      scope: { tenantId: TENANT, organizationId: ORG },
+      approvalId: 'approval-1',
+      actor: { actorType: 'system', reason: 'cart_expired' },
+    })
+    expect(expired.awaitingApprovalSince).toBeNull()
+  })
+
+  it('leaves awaiting_approval_since alone when the approval is no longer pending (already settled by a race)', async () => {
+    const expired = makeCart({
+      id: 'expired-already-settled-1',
+      expiresAt: new Date(NOW.getTime() - 1000),
+      approvalId: 'approval-1',
+      awaitingApprovalSince: null,
+    })
+    const em = makeEm([expired])
+    const approvalService = makeApprovalService()
+    approvalService.withdrawApproval.mockRejectedValueOnce(
+      new CustomerPurchaseApprovalServiceError('approval_not_pending', '[internal] not pending'),
+    )
+
+    const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, makeCodeService(), approvalService as never, NOW)
+
+    expect(result).toEqual({ transitioned: 1 })
+    expect(expired.awaitingApprovalSince).toBeNull()
+  })
+
+  it('never calls withdrawApproval for a basket with no approvalId', async () => {
+    const expired = makeCart({ id: 'expired-no-approval-1', expiresAt: new Date(NOW.getTime() - 1000) })
+    const em = makeEm([expired])
+    const approvalService = makeApprovalService()
+
+    const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, makeCodeService(), approvalService as never, NOW)
+
+    expect(result).toEqual({ transitioned: 1 })
+    expect(approvalService.withdrawApproval).not.toHaveBeenCalled()
+  })
+
+  it('does not let a failed approval withdrawal block the sweep tick', async () => {
+    const expired = makeCart({
+      id: 'expired-withdraw-fails-1',
+      expiresAt: new Date(NOW.getTime() - 1000),
+      approvalId: 'approval-1',
+      awaitingApprovalSince: new Date(NOW.getTime() - 1000),
+    })
+    const em = makeEm([expired])
+    const approvalService = makeApprovalService()
+    approvalService.withdrawApproval.mockRejectedValueOnce(new Error('customer_groups unavailable'))
+
+    const result = await sweepExpiredCarts(em as never, { tenantId: TENANT }, makeCodeService(), approvalService as never, NOW)
+
+    expect(result).toEqual({ transitioned: 1 })
+    expect(expired.status).toBe('expired')
   })
 })
 
@@ -561,7 +663,7 @@ describe('purgeExpiredCarts', () => {
     const old = makeCart({ id: 'old-1', status: 'expired', resolvedAt: RESOLVED_91_DAYS_AGO })
     const em = makeEm([old])
 
-    const result = await purgeExpiredCarts(em as never, { tenantId: TENANT }, NOW)
+    const result = await purgeExpiredCarts(em as never, { tenantId: TENANT }, null, NOW)
 
     expect(result).toEqual({ transitioned: 1 })
     expect((em.find as jest.Mock).mock.calls.length).toBeGreaterThan(0)
@@ -576,7 +678,7 @@ describe('purgeExpiredCarts', () => {
     const recent = makeCart({ id: 'recent-1', status: 'expired', resolvedAt: RESOLVED_10_DAYS_AGO })
     const em = makeEm([recent])
 
-    const result = await purgeExpiredCarts(em as never, { tenantId: TENANT }, NOW)
+    const result = await purgeExpiredCarts(em as never, { tenantId: TENANT }, null, NOW)
 
     expect(result).toEqual({ transitioned: 0 })
     expect(emitMock).not.toHaveBeenCalled()
@@ -586,7 +688,7 @@ describe('purgeExpiredCarts', () => {
     const unresolved = makeCart({ id: 'unresolved-1', status: 'active', resolvedAt: null })
     const em = makeEm([unresolved])
 
-    const result = await purgeExpiredCarts(em as never, { tenantId: TENANT }, NOW)
+    const result = await purgeExpiredCarts(em as never, { tenantId: TENANT }, null, NOW)
 
     expect(result).toEqual({ transitioned: 0 })
   })
@@ -603,7 +705,7 @@ describe('purgeExpiredCarts', () => {
     ]
     const em = makeEm([stillSource, stillTarget, stillProposal, unreferenced], mergeLogs)
 
-    const result = await purgeExpiredCarts(em as never, { tenantId: TENANT }, NOW)
+    const result = await purgeExpiredCarts(em as never, { tenantId: TENANT }, null, NOW)
 
     expect(result).toEqual({ transitioned: 1 })
     expect(emitMock).toHaveBeenCalledTimes(1)
@@ -618,8 +720,48 @@ describe('purgeExpiredCarts', () => {
     const proposal = makeCart({ id: 'proposal-purge-1', kind: 'proposal', status: 'expired', resolvedAt: RESOLVED_91_DAYS_AGO })
     const em = makeEm([proposal])
 
-    const result = await purgeExpiredCarts(em as never, { tenantId: TENANT }, NOW)
+    const result = await purgeExpiredCarts(em as never, { tenantId: TENANT }, null, NOW)
 
     expect(result).toEqual({ transitioned: 0 })
+  })
+
+  // K3 (§12): "Withdraws a pending approval left on a purged basket (normally already
+  // withdrawn at expiry)" — the one path that reaches purge with a still-pending approval
+  // is a cart `markConverted`/`merge` resolved directly, bypassing `expire-carts` first.
+  it('withdraws a pending approval before hard-deleting a purged basket', async () => {
+    const old = makeCart({
+      id: 'old-pending-approval-1',
+      status: 'converted',
+      resolvedAt: RESOLVED_91_DAYS_AGO,
+      approvalId: 'approval-1',
+      awaitingApprovalSince: new Date(NOW.getTime() - 1000),
+    })
+    const em = makeEm([old])
+    const approvalService = makeApprovalService()
+
+    const result = await purgeExpiredCarts(em as never, { tenantId: TENANT }, approvalService as never, NOW)
+
+    expect(result).toEqual({ transitioned: 1 })
+    expect(approvalService.withdrawApproval).toHaveBeenCalledWith({
+      scope: { tenantId: TENANT, organizationId: ORG },
+      approvalId: 'approval-1',
+      actor: { actorType: 'system', reason: 'cart_purged' },
+    })
+  })
+
+  it('does not let a failed approval withdrawal block the purge', async () => {
+    const old = makeCart({
+      id: 'old-withdraw-fails-1',
+      status: 'expired',
+      resolvedAt: RESOLVED_91_DAYS_AGO,
+      approvalId: 'approval-1',
+    })
+    const em = makeEm([old])
+    const approvalService = makeApprovalService()
+    approvalService.withdrawApproval.mockRejectedValueOnce(new Error('customer_groups unavailable'))
+
+    const result = await purgeExpiredCarts(em as never, { tenantId: TENANT }, approvalService as never, NOW)
+
+    expect(result).toEqual({ transitioned: 1 })
   })
 })

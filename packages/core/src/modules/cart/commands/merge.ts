@@ -29,6 +29,8 @@ import { cartVisibilityKey, evaluateCartVisibility, isVisible } from '../lib/vis
 import type { CartVisibilityResult } from '../lib/visibility'
 import { assertCartNotLocked } from '../lib/lockGuard'
 import { recordBasketMutationActivity } from '../lib/cartActivity'
+import { tryResolveCustomerPurchaseApprovalService } from '../lib/adminCartScope'
+import { withdrawPendingCartApproval } from '../lib/approvalLifecycle'
 import { emitCartEvent } from '../events'
 import { repriceCartCommand } from './cart'
 import type { CartRepriceInput, CartRepriceResult } from './cart'
@@ -595,6 +597,15 @@ const mergeCartCommand: CommandHandler<CartMergeInput, CartMergeResult> = {
     absorbedCart.status = 'merged'
     absorbedCart.mergedIntoCartId = survivorCart.id
     absorbedCart.resolvedAt = now
+
+    // §7.4 (rev 10 — K3): "A source basket whose `approval_id` names a `pending` approval
+    // has it withdrawn ... and its `awaiting_approval_since` is cleared." An `approved`
+    // approval is left exactly as is — the source cart is now `merged`, terminal, and can
+    // never lock again, so nothing further needs to happen to it. Both fields are written
+    // in the SAME flush as the rest of this absorbed cart's own transition, below.
+    const approvalService = tryResolveCustomerPurchaseApprovalService(ctx.container)
+    const approvalWithdrawn = await withdrawPendingCartApproval(approvalService, absorbedCart, 'cart_merged')
+    if (approvalWithdrawn) absorbedCart.awaitingApprovalSince = null
 
     const sourceSnapshot: StoredSourceSnapshot = {
       lines: absorbedLinesForSnapshot.map(toCartLineSnapshot),

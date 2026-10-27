@@ -1,4 +1,5 @@
 import type { CustomerGroupsService } from '@open-mercato/core/modules/customer_groups/services/customerGroupsService'
+import type { ApprovalView } from '@open-mercato/core/modules/customer_groups/services/customerPurchaseApprovalService'
 import type { Cart } from '../data/entities'
 
 // Step 3.1 (K1/K2, §9a.1/§9a.2) — the approval gate's own pure math and its one soft-DI
@@ -55,6 +56,29 @@ export function computeRequiresApproval(input: {
   if (input.approvalRequiredAbove == null) return false
   if (input.termsCurrencyCode !== input.cartCurrencyCode) return true
   return input.goodsGrossAmount > input.approvalRequiredAbove
+}
+
+/**
+ * Step 3.2 (§9a.3/§9a.4/§10.1) — the ONE qualification formula every reader of a cart's
+ * approval shares: `cart.lock`'s gate check (§9a.3 step 3), `cart.approval.request`'s own
+ * "does the CURRENT approval already cover this cart" pre-check (§9a.4 step 2), and the
+ * `CartView.approval.qualifies` field (§10.1) all ask the identical question — approved,
+ * same currency as the cart, amount still covers the current goods gross. Extracted here
+ * (not duplicated per call site) for the same reason `computeRequiresApproval` already is:
+ * one implementation to test and to read.
+ */
+export function approvalQualifies(input: {
+  approval: Pick<ApprovalView, 'status' | 'currencyCode' | 'amountGross'> | null
+  cartCurrencyCode: string
+  goodsGrossAmount: number
+}): boolean {
+  const { approval, cartCurrencyCode, goodsGrossAmount } = input
+  return (
+    !!approval &&
+    approval.status === 'approved' &&
+    approval.currencyCode === cartCurrencyCode &&
+    Number(approval.amountGross) >= goodsGrossAmount
+  )
 }
 
 export type CartForApprovalGate = Pick<

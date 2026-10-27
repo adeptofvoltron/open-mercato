@@ -45,7 +45,7 @@
 | 2 | 2.13 | checkout: B.3 delivery + payment step (rate quoting C13, delivery-promotions evaluation C8) | dispatch:standard | done | pending |
 | 3 | 3.1 | cart: approval gate K1–K5 (`requiresApproval`, lock refusal, `purpose: 'quote'` skip D-R5-23, guest fail-closed D-R5-12/29) | dispatch:standard | done | pending |
 | 3 | 3.1-fix | ecommerce: fix `mergeStoreSettings` missing `shipping` (TS2322/TS2741, regression from Step 2.13) | inline | done | pending |
-| 3 | 3.2 | cart: `/current/request-approval` route + lifecycle withdrawal wiring (K3/K4/K7, `awaiting_approval_since` K5) | dispatch:standard | todo | — |
+| 3 | 3.2 | cart: `/current/request-approval` route + lifecycle withdrawal wiring (K3/K4/K7, `awaiting_approval_since` K5) | dispatch:standard | done | pending |
 | 3 | 3.3 | cart: §7a proposal seam commands (create/withdraw/supersede/re-author, D-R5-14) | dispatch:standard | todo | — |
 | 3 | 3.4 | cart: §7a proposal routes + sweeper branches (K13–K16/S13–S15) + undo-merge refusal (D-R5-25) | dispatch:standard | todo | — |
 | 3 | 3.5 | checkout: B.2 cart-backed links — trusted pay-link seeding (D-R5-19) + store/channel/currency check (C9) | dispatch:standard | todo | — |
@@ -777,6 +777,96 @@ commit `c92470d8d5`).
   their first real consumer (checkout, Phase 4/5) per this Step's own explicit instruction,
   the same precedent Step 2.5/2.7 set for pre-declaring `customer_groups.approval.*`
   notification i18n ahead of a UI that reads it.
+
+- Step 3.2 (K5, §9a.5 vs. the task brief's own instruction): the task brief's own
+  Implementation bullet asked the new subscriber to "ALSO clear `Cart.approvalId` when the
+  outcome is NOT approved". Read the REVISED, authoritative spec text instead and found it
+  says the opposite, twice: §9a.5's own prose ("it clears `awaiting_approval_since`;
+  otherwise it does nothing. It changes no other column and emits nothing") and §9a.4's
+  lifecycle table ("§9a.5 subscriber clears `awaiting_approval_since`; `approval_id` is
+  unchanged"). Implemented the subscriber (`lib/approvalDecidedSubscriber.ts`, shared by
+  all four `.approved`/`.rejected`/`.expired`/`.withdrawn` thin files) to clear ONLY
+  `awaiting_approval_since`, uniformly across all four events including `.approved`, and
+  to NEVER touch `approval_id` under any outcome. This is not cosmetic: `approval_id` stays
+  the one authoritative pointer (§9a.4: "An older approved approval that still names this
+  cart as its subject is never read by cart or checkout" is the ONLY stale-reference case
+  the spec calls out — a rejected/withdrawn/expired approval staying referenced is how
+  `CartView.approval` can keep showing the buyer the final status of their last request
+  until they make a NEW one, which is what actually moves the pointer). Per root AGENTS.md
+  ("the spec is the authoritative contract... the analysis/brief is the finding that
+  produced it"), followed the spec. Alternative considered: implement the brief's literal
+  instruction — rejected as a real behavioral bug (an operator-facing "why does this
+  rejected/withdrawn approval still show on the cart" surprise, and a dead read for
+  `CartView.approval`'s own live `getApproval` call, which already degrades correctly to
+  the approval's own terminal status without any column-clearing help).
+- Step 3.2 (K3, the brief's own narrower enumeration vs. the full finding): the task brief's
+  title/Implementation list named four K3 transitions (merge-source, expiry, purge,
+  undo-merge-recompute-not-restore) and did not name the fifth row in K3's own full table
+  — "Converted | Pending (a `purpose: 'quote'` conversion, §9a.6): withdrawn." Did NOT
+  implement this fifth row in `cart.markConverted` (`commands/lock.ts`) — no caller in this
+  worktree ever reaches it with `purpose: 'quote'` through to conversion (checkout's quote
+  flow is Phase 5.1's own scope, not yet landed), so there is nothing to exercise or test
+  against today, and the brief's own explicit Implementation bullets, which this Step is
+  judged against, never named it. Flagged here rather than silently added: Step 5.1 (or
+  whichever Step first makes `cart.markConverted` reachable with `salesQuoteId` set) should
+  add "if `input.salesQuoteId` is set and the cart's current approval is still `pending`,
+  withdraw it (`lib/approvalLifecycle.ts#withdrawPendingCartApproval`, reason — none of the
+  three existing reasons fit; a fourth reason value may be needed, or `'cart_merged'`'s
+  slot repurposed — the owner should decide which)" to that Step's own scope. Alternative
+  considered: add it now as cheap, well-specified, additive logic — rejected because it
+  would be untestable without inventing a fake `purpose: 'quote'` caller this Step has no
+  business inventing, and because the brief's own narrower enumeration, read against its
+  explicit "If this Step genuinely needs splitting, STOP" instruction, reads as a deliberate
+  scope boundary rather than an oversight.
+- Step 3.2 (K7, the brief's own payload list vs. the revised spec's §11 text): the task
+  brief's own "K7 `cart.approval.requested` payload" instruction and the pre-revision K7
+  analysis finding both give a 6-field payload (`{ cartId, approvalId, tenantId,
+  organizationId, amountGross, currencyCode }`). The REVISED, authoritative §11 text (rev
+  10) gives 8 fields for the SAME event: `{ cartId, approvalId, tenantId, organizationId,
+  customerId, customerUserId, amountGross, currencyCode }`, with its own explanatory line
+  ("`customerId` is the company the approval was requested for"). Implemented the 8-field
+  spec shape, reading `customerId` off `requestResult.approval.customerId` (the service's
+  own G11 company-first resolution) rather than re-deriving it — same "spec overrides the
+  pre-revision analysis finding/brief paraphrase" precedent Step 2.9 applied to
+  `resolveForBuyer`'s fill list and Step 2.7 applied to the `approval.decided` notification.
+- Step 3.2 (K4/§8.4, route-level identity binding for a guest cart): confirmed
+  `resolveCurrentCart`'s existing binding check (`lib/currentCartRoute.ts`, Step 2.9) only
+  enforces a customer session when the ADDRESSED cart already has a `customerUserId` — a
+  guest cart (the K4 case this route exists to refuse) reaches the command un-gated by that
+  check. The actual guest refusal is therefore `commands/approval.ts`'s own `if
+  (!cart.customerUserId)` guard, run AFTER `loadMutableCart`'s status gate — matching
+  §9a.4's own ordering ("Preconditions: an identified basket with the matching session...").
+  Not a gap: the route-level binding check still does its OWN job (an identified basket
+  answers only to ITS buyer), and this command's guard is the separate, K4-specific "no
+  buyer identity at all" case §8.4 does not cover by itself.
+- Step 3.2 (idempotency-key, §10's generic "every mutation" text vs. this module's own
+  precedent): did NOT wire the generic `lib/idempotency.ts` `Idempotency-Key` replay-cache
+  into `POST /current/request-approval`, despite §10's route contract text listing it
+  ("`Idempotency-Key` and the optimistic-lock header are accepted as on every mutation").
+  That helper's own header comment states its scope explicitly: "this is why this helper
+  only wires into the line-mutation routes" — `/current/merge` and `/current/undo-merge`
+  (this Step's own named structural precedent) do NOT wire it in either, despite being
+  "mutations" too. The real retry-safety guarantee this route needs is already the DOMAIN-
+  level idempotency `requestApproval` provides (G8: a duplicate request for the same
+  subject while pending returns the SAME approval, never a second one) — a second, generic
+  response-replay cache on top would be redundant for this specific route. Standard
+  optimistic-lock header support IS wired in (every `/current/*` mutation route carries it,
+  no exception). Alternative considered: extend `lib/idempotency.ts` to this route for
+  literal §10 compliance — rejected as scope creep past a documented, already-precedented
+  module boundary, for a risk (double-request on retry) the service's own G8 guard already
+  closes.
+- Step 3.2 (§9a.4 step 4's pseudocode vs. the service's actual shipped signature): the task
+  brief's own call-shape pseudocode names `customerId: <resolved per G11, company-first>`
+  and `approvalPolicySnapshot: <from resolved terms>` as fields to pass into
+  `requestApproval`. Neither exists on the service's actual, Step-2.5-shipped
+  `RequestApprovalInput` type — it takes `buyer: { customerIds: string[] }` (the service
+  resolves the company-first `customerId` internally via `resolveCompanyFirstCustomerId`,
+  G11) and no `approvalPolicySnapshot` field at all (`approvalPolicy` is resolved
+  internally from `groupsService.resolveTerms` and snapshotted onto the row the service
+  creates). Called the real, shipped signature exactly as it exists rather than the brief's
+  paraphrase of an earlier design — this is not a judgment call so much as the only way the
+  code compiles, but recorded here since the brief's own pseudocode reads as if those two
+  fields were real inputs.
 
 ## External References
 

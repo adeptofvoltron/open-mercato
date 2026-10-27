@@ -211,6 +211,13 @@ export type CartMergeRequest = z.infer<typeof cartMergeRequestSchema>
 export const cartMergeUndoRequestSchema = z.object({}).strict()
 export type CartMergeUndoRequest = z.infer<typeof cartMergeUndoRequestSchema>
 
+/** `POST /current/request-approval` (rev 10 — K4, §9a.4/§10). "Body: `{}` (`.strict()`;
+ * amount, currency, requester and subject come from the server, never the body)" — the
+ * spec states this one explicitly, so this mirrors `cartCurrentCreateRequestSchema`'s
+ * empty-but-`.strict()` convention by the spec's own words, not by analogy. */
+export const cartRequestApprovalRequestSchema = z.object({}).strict()
+export type CartRequestApprovalRequest = z.infer<typeof cartRequestApprovalRequestSchema>
+
 // ---------------------------------------------------------------------------
 // `cart.markConverted` (§9.1 rev 10 — K8/D-R5-26) — additive, optional conversion inputs.
 // The TS signature in §9.1 types `lineMap` as one flat shape with BOTH line-id fields

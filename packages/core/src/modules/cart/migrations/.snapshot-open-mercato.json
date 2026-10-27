@@ -1547,6 +1547,23 @@
           "enumItems": [],
           "mappedType": "text"
         },
+        "awaiting_approval_since": {
+          "name": "awaiting_approval_since",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        },
         "buyer_digest": {
           "name": "buyer_digest",
           "type": "text",

@@ -458,6 +458,7 @@ export type CartSummary = {
   promotionEffects: unknown
   requiresApproval: boolean
   approvalId: string | null
+  awaitingApprovalSince: Date | null
   metadata: Record<string, unknown> | null
   salesChannelId: string | null
   lastActivityAt: Date
@@ -508,6 +509,7 @@ export function toCartSummary(cart: Cart): CartSummary {
     promotionEffects: cart.promotionEffects ?? null,
     requiresApproval: cart.requiresApproval,
     approvalId: cart.approvalId ?? null,
+    awaitingApprovalSince: cart.awaitingApprovalSince ?? null,
     metadata: cart.metadata ?? null,
     salesChannelId: cart.salesChannelId ?? null,
     lastActivityAt: cart.lastActivityAt,

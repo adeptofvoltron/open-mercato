@@ -14,7 +14,7 @@ import { cartMarkConvertedLineMapSchema, type CartMarkConvertedLineMapEntry } fr
 import { resolveCartLockTimeoutMs } from '../lib/sweepConfig'
 import { assertCartNotLocked } from '../lib/lockGuard'
 import { emitCartEvent } from '../events'
-import { computeGoodsGrossAmount } from '../lib/approvalGate'
+import { approvalQualifies, computeGoodsGrossAmount } from '../lib/approvalGate'
 import { tryResolveCustomerPurchaseApprovalService } from '../lib/adminCartScope'
 import { repriceCartCommand, toCartSummary } from './cart'
 import type { CartRepriceInput, CartRepriceResult, CartSummary } from './cart'
@@ -232,11 +232,9 @@ const lockCartCommand: CommandHandler<CartLockInput, CartLockResult> = {
       const approval = cart.approvalId && approvalService
         ? await approvalService.getApproval({ scope, approvalId: cart.approvalId })
         : null
-      const qualifies =
-        !!approval &&
-        approval.status === 'approved' &&
-        approval.currencyCode === cart.currencyCode &&
-        Number(approval.amountGross) >= goodsGrossAmount
+      // Step 3.2 — shared with `commands/approval.ts`'s own pre-check and `lib/cartView.ts`'s
+      // `CartView.approval.qualifies` field (`lib/approvalGate.ts#approvalQualifies`).
+      const qualifies = approvalQualifies({ approval, cartCurrencyCode: cart.currencyCode, goodsGrossAmount })
       if (!qualifies) {
         throw new CrudHttpError(409, {
           error: '[internal] cart_requires_approval',

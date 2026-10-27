@@ -2,8 +2,10 @@ import type { FilterQuery } from '@mikro-orm/core'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import { findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 import { createLogger } from '@open-mercato/shared/lib/logger'
+import type { CustomerPurchaseApprovalService } from '@open-mercato/core/modules/customer_groups/services/customerPurchaseApprovalService'
 import { Cart, CartLine, CartMergeLog, CartPromotionApplication } from '../data/entities'
 import { emitCartEvent } from '../events'
+import { withdrawPendingCartApproval } from './approvalLifecycle'
 import { DAY_MS, PURGE_RETENTION_DAYS, resolveCartInactivityWindowMs } from './sweepConfig'
 
 const logger = createLogger('cart')
@@ -114,6 +116,11 @@ async function emitCartLifecycleEvent(
  * (rev 10 — K9/K11) `cart.cart.abandoned`'s payload grows to the full Release 5 shape
  * (§11), and every transitioned basket's code reservations are released by `cartId`
  * (`releaseCartCodeReservations` above, K11).
+ *
+ * (rev 10 — K5, §9a.4/§9a.5/§12) Skips every basket with `awaiting_approval_since` set —
+ * "no abandonment while the buyer waits for approval." A column filter only, never a call
+ * into `customer_groups` (the whole point of the column, per the spec's own text: a
+ * per-row check there would be an N+1 against a peer module).
  */
 export async function sweepAbandonedCarts(
   em: EntityManager,
@@ -128,7 +135,13 @@ export async function sweepAbandonedCarts(
     const candidates = await findWithDecryption(
       em,
       Cart,
-      { tenantId: scope.tenantId, kind: 'basket' as const, status: 'active' as const, lastActivityAt: { $lt: cutoff } },
+      {
+        tenantId: scope.tenantId,
+        kind: 'basket' as const,
+        status: 'active' as const,
+        lastActivityAt: { $lt: cutoff },
+        awaitingApprovalSince: null,
+      },
       { limit: SWEEP_PAGE_SIZE, orderBy: { id: 'ASC' } },
       { tenantId: scope.tenantId },
     )
@@ -137,7 +150,7 @@ export async function sweepAbandonedCarts(
     const ids = candidates.map((cart) => cart.id)
     const affected = await em.nativeUpdate(
       Cart,
-      { id: { $in: ids }, tenantId: scope.tenantId, kind: 'basket', status: 'active' },
+      { id: { $in: ids }, tenantId: scope.tenantId, kind: 'basket', status: 'active', awaitingApprovalSince: null },
       { status: 'abandoned', resolvedAt: now, updatedAt: now },
     )
     if (affected === 0) break
@@ -206,11 +219,20 @@ export async function sweepAbandonedCarts(
  * (`releaseCartCodeReservations` above), closing the Release 4 deferral this file used to
  * carry at this exact spot. `cart.cart.expired`'s own payload is unchanged (K9 only grows
  * `cart.cart.abandoned`, §11).
+ *
+ * (rev 10 — K3, §9/§9a.4) Every transitioned basket's pending approval is withdrawn —
+ * "cart expiry ends a request earlier than the 14-day approval expiry" (§9a.4). Best-
+ * effort, same reasoning as `releaseCartCodeReservations`: the status transition already
+ * committed by the time this runs. `approvalService` is optional (soft dependency,
+ * `null` when `customer_groups`' approval service cannot be resolved) for the SAME reason
+ * `codeService` is already a duck-typed parameter here — this sweep must degrade, never
+ * throw, when a peer module's service happens to be unavailable.
  */
 export async function sweepExpiredCarts(
   em: EntityManager,
   scope: CartSweepScope,
   codeService: CartCodeServiceLike,
+  approvalService: CustomerPurchaseApprovalService | null,
   now: Date = new Date(),
 ): Promise<CartSweepResult> {
   let transitioned = 0
@@ -261,6 +283,21 @@ export async function sweepExpiredCarts(
         'cart:expire',
       )
       await releaseCartCodeReservations(em, codeService, cart, 'cart:expire')
+      try {
+        const approvalWithdrawn = await withdrawPendingCartApproval(approvalService, cart, 'cart_expired')
+        if (approvalWithdrawn) {
+          await em.nativeUpdate(
+            Cart,
+            { id: cart.id, tenantId: cart.tenantId, organizationId: cart.organizationId },
+            { awaitingApprovalSince: null },
+          )
+        }
+      } catch (error) {
+        logger.warn('cart:expire failed to withdraw pending approval', {
+          cartId: cart.id,
+          error: error instanceof Error ? error.message : error,
+        })
+      }
     }
     transitioned += affected
     if (candidates.length < SWEEP_PAGE_SIZE) break
@@ -350,10 +387,20 @@ function purgePageWhere(base: FilterQuery<Cart>, cursor: PurgeCursor): FilterQue
  * markConverted`/`cart.merge` set `resolvedAt` directly). K11 names only `expire`/`mark-
  * abandoned`; this sweep deliberately does NOT call `releaseCartCodeReservations` — see
  * NOTIFY.md for why that is a real, scoped-out gap rather than a verified no-op.
+ *
+ * (rev 10 — K3, §9/§12) Unlike the code-reservation gap just above, the pending-approval
+ * withdrawal below is NOT skipped for this sweep — §12's own text names it explicitly
+ * ("Withdraws a pending approval left on a purged basket (normally already withdrawn at
+ * expiry)"), so a basket that reaches purge with its approval still `pending` (e.g. one
+ * `cart.markConverted`/`cart.merge` resolved directly, bypassing `expire-carts`) gets the
+ * same cleanup. Called BEFORE the row is hard-deleted — the `CustomerPurchaseApproval` row
+ * lives in `customer_groups`, independent of this cart row, so there is no ordering hazard
+ * either way, but withdrawing first keeps the two steps in the order §12's text reads.
  */
 export async function purgeExpiredCarts(
   em: EntityManager,
   scope: CartSweepScope,
+  approvalService: CustomerPurchaseApprovalService | null,
   now: Date = new Date(),
 ): Promise<CartSweepResult> {
   const cutoff = new Date(now.getTime() - PURGE_RETENTION_DAYS * DAY_MS)
@@ -405,6 +452,14 @@ export async function purgeExpiredCarts(
       // (review finding — mirrors the abandon/expire sweeps' same race). A page tops out at
       // `SWEEP_PAGE_SIZE`, so the extra round trips stay bounded.
       for (const cart of purgeable) {
+        try {
+          await withdrawPendingCartApproval(approvalService, cart, 'cart_purged')
+        } catch (error) {
+          logger.warn('cart:purge-expired failed to withdraw pending approval', {
+            cartId: cart.id,
+            error: error instanceof Error ? error.message : error,
+          })
+        }
         const affected = await em.nativeDelete(Cart, { id: cart.id, tenantId: scope.tenantId })
         if (affected === 0) continue
         await emitCartLifecycleEvent(
