@@ -2,7 +2,6 @@
 
 import * as React from 'react'
 import Link from 'next/link'
-import { useParams } from 'next/navigation'
 import { ArrowLeft } from 'lucide-react'
 import { Page, PageBody } from '@open-mercato/ui/backend/Page'
 import { Button } from '@open-mercato/ui/primitives/button'
@@ -99,10 +98,9 @@ type ThreadDetailResponse = {
   proposals: ProposalRow[]
 }
 
-export default function AssistedSellingThreadPage() {
+export default function AssistedSellingThreadPage({ params }: { params?: { id?: string } }) {
   const t = useT()
-  const params = useParams<{ id: string }>()
-  const threadId = typeof params?.id === 'string' ? params.id : ''
+  const threadId = params?.id ?? ''
 
   const [data, setData] = React.useState<ThreadDetailResponse | null>(null)
   const [isLoading, setIsLoading] = React.useState(true)

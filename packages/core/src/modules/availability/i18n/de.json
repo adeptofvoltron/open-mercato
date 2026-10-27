@@ -91,5 +91,6 @@
   "availability.states.low_stock": "Geringer Bestand",
   "availability.states.not_tracked": "Nicht erfasst",
   "availability.states.out_of_stock": "Nicht vorrätig",
-  "availability.states.preorder": "Vorbestellung"
+  "availability.states.preorder": "Vorbestellung",
+  "notifications.categories.availability": "Verfügbarkeit"
 }

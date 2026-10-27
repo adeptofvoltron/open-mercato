@@ -2,7 +2,7 @@
 
 import * as React from 'react'
 import Link from 'next/link'
-import { useParams, useRouter } from 'next/navigation'
+import { useRouter } from 'next/navigation'
 import { Page, PageBody } from '@open-mercato/ui/backend/Page'
 import { Button } from '@open-mercato/ui/primitives/button'
 import { StatusBadge, type StatusBadgeVariant } from '@open-mercato/ui/primitives/status-badge'
@@ -79,11 +79,10 @@ type CartAdminDetailResponse = {
   warnings?: WarningRow[]
 }
 
-export default function CartAdminDetailPage() {
+export default function CartAdminDetailPage({ params }: { params?: { id?: string } }) {
   const t = useT()
   const router = useRouter()
-  const params = useParams<{ id: string }>()
-  const cartId = typeof params?.id === 'string' ? params.id : ''
+  const cartId = params?.id ?? ''
 
   const [data, setData] = React.useState<CartAdminDetailResponse | null>(null)
   const [isLoading, setIsLoading] = React.useState(true)

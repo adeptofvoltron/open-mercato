@@ -91,5 +91,6 @@
   "availability.states.low_stock": "재고 부족",
   "availability.states.not_tracked": "추적 안 함",
   "availability.states.out_of_stock": "품절",
-  "availability.states.preorder": "예약 주문"
+  "availability.states.preorder": "예약 주문",
+  "notifications.categories.availability": "재고 가용성"
 }

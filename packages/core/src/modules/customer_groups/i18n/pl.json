@@ -295,5 +295,6 @@
   "customer_groups.widgets.groupPicker.label": "Grupa klientów",
   "customer_groups.widgets.groupPicker.placeholder": "Szukaj grup klientów…",
   "customer_groups.widgets.groupPicker.priority": "Priorytet {priority}",
-  "customer_groups.widgets.groupPicker.unknownGroup": "Nieznana grupa ({id})"
+  "customer_groups.widgets.groupPicker.unknownGroup": "Nieznana grupa ({id})",
+  "notifications.categories.customer_groups": "Grupy klientów"
 }

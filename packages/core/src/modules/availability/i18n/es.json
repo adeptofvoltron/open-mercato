@@ -91,5 +91,6 @@
   "availability.states.low_stock": "Stock bajo",
   "availability.states.not_tracked": "Sin seguimiento",
   "availability.states.out_of_stock": "Agotado",
-  "availability.states.preorder": "Preventa"
+  "availability.states.preorder": "Preventa",
+  "notifications.categories.availability": "Disponibilidad"
 }
