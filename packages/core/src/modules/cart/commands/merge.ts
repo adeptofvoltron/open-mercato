@@ -29,8 +29,9 @@ import { cartVisibilityKey, evaluateCartVisibility, isVisible } from '../lib/vis
 import type { CartVisibilityResult } from '../lib/visibility'
 import { assertCartNotLocked } from '../lib/lockGuard'
 import { recordBasketMutationActivity } from '../lib/cartActivity'
-import { tryResolveCustomerPurchaseApprovalService } from '../lib/adminCartScope'
+import { tryResolveCustomerPurchaseApprovalService, tryResolveCartCodeService } from '../lib/adminCartScope'
 import { withdrawPendingCartApproval } from '../lib/approvalLifecycle'
+import { releaseCartCodeReservations } from '../lib/sweepers'
 import { emitCartEvent } from '../events'
 import { repriceCartCommand } from './cart'
 import type { CartRepriceInput, CartRepriceResult } from './cart'
@@ -886,6 +887,16 @@ const mergeCartCommand: CommandHandler<CartMergeInput, CartMergeResult> = {
     // touched by that dispatch, so its own side effects fire here, the only place that ever
     // will.
     await emitCrudSideEffects({ dataEngine, action: 'updated', entity: absorbedCart, identifiers: getCartIdentifiers(absorbedCart), events: cartCrudEvents, indexer: cartCrudIndexer })
+
+    // Step 6.1 (K11 gap-fill): the ABSORBED cart's reserved-but-unused promotion codes are
+    // released by `cartId`, the identical best-effort release `lib/sweepers.ts`'s own
+    // expire/abandon sweeps already apply — a merge-absorbed cart never transitions through
+    // either of those sweeps (it is already `merged`, terminal), so without this call its
+    // codes would only ever be freed by `promotions`' slow TTL sweep.
+    const codeService = tryResolveCartCodeService(ctx.container)
+    if (codeService) {
+      await releaseCartCodeReservations(em, codeService, absorbedCart, 'cart:merge')
+    }
     for (const line of newLines) {
       await emitCrudSideEffects({ dataEngine, action: 'created', entity: line, identifiers: getCartLineIdentifiers(line), indexer: cartLineCrudIndexer })
       await emitCartEvent('cart.line.added', { id: line.id, cartId: line.cartId, organizationId: line.organizationId, tenantId: line.tenantId })

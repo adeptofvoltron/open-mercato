@@ -56,7 +56,7 @@ import { commandRegistry } from '@open-mercato/shared/lib/commands/registry'
 import type { CommandBus, CommandRuntimeContext } from '@open-mercato/shared/lib/commands'
 import { isCrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 import { CatalogProduct } from '@open-mercato/core/modules/catalog/data/entities'
-import { Cart, CartLine, CartMergeLog } from '../../data/entities'
+import { Cart, CartLine, CartMergeLog, CartPromotionApplication } from '../../data/entities'
 import { hashCartToken } from '../../lib/token'
 import type { ResolvedCartRouteContext } from '../../lib/routeContext'
 import { emitCartEvent as mockedEmitCartEvent } from '../../events'
@@ -330,6 +330,9 @@ function makeCtx(opts: {
   // DI token` throw caught internally by `tryResolveCustomerPurchaseApprovalService`,
   // degrading to "nothing withdrawn" exactly as before this Step.
   customerPurchaseApprovalService?: unknown
+  // Step 6.1 (K11 gap-fill) — same "undefined degrades via Unexpected DI token" shape as
+  // `customerPurchaseApprovalService` above, caught by `tryResolveCartCodeService`.
+  promotionCodeService?: unknown
 }): CommandRuntimeContext {
   const dataEngine = makeDataEngine()
   const salesCalculationService = makeSalesCalculationService()
@@ -349,6 +352,10 @@ function makeCtx(opts: {
         if (token === 'catalogScopedProductService') return opts.catalogScopedProductService ?? makeDefaultCatalogScopedProductService()
         if (token === 'customerPurchaseApprovalService') {
           if (opts.customerPurchaseApprovalService !== undefined) return opts.customerPurchaseApprovalService
+          throw new Error(`Unexpected DI token: ${token}`)
+        }
+        if (token === 'promotionCodeService') {
+          if (opts.promotionCodeService !== undefined) return opts.promotionCodeService
           throw new Error(`Unexpected DI token: ${token}`)
         }
         throw new Error(`Unexpected DI token: ${token}`)
@@ -964,6 +971,66 @@ describe('cart.merge — K3 source-side approval withdrawal (§7.4)', () => {
     )
 
     expect(withdrawApproval).not.toHaveBeenCalled()
+  })
+})
+
+// Step 6.1 (K11 gap-fill) — `releaseCartCodeReservations` (`lib/sweepers.ts`) was only ever
+// wired into the expire/abandon/proposal-expiry sweeps; a merge-absorbed cart never passes
+// through any of those (it is already `merged`, terminal), so its own reserved-but-unused
+// promotion codes dangled until `promotions`' slow TTL sweep caught them. This proves the
+// absorbed cart's `CartPromotionApplication` rows are released by `cartId`, same as every
+// sweep call site.
+describe('cart.merge — K11 absorbed-cart code reservation release', () => {
+  it('releases every distinct codeId the absorbed (source) cart still holds', async () => {
+    seededCarts = [
+      makeCartFixture({ id: 'cart-target', tokenHash: 'target-token-hash' }),
+      makeCartFixture({ id: 'cart-guest', tokenHash: hashCartToken('guest-plain-token') }),
+    ]
+    seededCartLines = [makeLineFixture({ id: 'line-target-1', cartId: 'cart-target', productId: 'product-1', quantity: '2' })]
+
+    const handler = getMergeHandler()
+    const em = makeEm()
+    em.find.mockImplementation(async (entity: unknown, where: Record<string, unknown>) => {
+      if (entity === CartPromotionApplication) {
+        const rows = [
+          { id: 'app-1', cartId: 'cart-guest', tenantId: TENANT_ID, organizationId: ORG_ID, codeId: 'code-1' },
+          { id: 'app-2', cartId: 'cart-guest', tenantId: TENANT_ID, organizationId: ORG_ID, codeId: 'code-2' },
+        ]
+        return rows.filter((row) => matchesWhere(row, where))
+      }
+      return []
+    })
+    const releaseCode = jest.fn(async () => undefined)
+    const ctx = makeCtx({ em, promotionCodeService: { releaseCode } })
+
+    await handler.execute(
+      { targetCartId: 'cart-target', tenantId: TENANT_ID, organizationId: ORG_ID, sourceToken: 'guest-plain-token', routeContext: makeRouteContext() },
+      ctx,
+    )
+
+    expect(releaseCode).toHaveBeenCalledTimes(2)
+    expect(releaseCode).toHaveBeenCalledWith(em, 'code-1', 'cart-guest', { tenantId: TENANT_ID, organizationId: ORG_ID })
+    expect(releaseCode).toHaveBeenCalledWith(em, 'code-2', 'cart-guest', { tenantId: TENANT_ID, organizationId: ORG_ID })
+  })
+
+  it('does nothing when the absorbed cart holds no code reservations', async () => {
+    seededCarts = [
+      makeCartFixture({ id: 'cart-target', tokenHash: 'target-token-hash' }),
+      makeCartFixture({ id: 'cart-guest', tokenHash: hashCartToken('guest-plain-token') }),
+    ]
+    seededCartLines = [makeLineFixture({ id: 'line-target-1', cartId: 'cart-target', productId: 'product-1', quantity: '2' })]
+
+    const handler = getMergeHandler()
+    const em = makeEm()
+    const releaseCode = jest.fn(async () => undefined)
+    const ctx = makeCtx({ em, promotionCodeService: { releaseCode } })
+
+    await handler.execute(
+      { targetCartId: 'cart-target', tenantId: TENANT_ID, organizationId: ORG_ID, sourceToken: 'guest-plain-token', routeContext: makeRouteContext() },
+      ctx,
+    )
+
+    expect(releaseCode).not.toHaveBeenCalled()
   })
 })
 

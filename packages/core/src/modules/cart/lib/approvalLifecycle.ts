@@ -18,7 +18,19 @@ import {
 // `withdrawApproval` directly with its own actor shape instead of this helper's `system`
 // actor.
 
-export type CartApprovalWithdrawReason = 'cart_merged' | 'cart_expired' | 'cart_purged'
+// Step 6.1 (K3 gap-fill, §9a.4's "a cart-initiated withdrawal clears both in one step" rule
+// applied to the ONE transition the original Step 3.2/3.4 pass missed): a `locked` cart
+// converted via the QUOTE outcome (`salesQuoteId`) is not the "approved order went through"
+// case §9a.4 already covers — a `SalesQuote` is not yet a commitment, so a still-`pending`
+// approval left on that cart would otherwise dangle forever. The ORDER outcome
+// (`salesOrderId`) deliberately has NO member here — per K3's own table an approved-order
+// conversion leaves an `approved` approval exactly as is, and `markConverted`'s own call
+// below only ever withdraws a still-`pending` one anyway (idempotent no-op otherwise).
+export type CartApprovalWithdrawReason =
+  | 'cart_merged'
+  | 'cart_expired'
+  | 'cart_purged'
+  | 'cart_converted_as_quote'
 
 export type CartForApprovalWithdrawal = {
   tenantId: string

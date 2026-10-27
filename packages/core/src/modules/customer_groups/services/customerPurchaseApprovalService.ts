@@ -51,7 +51,7 @@ export type ApprovalActor =
 
 export type ApprovalWithdrawActor =
   | ApprovalActor
-  | { actorType: 'system'; reason: 'cart_merged' | 'cart_expired' | 'cart_purged' }
+  | { actorType: 'system'; reason: 'cart_merged' | 'cart_expired' | 'cart_purged' | 'cart_converted_as_quote' }
 
 export type ApprovalSlotView = {
   decision: CustomerPurchaseApprovalSlotDecision

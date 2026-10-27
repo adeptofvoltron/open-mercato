@@ -15,7 +15,9 @@ import { resolveCartLockTimeoutMs } from '../lib/sweepConfig'
 import { assertCartNotLocked } from '../lib/lockGuard'
 import { emitCartEvent } from '../events'
 import { approvalQualifies, computeGoodsGrossAmount } from '../lib/approvalGate'
-import { tryResolveCustomerPurchaseApprovalService } from '../lib/adminCartScope'
+import { tryResolveCustomerPurchaseApprovalService, tryResolveCartCodeService } from '../lib/adminCartScope'
+import { withdrawPendingCartApproval } from '../lib/approvalLifecycle'
+import { releaseCartCodeReservations } from '../lib/sweepers'
 import { repriceCartCommand, toCartSummary } from './cart'
 import type { CartRepriceInput, CartRepriceResult, CartSummary } from './cart'
 
@@ -560,6 +562,17 @@ const markConvertedCommand: CommandHandler<CartMarkConvertedInput, CartMarkConve
       validateConversionLineMap(input, new Set(liveLines.map((line) => line.id)))
     }
 
+    // Step 6.1 (K3 gap-fill, §9a.4): a QUOTE-outcome conversion ends the cart's own
+    // lifecycle without the approval ever reaching a terminal decision — unlike the ORDER
+    // outcome, which §9a.4 already treats as "approved, left as is." Resolved and withdrawn
+    // BEFORE the write below, same sequencing `commands/merge.ts`'s absorbed-cart path
+    // already uses, so `cart.awaitingApprovalSince` clears in the SAME flush as
+    // `cart.status`.
+    const approvalService = tryResolveCustomerPurchaseApprovalService(ctx.container)
+    const approvalWithdrawn = input.salesQuoteId !== undefined
+      ? await withdrawPendingCartApproval(approvalService, cart, 'cart_converted_as_quote')
+      : false
+
     const now = new Date()
     await withAtomicFlush(
       em,
@@ -567,6 +580,7 @@ const markConvertedCommand: CommandHandler<CartMarkConvertedInput, CartMarkConve
         () => {
           cart.status = 'converted'
           cart.resolvedAt = now
+          if (approvalWithdrawn) cart.awaitingApprovalSince = null
         },
       ],
       { transaction: true, label: 'cart.markConverted' },
@@ -581,6 +595,17 @@ const markConvertedCommand: CommandHandler<CartMarkConvertedInput, CartMarkConve
       events: cartCrudEvents,
       indexer: cartCrudIndexer,
     })
+
+    // Step 6.1 (K11 gap-fill): a converted cart's reserved-but-unused promotion codes are
+    // released by `cartId`, the SAME best-effort, by-`cartId` release every sweep in
+    // `lib/sweepers.ts` already applies on expire/abandon — closing the one lifecycle
+    // transition this file's own original pass never wired it to. Best-effort: a failed
+    // release must not fail a conversion that already committed; `promotions`' own TTL
+    // sweep is still the independent safety net.
+    const codeService = tryResolveCartCodeService(ctx.container)
+    if (codeService) {
+      await releaseCartCodeReservations(em, codeService, cart, 'cart:markConverted')
+    }
     // (rev 10 — K8/D-R5-16/D-R5-26, §11) The Release 5 payload grows additively:
     // `checkoutSessionId` (the cart's own stored session — always set on a `locked` cart,
     // never `input.checkoutSessionId`, which stays optional at the type level), plus

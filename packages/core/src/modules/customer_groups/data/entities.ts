@@ -37,6 +37,9 @@ export type CustomerPurchaseApprovalWithdrawnReason =
   | 'cart_merged'
   | 'cart_expired'
   | 'cart_purged'
+  // Step 6.1 (K3 gap-fill) — a `locked` cart's pending approval withdrawn because the cart
+  // converted via the QUOTE outcome, not the order one (see `cart/lib/approvalLifecycle.ts`).
+  | 'cart_converted_as_quote'
 
 // Groups are tenant-scoped, not organization-scoped — spec §5 note: "groups are
 // tenant-scoped here, consistent with `CatalogPriceKind`, which allows a null

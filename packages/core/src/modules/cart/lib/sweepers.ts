@@ -36,8 +36,13 @@ export type CartCodeServiceLike = {
  * re-thrown (which would retry a transition that already landed) nor treated as a failed
  * sweep — `promotions`' own `code-reservation-sweeper.ts` (its TTL-based independent
  * safety net) is still there to catch whatever this call does not reach.
+ *
+ * Exported as of Step 6.1 (K11 gap-fill): `commands/lock.ts#markConverted` and
+ * `commands/merge.ts`'s absorbed-cart finalization share this exact routine rather than
+ * re-implementing it a third/fourth time — a converted or merge-absorbed cart's reserved
+ * codes need the identical by-`cartId` release this file's own sweeps already apply.
  */
-async function releaseCartCodeReservations(
+export async function releaseCartCodeReservations(
   em: EntityManager,
   codeService: CartCodeServiceLike,
   cart: Cart,

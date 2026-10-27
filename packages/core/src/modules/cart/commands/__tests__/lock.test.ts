@@ -36,7 +36,7 @@ jest.mock('@open-mercato/shared/lib/encryption/find', () => ({
 import { commandRegistry } from '@open-mercato/shared/lib/commands/registry'
 import type { CommandBus, CommandHandler, CommandRuntimeContext } from '@open-mercato/shared/lib/commands'
 import { isCrudHttpError } from '@open-mercato/shared/lib/crud/errors'
-import { Cart, CartLine } from '../../data/entities'
+import { Cart, CartLine, CartPromotionApplication } from '../../data/entities'
 import type { ResolvedCartRouteContext } from '../../lib/routeContext'
 import { resolveCartLockTimeoutMs } from '../../lib/sweepConfig'
 import { emitCartEvent as mockedEmitCartEvent } from '../../events'
@@ -274,6 +274,9 @@ function makeCtx(opts: {
   // internally, degrading to `requiresApproval: false` exactly as before this Step.
   customerGroupsService?: unknown
   customerPurchaseApprovalService?: unknown
+  // Step 6.1 (K11 gap-fill) — same "undefined degrades via Unexpected DI token" shape as
+  // `customerPurchaseApprovalService` above, caught by `tryResolveCartCodeService`.
+  promotionCodeService?: unknown
 }): CommandRuntimeContext {
   const dataEngine = opts.dataEngine ?? makeDataEngine()
   const salesCalculationService = opts.salesCalculationService ?? makeSalesCalculationService()
@@ -295,6 +298,10 @@ function makeCtx(opts: {
         }
         if (token === 'customerPurchaseApprovalService') {
           if (opts.customerPurchaseApprovalService !== undefined) return opts.customerPurchaseApprovalService
+          throw new Error(`Unexpected DI token: ${token}`)
+        }
+        if (token === 'promotionCodeService') {
+          if (opts.promotionCodeService !== undefined) return opts.promotionCodeService
           throw new Error(`Unexpected DI token: ${token}`)
         }
         throw new Error(`Unexpected DI token: ${token}`)
@@ -1238,5 +1245,104 @@ describe('cart.markConverted', () => {
 
     expect(isCrudHttpError(captured)).toBe(true)
     expect((captured as { status: number }).status).toBe(400)
+  })
+})
+
+// Step 6.1 (K3/K11 gap-fill) — the two lifecycle side effects `markConverted`'s original
+// Step 2.10/7.5 pass never wired: withdrawing a still-pending approval on the QUOTE outcome
+// (§9a.4, mirroring `commands/merge.ts`'s source-side withdrawal), and releasing the cart's
+// reserved-but-unused promotion codes by `cartId` (mirroring `lib/sweepers.ts`'s own
+// expire/abandon sweeps).
+describe('cart.markConverted — K3/K11 gap-fill', () => {
+  it('(K3) withdraws a pending approval and clears awaitingApprovalSince when converted via the QUOTE outcome', async () => {
+    seededCarts = [
+      makeCartFixture({
+        status: 'locked',
+        checkoutSessionId: 'checkout-session-1',
+        approvalId: 'approval-1',
+        awaitingApprovalSince: new Date('2026-02-28T00:00:00.000Z'),
+      }),
+    ]
+    const handler = getHandler<CartMarkConvertedInput, CartMarkConvertedResult>('cart.markConverted')
+    const em = makeEm()
+    const withdrawApproval = jest.fn(async () => ({}))
+    const ctx = makeCtx({ em, customerPurchaseApprovalService: { withdrawApproval } })
+
+    const result = await handler.execute(
+      { cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, salesQuoteId: 'quote-1' },
+      ctx,
+    )
+
+    expect(result.cart.status).toBe('converted')
+    expect(withdrawApproval).toHaveBeenCalledWith({
+      scope: { tenantId: TENANT_ID, organizationId: ORG_ID },
+      approvalId: 'approval-1',
+      actor: { actorType: 'system', reason: 'cart_converted_as_quote' },
+    })
+    const cartRow = seededCarts.find((row) => row.id === CART_ID)!
+    expect(cartRow.awaitingApprovalSince).toBeNull()
+  })
+
+  it('(K3 regression guard) does NOT withdraw the approval when converted via the ORDER outcome', async () => {
+    seededCarts = [
+      makeCartFixture({
+        status: 'locked',
+        checkoutSessionId: 'checkout-session-1',
+        approvalId: 'approval-1',
+        awaitingApprovalSince: new Date('2026-02-28T00:00:00.000Z'),
+      }),
+    ]
+    const handler = getHandler<CartMarkConvertedInput, CartMarkConvertedResult>('cart.markConverted')
+    const em = makeEm()
+    const withdrawApproval = jest.fn(async () => ({}))
+    const ctx = makeCtx({ em, customerPurchaseApprovalService: { withdrawApproval } })
+
+    const result = await handler.execute(
+      { cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, salesOrderId: 'order-1' },
+      ctx,
+    )
+
+    expect(result.cart.status).toBe('converted')
+    expect(withdrawApproval).not.toHaveBeenCalled()
+    const cartRow = seededCarts.find((row) => row.id === CART_ID)!
+    expect(cartRow.awaitingApprovalSince).toEqual(new Date('2026-02-28T00:00:00.000Z'))
+  })
+
+  it('(K11) releases every distinct codeId the cart still holds on conversion', async () => {
+    seededCarts = [makeCartFixture({ status: 'locked', checkoutSessionId: 'checkout-session-1' })]
+    const handler = getHandler<CartMarkConvertedInput, CartMarkConvertedResult>('cart.markConverted')
+    const em = makeEm()
+    em.find.mockImplementation(async (entity: unknown, where: Record<string, unknown>) => {
+      if (entity === CartPromotionApplication) {
+        const rows = [
+          { id: 'app-1', cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, codeId: 'code-1' },
+          { id: 'app-2', cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, codeId: 'code-2' },
+        ]
+        return rows.filter((row) => matchesWhere(row, where))
+      }
+      return []
+    })
+    const releaseCode = jest.fn(async () => undefined)
+    const ctx = makeCtx({ em, promotionCodeService: { releaseCode } })
+
+    const result = await handler.execute({ cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID }, ctx)
+
+    expect(result.cart.status).toBe('converted')
+    expect(releaseCode).toHaveBeenCalledTimes(2)
+    expect(releaseCode).toHaveBeenCalledWith(em, 'code-1', CART_ID, { tenantId: TENANT_ID, organizationId: ORG_ID })
+    expect(releaseCode).toHaveBeenCalledWith(em, 'code-2', CART_ID, { tenantId: TENANT_ID, organizationId: ORG_ID })
+  })
+
+  it('(K11) does nothing when the cart holds no code reservations', async () => {
+    seededCarts = [makeCartFixture({ status: 'locked', checkoutSessionId: 'checkout-session-1' })]
+    const handler = getHandler<CartMarkConvertedInput, CartMarkConvertedResult>('cart.markConverted')
+    const em = makeEm()
+    const releaseCode = jest.fn(async () => undefined)
+    const ctx = makeCtx({ em, promotionCodeService: { releaseCode } })
+
+    const result = await handler.execute({ cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID }, ctx)
+
+    expect(result.cart.status).toBe('converted')
+    expect(releaseCode).not.toHaveBeenCalled()
   })
 })

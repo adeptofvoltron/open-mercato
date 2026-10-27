@@ -1,5 +1,6 @@
 import type { OrganizationScope } from '@open-mercato/core/modules/directory/utils/organizationScope'
 import type { CustomerPurchaseApprovalService } from '@open-mercato/core/modules/customer_groups/services/customerPurchaseApprovalService'
+import type { CartCodeServiceLike } from './sweepers'
 
 // Step 2.10 (K6/§10.2) — the two hand-written admin routes (`/carts/[id]`,
 // `/carts/[id]/reprice`) need the SAME `organizationIds` derivation `makeCrudRoute` already
@@ -51,6 +52,26 @@ export function tryResolveCustomerPurchaseApprovalService(container: {
 }): CustomerPurchaseApprovalService | null {
   try {
     return container.resolve<CustomerPurchaseApprovalService>('customerPurchaseApprovalService') ?? null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Step 6.1 (K11 gap-fill) — `promotions` is a HARD dependency of `cart` (`index.ts`'s
+ * `requires`, same as `customer_groups` above), so `promotionCodeService` is always
+ * registered in practice too, but `lib/sweepers.ts#releaseCartCodeReservations`'s own
+ * callers (the sweep workers) resolve it via `ctx.resolve` without a `try` — this helper
+ * exists for the two command call sites (`commands/lock.ts#markConverted`,
+ * `commands/merge.ts`'s absorbed-cart finalization) that need the SAME soft-DI degrade
+ * `tryResolveCustomerPurchaseApprovalService` above already uses, since a command runs in
+ * a request path rather than a worker's own fixed DI wiring.
+ */
+export function tryResolveCartCodeService(container: {
+  resolve: <T = unknown>(name: string) => T
+}): CartCodeServiceLike | null {
+  try {
+    return container.resolve<CartCodeServiceLike>('promotionCodeService') ?? null
   } catch {
     return null
   }
