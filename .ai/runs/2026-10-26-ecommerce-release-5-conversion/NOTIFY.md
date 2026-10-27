@@ -2105,3 +2105,15 @@ commit, credit link, codes/usage, gateway, lineMap, recovery — plus the public
   `assisted_selling`, where it belongs now that the module's thread/participant bookkeeping
   exists to support it properly. Both are additive, same-module-pair fixes with clear spec basis
   (§6.4/§6.6, §8.1) — appended Step 4.4-fix rather than stopping the run.
+
+## 2026-10-28T03:30:00Z — checkpoint 9 (Steps 4.1–4.4 + 4.2-fix)
+- Range: `4e97db75cd`..`008238bd42` (incl. `2c25fb7bbf`). Summary: checkout's entire B.4 submit
+  sequence (lock → reserve → credit → document → commit → codes → gateway → lineMap), its
+  recovery jobs for both `submitting` and `awaiting_payment` stuck states; assisted_selling module
+  opened (settings, threads, proposals).
+- Checks: forced full typecheck with tsbuildinfo wiped (40/40, 0 cached) pass; core sweep across
+  5 modules (121/124 suites, 1401/1418 tests, 3 expected gated skips); full checkout suite (53/53
+  suites, 407/407 tests).
+- Decisions/problems: two real gaps found and tracked this window, not papered over —
+  expire-awaiting-payment (already fixed, 4.2-fix) and assisted_selling's terminal-state
+  subscriber + re-author migration (appended as 4.4-fix, next up).
