@@ -102,6 +102,7 @@ export async function POST(req: Request) {
       organizationId: resolved.scope.organizationId,
       idempotencyKey,
       paymentMethodCode: parsed.paymentMethodCode,
+      poNumber: parsed.poNumber ?? null,
       request: req,
     }
     const { result } = await commandBus.execute<CheckoutSessionSubmitCommandInput, CheckoutSessionSubmitStageResult>(

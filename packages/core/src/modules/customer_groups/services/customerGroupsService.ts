@@ -18,12 +18,11 @@ import { CUSTOMER_GROUP_MAX_ANCESTOR_DEPTH } from '../data/validators'
 // Step 3.1 (cart approval gate, K1/D-R5-4/D-R5-37) adds `termsCurrencyCode` the same way,
 // PLUS one extra, field-specific step `applyTermsCurrencyFallback` runs after the generic
 // per-field loop below: when no group in the chain sets it, fall back to the buyer's
-// organization's base currency (D-R5-37) rather than leaving it `null`. §6.0 also names
-// `allowQuoteRequests` and `requiresPoNumber` for the plain TERMS_FIELD_NAMES treatment;
-// those two still have no caller in this run and are deliberately left unresolved here —
-// see PLAN.md "Decisions taken without the owner" — checkout B.5 (Step 5.1) must add them
-// the same way `approvalPolicy`/`termsCurrencyCode` were added, not invent a parallel
-// mechanism.
+// organization's base currency (D-R5-37) rather than leaving it `null`.
+//
+// Step 5.1 (checkout B.5, D-R5-20/D-R5-28): `allowQuoteRequests`/`requiresPoNumber` added
+// to `TERMS_FIELD_NAMES` the same plain way `approvalPolicy` was — tenant default `false`
+// for both, no fallback step of their own (unlike `termsCurrencyCode`).
 const DEFAULT_APPROVAL_POLICY: CustomerGroupApprovalPolicy = 'buyer'
 // Step 3.1 (D-R5-37): the sentinel `sources.termsCurrencyCode` carries when the value came
 // from the organization's base currency rather than any group's own `terms_currency_code`
@@ -48,6 +47,8 @@ const TERMS_FIELD_NAMES = [
   'minOrderValue',
   'approvalPolicy',
   'termsCurrencyCode',
+  'allowQuoteRequests',
+  'requiresPoNumber',
 ] as const
 type TermsFieldName = (typeof TERMS_FIELD_NAMES)[number]
 
@@ -75,6 +76,11 @@ export type ResolvedTerms = {
   // has no base currency (or no `organizationId` was supplied to resolve one against) —
   // every other case falls back to the base currency, see `applyTermsCurrencyFallback`.
   termsCurrencyCode: string | null
+  // Step 5.1 (D-R5-20): tenant default `false` — see DEFAULT_APPROVAL_POLICY's sibling
+  // pattern. Gates the `request_quote` checkout payment method.
+  allowQuoteRequests: boolean
+  // Step 5.1 (D-R5-28): tenant default `false`. Gates checkout's PO-number precondition.
+  requiresPoNumber: boolean
   sources: ResolvedTermsSources
 }
 
@@ -248,6 +254,8 @@ function tenantDefaultTerms(): ResolvedTerms {
     minOrderValue: null,
     approvalPolicy: DEFAULT_APPROVAL_POLICY,
     termsCurrencyCode: null,
+    allowQuoteRequests: false,
+    requiresPoNumber: false,
     sources: {
       priceKindId: null,
       paymentTermsDays: null,
@@ -256,6 +264,8 @@ function tenantDefaultTerms(): ResolvedTerms {
       minOrderValue: null,
       approvalPolicy: null,
       termsCurrencyCode: null,
+      allowQuoteRequests: null,
+      requiresPoNumber: null,
     },
   }
 }
@@ -285,6 +295,10 @@ function termsFieldIsSet(terms: CustomerGroupTerms, field: TermsFieldName): bool
       return terms.approvalPolicy != null
     case 'termsCurrencyCode':
       return terms.termsCurrencyCode != null
+    case 'allowQuoteRequests':
+      return terms.allowQuoteRequests != null
+    case 'requiresPoNumber':
+      return terms.requiresPoNumber != null
   }
 }
 
@@ -315,6 +329,12 @@ function applyTermsField(
       break
     case 'termsCurrencyCode':
       result.termsCurrencyCode = terms.termsCurrencyCode ?? null
+      break
+    case 'allowQuoteRequests':
+      result.allowQuoteRequests = terms.allowQuoteRequests === true
+      break
+    case 'requiresPoNumber':
+      result.requiresPoNumber = terms.requiresPoNumber === true
       break
   }
   result.sources[field] = sourceGroupId

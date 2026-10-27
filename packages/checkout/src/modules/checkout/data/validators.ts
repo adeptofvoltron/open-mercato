@@ -336,10 +336,19 @@ export const checkoutSessionDeliverySelectSchema = z.object({
 // Release 5, Step 4.2 (B.4, §9's route table: `POST /sessions/current/submit`).
 // `paymentMethodCode` is the command's own direct input per Step 4.1's resolved decision
 // ("submit takes the method as a direct input... no `POST /sessions/current/payment`
-// selection route is built"); the body carries nothing else — the `Idempotency-Key`
-// header (§7.1 precondition 2) is validated at the route, not in this schema.
+// selection route is built"); the Idempotency-Key header (§7.1 precondition 2) is
+// validated at the route, not in this schema.
+//
+// Release 5, Step 5.1 (B.5, §8.4/§9's route table: "POST .../payment | Select a method;
+// PO number"). The spec names a dedicated payment-selection route as the PO number's
+// input point, but Step 4.1 already resolved "no selection route, submit takes the method
+// directly" for `paymentMethodCode` — `poNumber` follows the SAME resolved shape rather
+// than reopening that decision for one more field. Optional at the schema level; the
+// command itself (`commands/submit.ts`) is what refuses a missing PO number with `422
+// purchase_order_number_required` when the resolved `requiresPoNumber` term demands one.
 export const checkoutSessionSubmitSchema = z.object({
   paymentMethodCode: requiredTrimmedString('checkout.validation.common.required'),
+  poNumber: optionalTrimmedString,
 })
 
 export type CheckoutSessionCreateInput = z.infer<typeof checkoutSessionCreateSchema>

@@ -14,6 +14,7 @@ import type {
   CustomerCreditService,
   ReserveCreditResult,
 } from '@open-mercato/core/modules/customer_groups/services/customerCreditService'
+import type { CustomerGroupsService, ResolvedTerms } from '@open-mercato/core/modules/customer_groups/services/customerGroupsService'
 import type { AppliedPromotion, PromotionsService } from '@open-mercato/core/modules/promotions/lib/types'
 import type { PaymentGatewayService } from '@open-mercato/core/modules/payment_gateways/lib/gateway-service'
 import { CheckoutSession, CheckoutTransaction } from '../data/entities'
@@ -41,19 +42,24 @@ import { mapGatewayStatusToCheckoutStatus } from '../lib/utils'
 // Builds EXACTLY steps 1-5 of the revised submit sequence — preconditions, `cart.lock`,
 // `availability.reserve`, on-account `reserveCredit`, idempotent document creation plus the
 // C7 goods-totals equality check — and STOPS there. `availability.commit`, credit linkage,
-// code usage, the gateway step and `markConverted`'s `lineMap` are Step 4.2's own scope; this
-// command never reaches a terminal session status (`completed`/`failed`) — on success the
-// session is left `submitting`, `submitProgress: 'document_created'`, with
-// `salesQuoteId`/`salesOrderId` written, ready for Step 4.2 to continue from exactly this
-// point. `purpose` stays `'order'` always in this Step (the quote/`request_quote` branch is
-// Step 5.1's own scope — see NOTIFY.md for why `request_quote` is refused here outright).
+// code usage, the gateway step and `markConverted`'s `lineMap` are Step 4.2's own scope.
+//
+// Release 5, Step 5.1 (checkout B.5, §8, C15-C17/D-R5-20/D-R5-23/D-R5-26/D-R5-28): adds the
+// B2B preconditions (PO number §8.4, `min_order_value` §8.5) and the quote branch (§8.6) —
+// `purpose: 'quote'` when `paymentMethodCode === 'request_quote'` (D-R5-23), which this
+// command now honors instead of refusing outright. The quote branch ends submit right after
+// document creation (§7.2 step 5's "QUOTE OUTCOME" block) via `completeQuoteOutcome` below —
+// it never reaches `continueOrderOutcome`'s steps 6-8 (no commit, no credit, no codes, no
+// gateway).
 //
 // Payment-method-selection question (tracked in NOTIFY.md after Step 2.13): RESOLVED as
 // "submit takes the method as a direct input" — `paymentMethodCode` is a required field on
 // this command's own input, never read off the session. No `POST /sessions/current/payment`
 // selection route is built by this Step (nor by any Step before it); a caller that wants one
 // can add it later purely as a convenience that stores the choice ahead of submit — this
-// command does not depend on it existing.
+// command does not depend on it existing. Step 5.1 follows the SAME resolved shape for the
+// PO number (§8.4's own "captured at the payment step" becomes a direct `poNumber` input
+// here, for the identical reason).
 //
 // Each of steps 1-5 is dispatched as its own, separately-committing call (cart.lock,
 // availability.reserve, customerCreditService.reserveCredit, sales.quotes.create,
@@ -73,6 +79,9 @@ export type CheckoutSessionSubmitCommandInput = {
   organizationId: string
   idempotencyKey: string
   paymentMethodCode: string
+  // Release 5, Step 5.1 (§8.4/D-R5-28): written to `SalesQuote.customer_reference` at
+  // document creation when the resolved `requiresPoNumber` term demands one.
+  poNumber?: string | null
   request?: Request | null
 }
 
@@ -82,7 +91,9 @@ export type CheckoutSessionSubmitStageResult = {
   stockReservationKey: string | null
   creditReservationKey: string | null
   salesQuoteId: string
-  salesOrderId: string
+  // Release 5, Step 5.1 (§8.6): `null` for the quote outcome — a `request_quote` submit
+  // never converts to an order (C16/C17), so there is no order id to report.
+  salesOrderId: string | null
 }
 
 type SubmitScope = { tenantId: string; organizationId: string }
@@ -284,14 +295,6 @@ const submitSessionCommand: CommandHandler<CheckoutSessionSubmitCommandInput, Ch
     if (!session.shippingMethod) {
       throw new CrudHttpError(422, { error: '[internal] a delivery method must be selected before submit', code: 'steps_incomplete' })
     }
-    // C15/§5.5 (request_quote, D-R5-20): Step 5.1's own scope — `cart.lock`'s `purpose`
-    // stays `'order'` unconditionally in this Step, so a quote-branch payment method cannot
-    // be honored correctly yet. Refused with the spec's own "method not offered" code rather
-    // than silently treated as a gateway/on-account method.
-    if (input.paymentMethodCode === 'request_quote') {
-      throw new CrudHttpError(422, { error: '[internal] request_quote is not available yet', code: 'payment_method_unavailable' })
-    }
-
     // Preconditions check 4 (C9, re-verified at submit per the C9 guard's own contract —
     // Step 3.5's cart/session may have drifted since session creation). Three of the four
     // comparisons compare the session's OWN stored fields against the FRESH cart peer read
@@ -315,6 +318,39 @@ const submitSessionCommand: CommandHandler<CheckoutSessionSubmitCommandInput, Ch
       },
       resolvedStoreId,
     })
+
+    // ---------------------------------------------------------------------
+    // §7.1 preconditions 6/9 (Step 5.1, B.5, D-R5-20/D-R5-23/D-R5-28): resolved ONCE here,
+    // before the CAS — cheap, no side effects, matching the spec's own "preconditions are
+    // checked before any side effect" framing as closely as this command's structure
+    // allows. Reused below for the §7.1 precondition-8 `min_order_value` check (which
+    // cannot run until the cart's locked goods gross is known, Step 3 below) and for the
+    // `cart.lock` `purpose` argument (§6).
+    // ---------------------------------------------------------------------
+    const isQuotePurpose = input.paymentMethodCode === 'request_quote'
+    const customerGroupsService = tryResolve<CustomerGroupsService>(container, 'customerGroupsService')
+    const terms: ResolvedTerms | null = customerGroupsService
+      ? await customerGroupsService.resolveTerms({
+          customerId: cartPeer.customerId,
+          customerIds: cartPeer.customerIds,
+          tenantId: scope.tenantId,
+          organizationId: scope.organizationId,
+        })
+      : null
+
+    // §5.5/§8.1: `request_quote` is only ever a real option when the resolved terms allow
+    // it — entitlement is never trusted from the client (§5.5's own wording), so this is
+    // re-checked here even though the payment-methods LISTING route already gates it.
+    if (isQuotePurpose && !terms?.allowQuoteRequests) {
+      throw new CrudHttpError(422, { error: '[internal] request_quote is not available', code: 'payment_method_unavailable' })
+    }
+
+    // §7.1 precondition 9 (D-R5-28): PO number required when the resolved term demands
+    // one — applies to BOTH outcomes (order and quote), unlike the approval gate and
+    // `min_order_value`, which D-R5-23 exempts only for `purpose: 'quote'`.
+    if (terms?.requiresPoNumber && !input.poNumber) {
+      throw new CrudHttpError(422, { error: '[internal] a purchase order number is required', code: 'purchase_order_number_required' })
+    }
 
     // §7.2 step 0: CAS open -> submitting, submit_attempt += 1, fresh keys.
     const attempt = session.submitAttempt + 1
@@ -376,7 +412,10 @@ const submitSessionCommand: CommandHandler<CheckoutSessionSubmitCommandInput, Ch
         tenantId: scope.tenantId,
         organizationId: scope.organizationId,
         checkoutSessionId: session.id,
-        purpose: 'order',
+        // §6/D-R5-23: `'quote'` skips the cart's own approval gate and (together with the
+        // explicit skip below) `min_order_value`; the visibility pass, store/channel
+        // checks and re-price still run regardless.
+        purpose: isQuotePurpose ? 'quote' : 'order',
         request: input.request,
       })
     } catch (err) {
@@ -493,6 +532,25 @@ const submitSessionCommand: CommandHandler<CheckoutSessionSubmitCommandInput, Ch
       throw new CrudHttpError(409, { error: '[internal] the cart has no lines', code: 'cart_empty' })
     }
 
+    // §7.1 precondition 8 / §8.5 (D-R5-4, D-R5-23): checked on the K1 basis (goods gross
+    // after promotions, excluding delivery) in `terms_currency_code`. §8.5's own text is
+    // explicit that a cart in another currency is simply NOT checked (never fail-closed —
+    // unlike the approval gate's own currency-mismatch rule, D-R5-4 deliberately gives
+    // these two fields opposite postures for a mismatch). Skipped entirely for a
+    // `request_quote` submit (D-R5-23).
+    if (!isQuotePurpose && terms?.minOrderValue != null && terms.termsCurrencyCode === session.currencyCode) {
+      const goodsGross = toNumber(snapshot.totals.grandTotalGrossAmount)
+      if (goodsGross < terms.minOrderValue) {
+        await compensate(container, em, session, scope, { releaseCredit: false, releaseStock: false, unlockCart: true }, { stockReservationKey, creditReservationKey })
+        throw new CrudHttpError(409, {
+          error: '[internal] the cart total is below the minimum order value',
+          code: 'below_min_order_value',
+          minOrderValue: terms.minOrderValue,
+          currencyCode: terms.termsCurrencyCode,
+        })
+      }
+    }
+
     // ---------------------------------------------------------------------
     // Step 3 (§7.2 step 3, A6/A15, D-R5-9): availability.reserve
     // ---------------------------------------------------------------------
@@ -587,6 +645,10 @@ const submitSessionCommand: CommandHandler<CheckoutSessionSubmitCommandInput, Ch
           shippingMethodCode: shippingMethod.deliveryMethodCode,
           shippingMethodSnapshot: session.shippingMethod ?? undefined,
           paymentMethodCode: input.paymentMethodCode,
+          // §8.4/D-R5-28: written regardless of outcome whenever the buyer supplied one —
+          // the resolved `requiresPoNumber` term only gates whether it is REQUIRED
+          // (checked above as a precondition), not whether it is recorded when supplied.
+          customerReference: input.poNumber ?? undefined,
           lines: quoteLines,
           adjustments: [
             ...snapshot.adjustments,
@@ -643,6 +705,26 @@ const submitSessionCommand: CommandHandler<CheckoutSessionSubmitCommandInput, Ch
       throw new CrudHttpError(500, { error: '[internal] totals did not match at document creation', code: 'totals_mismatch' })
     }
 
+    // ---------------------------------------------------------------------
+    // QUOTE OUTCOME (§7.2 step 5's own "after 5a/5b" block, Step 5.1, C16/C17/D-R5-20/
+    // D-R5-26): ends submit right here — no order conversion, no commit, no credit, no
+    // codes, no gateway. `isOnAccount` is always false when `isQuotePurpose` (the two
+    // payment method codes are mutually exclusive), so nothing was ever reserved for
+    // credit to release here.
+    // ---------------------------------------------------------------------
+    if (isQuotePurpose) {
+      await em.nativeUpdate(
+        CheckoutSession,
+        { id: session.id, ...scope },
+        { salesQuoteId: quoteId, submitProgress: 'document_created', updatedAt: new Date() },
+      )
+      session.salesQuoteId = quoteId
+      session.submitProgress = 'document_created'
+      await writeSessionEvent(em, { ...scope, sessionId: session.id, kind: 'document_created', actor: 'system', payload: { quoteId } })
+
+      return completeQuoteOutcome(container, em, session, scope, quoteId, { stockReservationKey: availabilityActive ? stockReservationKey : null })
+    }
+
     const existingOrder = await findExistingOrderById(em, scope, quoteId)
     let orderId: string
     if (existingOrder) {
@@ -667,11 +749,9 @@ const submitSessionCommand: CommandHandler<CheckoutSessionSubmitCommandInput, Ch
     await writeSessionEvent(em, { ...scope, sessionId: session.id, kind: 'document_created', actor: 'system', payload: { quoteId, orderId } })
 
     // ---------------------------------------------------------------------
-    // Steps 6-8 (Step 4.2, C5/C6/C18/C24): order outcome only — `request_quote` is
-    // refused outright at the top of this function (Step 5.1's own scope), so the quote
-    // outcome branch of §7.2 step 5/6 is never reachable from this command yet (D-R5-26's
-    // quote `lineMap` is therefore also Step 5.1's gap to close, not this Step's).
-    // `continueOrderOutcome` is a tightly-coupled sibling of this `execute()`, not a
+    // Steps 6-8 (Step 4.2, C5/C6/C18/C24): order outcome only — the quote outcome already
+    // returned above, before this point is ever reached. `continueOrderOutcome` is a
+    // tightly-coupled sibling of this `execute()`, not a
     // parallel reimplementation — `recover-stuck-submits` (workers/recover-stuck-
     // submits.worker.ts) calls the SAME function directly for a session whose
     // `submit_progress` is already `document_created`/`finalized`, re-deriving its inputs
@@ -841,6 +921,35 @@ async function buildOrderLineMap(
   return lineMap
 }
 
+// §7.2's quote-outcome block / D-R5-26: the quote's OWN lines, read directly (never
+// converted to an order) — `metadata.cartLineId` was set at step 5a, identically to the
+// order branch's own quote lines, so this is `buildOrderLineMap`'s exact sibling against
+// `sales_quote_lines` instead of `sales_order_lines`.
+async function buildQuoteLineMap(
+  em: EntityManager,
+  scope: SubmitScope,
+  quoteId: string,
+): Promise<Array<{ cartLineId: string; salesQuoteLineId: string }>> {
+  const rows = await em
+    .getKysely<{
+      sales_quote_lines: { id: string; quote_id: string; tenant_id: string; organization_id: string; metadata: Record<string, unknown> | null; deleted_at: Date | null }
+    }>()
+    .selectFrom('sales_quote_lines')
+    .select(['id', 'metadata'])
+    .where('quote_id', '=', quoteId)
+    .where('tenant_id', '=', scope.tenantId)
+    .where('organization_id', '=', scope.organizationId)
+    .where('deleted_at', 'is', null)
+    .execute()
+  const lineMap: Array<{ cartLineId: string; salesQuoteLineId: string }> = []
+  for (const row of rows) {
+    const cartLineId = typeof row.metadata?.cartLineId === 'string' ? (row.metadata.cartLineId as string) : null
+    if (!cartLineId) continue
+    lineMap.push({ cartLineId, salesQuoteLineId: row.id })
+  }
+  return lineMap
+}
+
 /**
  * §7.3's "5c-8" row: once the order exists, EVERY later failure compensates by
  * cancelling it — never a hand-rolled parallel release. `sales.order.cancelled`'s own
@@ -959,6 +1068,92 @@ export async function confirmOrderAndComplete(
     creditReservationKey: reservationKeys.creditReservationKey,
     salesQuoteId: quoteId,
     salesOrderId: orderId,
+  }
+}
+
+/**
+ * §7.2's "QUOTE OUTCOME (request_quote)" block / §8.6 (C16/C17, D-R5-20/D-R5-26): the
+ * quote already exists (document creation, step 5a/5b) — release the stock hold
+ * immediately (C16, never `availability.commit`), build the quote `lineMap` (D-R5-26),
+ * `cart.markConverted` with `salesQuoteId`, and move the session straight to `completed`
+ * with `outcomeKind: 'quote'`. No credit was ever reserved for `request_quote` (`isOnAccount`
+ * is always false for this payment method, Step 4.1's own mutual-exclusion), no codes are
+ * consumed, no gateway is ever involved — this is a terminal state on its own, not a
+ * waypoint `continueOrderOutcome` is reached from.
+ */
+// Exported for the SAME reason `confirmOrderAndComplete`/`compensateByCancellingOrder` are:
+// a session that crashes in the narrow window between document creation and this
+// function's own completion is resumed by `recover-stuck-submits` through this EXACT
+// function, re-derived from the session's own stored `paymentMethodCode`/`salesQuoteId` —
+// never a parallel reimplementation.
+export async function completeQuoteOutcome(
+  container: CommandRuntimeContext['container'],
+  em: EntityManager,
+  session: CheckoutSession,
+  scope: SubmitScope,
+  quoteId: string,
+  reservationKeys: { stockReservationKey: string | null },
+): Promise<CheckoutSessionSubmitStageResult> {
+  const trustedCtx = buildTrustedCtx(container, scope, `checkout:submit:complete-quote:${session.id}`)
+  const commandBus = container.resolve('commandBus') as CommandBus
+
+  if (reservationKeys.stockReservationKey) {
+    try {
+      await commandBus.execute('availability.release', {
+        input: { tenantId: scope.tenantId, organizationId: scope.organizationId, idempotencyKey: reservationKeys.stockReservationKey, reason: 'quote' },
+        ctx: trustedCtx,
+      })
+    } catch (err) {
+      if (err instanceof CrudHttpError && err.status === 404) {
+        // Nothing was ever reserved under this key — a no-op, matching every other
+        // `availability.release`-after-a-maybe-reserve call site in this file.
+      } else {
+        throw err
+      }
+    }
+  }
+  await writeSessionEvent(em, { ...scope, sessionId: session.id, kind: 'stock_released', actor: 'system', payload: { quoteId } })
+
+  const lineMap = await buildQuoteLineMap(em, scope, quoteId)
+  const cartService = tryResolve<CartService>(container, 'cartService')
+  if (cartService && session.cartId) {
+    await cartService.markConverted({
+      cartId: session.cartId,
+      tenantId: scope.tenantId,
+      organizationId: scope.organizationId,
+      checkoutSessionId: session.id,
+      salesQuoteId: quoteId,
+      lineMap,
+    })
+  }
+
+  await em.nativeUpdate(
+    CheckoutSession,
+    { id: session.id, ...scope },
+    { status: 'completed', outcomeKind: 'quote', completedAt: new Date(), updatedAt: new Date() },
+  )
+  session.status = 'completed'
+  session.outcomeKind = 'quote'
+
+  await writeSessionEvent(em, { ...scope, sessionId: session.id, kind: 'quote_completed', actor: 'system', payload: { quoteId, outcome: 'completed' } })
+  await emitCheckoutEvent('checkout.session.completed', {
+    sessionId: session.id,
+    tenantId: scope.tenantId,
+    organizationId: scope.organizationId,
+    cartId: session.cartId ?? null,
+    outcomeKind: 'quote',
+    salesOrderId: null,
+    salesQuoteId: quoteId,
+    paymentMethodCode: session.paymentMethodCode ?? null,
+  }).catch(() => undefined)
+
+  return {
+    session,
+    attempt: session.submitAttempt,
+    stockReservationKey: reservationKeys.stockReservationKey,
+    creditReservationKey: null,
+    salesQuoteId: quoteId,
+    salesOrderId: null,
   }
 }
 

@@ -2269,3 +2269,97 @@ commit, credit link, codes/usage, gateway, lineMap, recovery — plus the public
 - Decisions/problems: none blocking. One non-blocking deferral (time-based retention sweepers)
   carried to Step 6.1.
 - Phase 4 is complete. All 5 planned Steps + 2 fix-forwards landed; no rescues needed this phase.
+
+## 2026-10-28T05:00:00Z — Step 5.1 landed (checkout B.5 B2B — PO number, min_order_value,
+on-account/request_quote payment methods, quote branch — C15-C17/D-R5-20/23/26/28, opens Phase 5)
+
+- **`resolveTerms` gap, verified then fixed:** re-grepped `customer_groups/services/
+  customerGroupsService.ts` at the top of this Step — Step 2.5/3.1's own NOTIFY note
+  ("`allowQuoteRequests`/`requiresPoNumber`... still no caller in this run") was confirmed
+  still accurate (both fields existed on the `CustomerGroupTerms` entity, Step 1.5, but were
+  absent from `TERMS_FIELD_NAMES`/`ResolvedTerms`). Fixed the SAME way `approvalPolicy` was
+  added: both appended to `TERMS_FIELD_NAMES`, `tenantDefaultTerms()`, `termsFieldIsSet()`,
+  `applyTermsField()`; tenant default `false` for both, no base-currency-style fallback step
+  of their own (unlike `termsCurrencyCode`). `resolveTerms.test.ts`'s two full-object
+  `toEqual` assertions (tenant-default cases) updated for the two new fields; four new
+  inheritance/override tests added mirroring the existing `allowPurchaseOnAccount` pattern.
+- **PO number input location (genuine scope call — the spec names a dedicated `POST
+  .../current/payment` route for it, §9's route table and §8.4, but no such route exists
+  anywhere in this worktree).** Rather than reopening Step 4.1's own resolved "no selection
+  route, submit takes the method directly" decision for one more field, `poNumber` is an
+  additive, optional field on `checkout.session.submit`'s own input (`data/validators.ts`,
+  `commands/submit.ts`, the submit route) — the SAME resolved shape `paymentMethodCode`
+  already uses. Required (`422 purchase_order_number_required`) only when the resolved
+  `requiresPoNumber` term is `true`; written to `SalesQuote.customer_reference` whenever
+  supplied, regardless of outcome.
+- **`min_order_value` currency-mismatch semantics — corrected against this Step's own task
+  brief, per the authoritative spec.** The brief characterized D-R5-4 as a uniform
+  "fail-closed-on-mismatch rule, same as K1's currency rule." The revised spec's own §7.1
+  precondition 8 and §8.5 are explicit and unambiguous that a cart in a currency OTHER than
+  `terms_currency_code` is simply **not checked** for `min_order_value` — D-R5-4 deliberately
+  gives the approval gate (fail-closed) and `min_order_value` (skip) OPPOSITE postures for the
+  same mismatch, not the same one. Implemented per the spec (root AGENTS.md: the spec is the
+  authoritative contract; same class of brief-vs-spec call Step 3.2 made for K5). Reused the
+  SAME currency-equality comparison pattern K1 established (`terms.termsCurrencyCode ===
+  session.currencyCode`), just gated the opposite way on a mismatch. Flagging this correction
+  explicitly in case a later Step's own brief repeats the same mischaracterization.
+- **Quote branch (§7.2's "QUOTE OUTCOME" block, §8.6, C16/C17, D-R5-20/23/26):**
+  `cart.lock`'s `purpose` is now `isQuotePurpose ? 'quote' : 'order'` (previously hardcoded
+  `'order'`); `request_quote` is re-verified against the resolved `allowQuoteRequests` at
+  submit (entitlement never trusted from the client, §5.5), not just at the payment-methods
+  listing. After document creation (step 5a/5b, including the C7 goods-totals equality
+  check, which still applies to the quote outcome), a new `completeQuoteOutcome` (exported,
+  sibling of `confirmOrderAndComplete`/`compensateByCancellingOrder`) releases the stock hold
+  immediately via `availability.release(..., reason: 'quote')` — never `availability.commit`
+  — builds the quote's own `lineMap` (`buildQuoteLineMap`, reading `sales_quote_lines`
+  instead of `sales_order_lines`, D-R5-26), calls `cart.markConverted({ salesQuoteId,
+  lineMap })`, and moves the session straight to `completed`/`outcomeKind: 'quote'`. No
+  credit was ever reserved for `request_quote` (`isOnAccount` is always false for it — the
+  two payment method codes are mutually exclusive), no codes are consumed, no gateway is
+  ever called. `sales.quotes.convert_to_order` is never reached for this outcome.
+  `CheckoutSessionSubmitStageResult.salesOrderId` widened to `string | null` (the backing
+  `CheckoutSession.salesOrderId` column was already nullable; this is the first caller that
+  can genuinely return `null`). Two additive `SessionEventKind` members added
+  (`stock_released`, `quote_completed`) — plain TS union growth, no migration, no existing
+  kind repurposed for a semantically different action.
+- **`recover-stuck-submits` extended for the quote outcome's own narrow crash window.** A
+  `request_quote` submit normally completes synchronously within one call and never reaches
+  a `submitting`+stuck observation; the only way this job ever sees one is a crash between
+  document creation and `completeQuoteOutcome` returning. Added a `paymentMethodCode ===
+  'request_quote'` branch (checked before the pre-existing order-outcome branch) that resumes
+  through `completeQuoteOutcome` instead of `continueOrderOutcome` — the latter would
+  wrongly try to confirm/commit/gateway an order that, for a quote outcome, never exists.
+- **On-account/request_quote listing (`lib/paymentMethods.ts`, `GET .../payment-methods`
+  route).** `listCheckoutPaymentMethods` now also resolves the cart's buyer identity (via
+  `lookupCartPeerById`, when the session has a `cartId`) and lists `{ kind: 'on_account' }`
+  when `allowPurchaseOnAccount` is true AND `customerCreditService.checkCredit` (amount
+  `'0'`, since the real payable amount is unknown this early) does not refuse with
+  `no_account`/`on_hold`/`not_permitted` (a `limit_exceeded` reason is NOT excluded from the
+  listing — it is not amount-aware at this point, matching §5.5's own three-reason
+  catalogue), and `{ kind: 'request_quote' }` when `allowQuoteRequests` is true — two fully
+  independent gates, neither offered to a guest cart (no buyer identity at all). No
+  per-method `label`/translation added (unlike the gateway entries' merchant-configured
+  `label`) — these are reason-code-style machine identifiers, same precedent `checkCredit`'s
+  own `reason` field already sets for this response surface; a future storefront client
+  i18n's them by `kind` client-side.
+- **NOT implemented in this Step, flagged forward again:** PLAN.md's own Step 3.2 entry
+  (K3's fifth row) asks "whichever Step first makes `cart.markConverted` reachable with
+  `salesQuoteId` set" to withdraw the cart's still-pending approval on that conversion. This
+  Step is that Step, but the fix belongs inside `cart` (`commands/lock.ts#markConverted` or a
+  subscriber on `cart.cart.converted`), outside this Step's `checkout`-only module boundary
+  and its own explicit Implementation bullet list. Left exactly as PLAN.md already flagged
+  it — no caller in this worktree reaches `markConverted({ salesQuoteId })` with a cart that
+  ALSO has a pending approval (the quote branch's own happy-path tests use carts with no
+  approval at all), so there is nothing to regress by deferring it again.
+- Files: `packages/core/src/modules/customer_groups/services/customerGroupsService.ts`
+  (+`allowQuoteRequests`/`requiresPoNumber`), `__tests__/resolveTerms.test.ts` (+4 tests, 2
+  updated). `packages/checkout/src/modules/checkout/lib/paymentMethods.ts` (+on_account/
+  request_quote), `lib/__tests__/paymentMethods.test.ts` (+8 tests); `api/sessions/current/
+  payment-methods/route.ts` (+buyer identity via `lookupCartPeerById`); `data/validators.ts`
+  (+`poNumber`); `api/sessions/current/submit/route.ts` (+`poNumber` passthrough);
+  `commands/submit.ts` (terms resolution, PO/min_order_value preconditions, quote `purpose`,
+  `completeQuoteOutcome`/`buildQuoteLineMap`, widened `salesOrderId` type), `commands/
+  __tests__/submit.test.ts` (+13 tests, 1 updated); `lib/sessionEvents.ts` (+`stock_released`/
+  `quote_completed`); `workers/recover-stuck-submits.worker.ts` (+quote-outcome resume
+  branch).
+- Opens Phase 5.

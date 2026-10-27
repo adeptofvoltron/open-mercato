@@ -12,19 +12,21 @@ function descriptor(overrides: Record<string, unknown> = {}) {
   }
 }
 
-function makeContainer(descriptorService: unknown) {
+function makeContainer(descriptorService: unknown, registrations: Record<string, unknown> = {}) {
   return {
     resolve: (name: string) => {
       if (name === 'paymentGatewayDescriptorService') {
         if (!descriptorService) throw new Error('paymentGatewayDescriptorService is not registered')
         return descriptorService
       }
+      if (name in registrations) return registrations[name]
       throw new Error(`Unexpected DI token: ${name}`)
     },
   }
 }
 
 const SCOPE = { tenantId: 'tenant-1', organizationId: 'org-1' }
+const BUYER = { customerId: 'customer-1', customerIds: ['customer-1'] }
 
 describe('listCheckoutPaymentMethods (§5.5, B.3 gateway half only)', () => {
   it('returns an empty list — never throws — when payment_gateways is absent (C10/D-R5-18)', async () => {
@@ -68,6 +70,98 @@ describe('listCheckoutPaymentMethods (§5.5, B.3 gateway half only)', () => {
     const container = makeContainer({ listResolved })
 
     const result = await listCheckoutPaymentMethods(container, SCOPE, { currencyCode: 'USD', linkGatewayProviderKey: null })
+
+    expect(result).toEqual([])
+  })
+})
+
+// Release 5, Step 5.1 (§5.5's B.5 half, D-R5-5/D-R5-20). `on_account` and `request_quote`
+// gate independently of one another — covered by separate tests rather than one combined
+// "B.5 methods" test, per the Step's own test list.
+describe('listCheckoutPaymentMethods (§5.5, B.5 half: on_account/request_quote)', () => {
+  it('never offers on_account or request_quote to a guest cart (no buyer identity, OQ1)', async () => {
+    const resolveTerms = jest.fn(async () => ({ allowPurchaseOnAccount: true, allowQuoteRequests: true }))
+    const container = makeContainer(null, { customerGroupsService: { resolveTerms } })
+
+    const result = await listCheckoutPaymentMethods(container, SCOPE, { currencyCode: 'USD', linkGatewayProviderKey: null, buyer: null })
+
+    expect(result).toEqual([])
+    expect(resolveTerms).not.toHaveBeenCalled()
+  })
+
+  it('offers request_quote when allowQuoteRequests resolves true, independent of on_account', async () => {
+    const resolveTerms = jest.fn(async () => ({ allowPurchaseOnAccount: false, allowQuoteRequests: true }))
+    const container = makeContainer(null, { customerGroupsService: { resolveTerms } })
+
+    const result = await listCheckoutPaymentMethods(container, SCOPE, { currencyCode: 'USD', linkGatewayProviderKey: null, buyer: BUYER })
+
+    expect(result).toEqual([{ kind: 'request_quote' }])
+    expect(resolveTerms).toHaveBeenCalledWith({
+      customerId: BUYER.customerId,
+      customerIds: BUYER.customerIds,
+      tenantId: SCOPE.tenantId,
+      organizationId: SCOPE.organizationId,
+    })
+  })
+
+  it('omits request_quote when allowQuoteRequests resolves false (tenant default)', async () => {
+    const resolveTerms = jest.fn(async () => ({ allowPurchaseOnAccount: false, allowQuoteRequests: false }))
+    const container = makeContainer(null, { customerGroupsService: { resolveTerms } })
+
+    const result = await listCheckoutPaymentMethods(container, SCOPE, { currencyCode: 'USD', linkGatewayProviderKey: null, buyer: BUYER })
+
+    expect(result).toEqual([])
+  })
+
+  it('offers on_account when allowPurchaseOnAccount is true and checkCredit finds an eligible account, independent of request_quote', async () => {
+    const resolveTerms = jest.fn(async () => ({ allowPurchaseOnAccount: true, allowQuoteRequests: false }))
+    const checkCredit = jest.fn(async () => ({ allowed: true, reason: 'ok' }))
+    const container = makeContainer(null, { customerGroupsService: { resolveTerms }, customerCreditService: { checkCredit } })
+
+    const result = await listCheckoutPaymentMethods(container, SCOPE, { currencyCode: 'USD', linkGatewayProviderKey: null, buyer: BUYER })
+
+    expect(result).toEqual([{ kind: 'on_account' }])
+    expect(checkCredit).toHaveBeenCalledWith({ scope: SCOPE, buyer: { customerId: BUYER.customerId }, currencyCode: 'USD', amount: '0' })
+  })
+
+  it.each(['no_account', 'on_hold', 'not_permitted'] as const)(
+    'omits on_account when checkCredit refuses with reason=%s',
+    async (reason) => {
+      const resolveTerms = jest.fn(async () => ({ allowPurchaseOnAccount: true, allowQuoteRequests: false }))
+      const checkCredit = jest.fn(async () => ({ allowed: false, reason }))
+      const container = makeContainer(null, { customerGroupsService: { resolveTerms }, customerCreditService: { checkCredit } })
+
+      const result = await listCheckoutPaymentMethods(container, SCOPE, { currencyCode: 'USD', linkGatewayProviderKey: null, buyer: BUYER })
+
+      expect(result).toEqual([])
+    },
+  )
+
+  it('omits on_account when the term itself disallows purchase on account, without ever calling checkCredit', async () => {
+    const resolveTerms = jest.fn(async () => ({ allowPurchaseOnAccount: false, allowQuoteRequests: false }))
+    const checkCredit = jest.fn()
+    const container = makeContainer(null, { customerGroupsService: { resolveTerms }, customerCreditService: { checkCredit } })
+
+    const result = await listCheckoutPaymentMethods(container, SCOPE, { currencyCode: 'USD', linkGatewayProviderKey: null, buyer: BUYER })
+
+    expect(result).toEqual([])
+    expect(checkCredit).not.toHaveBeenCalled()
+  })
+
+  it('offers both on_account and request_quote together when both terms allow it', async () => {
+    const resolveTerms = jest.fn(async () => ({ allowPurchaseOnAccount: true, allowQuoteRequests: true }))
+    const checkCredit = jest.fn(async () => ({ allowed: true, reason: 'ok' }))
+    const container = makeContainer(null, { customerGroupsService: { resolveTerms }, customerCreditService: { checkCredit } })
+
+    const result = await listCheckoutPaymentMethods(container, SCOPE, { currencyCode: 'USD', linkGatewayProviderKey: null, buyer: BUYER })
+
+    expect(result).toEqual([{ kind: 'on_account' }, { kind: 'request_quote' }])
+  })
+
+  it('returns no B.5 methods — never throws — when customer_groups is absent (C10/D-R5-18)', async () => {
+    const container = makeContainer(null, {})
+
+    const result = await listCheckoutPaymentMethods(container, SCOPE, { currencyCode: 'USD', linkGatewayProviderKey: null, buyer: BUYER })
 
     expect(result).toEqual([])
   })

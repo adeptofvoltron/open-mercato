@@ -64,6 +64,8 @@ function makeTerms(overrides: Partial<CustomerGroupTerms> & { groupId: string })
     minOrderValue: null,
     approvalPolicy: null,
     termsCurrencyCode: null,
+    allowQuoteRequests: null,
+    requiresPoNumber: null,
     metadata: null,
     createdAt: new Date('2026-01-01T00:00:00.000Z'),
     updatedAt: new Date('2026-01-01T00:00:00.000Z'),
@@ -179,6 +181,8 @@ describe('DefaultCustomerGroupsService.resolveTerms', () => {
       minOrderValue: null,
       approvalPolicy: 'buyer',
       termsCurrencyCode: null,
+      allowQuoteRequests: false,
+      requiresPoNumber: false,
       sources: {
         priceKindId: null,
         paymentTermsDays: null,
@@ -187,6 +191,8 @@ describe('DefaultCustomerGroupsService.resolveTerms', () => {
         minOrderValue: null,
         approvalPolicy: null,
         termsCurrencyCode: null,
+        allowQuoteRequests: null,
+        requiresPoNumber: null,
       },
     })
     expect(em.findOne).toHaveBeenCalledTimes(1)
@@ -294,6 +300,8 @@ describe('DefaultCustomerGroupsService.resolveTerms', () => {
       minOrderValue: null,
       approvalPolicy: 'buyer',
       termsCurrencyCode: null,
+      allowQuoteRequests: false,
+      requiresPoNumber: false,
       sources: {
         priceKindId: null,
         paymentTermsDays: null,
@@ -302,6 +310,8 @@ describe('DefaultCustomerGroupsService.resolveTerms', () => {
         minOrderValue: null,
         approvalPolicy: null,
         termsCurrencyCode: null,
+        allowQuoteRequests: null,
+        requiresPoNumber: null,
       },
     })
   })
@@ -323,6 +333,66 @@ describe('DefaultCustomerGroupsService.resolveTerms', () => {
 
     expect(result.approvalPolicy).toBe('both')
     expect(result.sources.approvalPolicy).toBe(PARENT_ID)
+  })
+
+  // Step 5.1 (checkout B.5, D-R5-20/D-R5-28): `allowQuoteRequests`/`requiresPoNumber`
+  // resolve through the exact same per-field inheritance as `allowPurchaseOnAccount` —
+  // tenant default `false`, no base-currency-style fallback step of their own.
+  it('inherits allowQuoteRequests from the parent when the child row leaves it unset (D-R5-20)', async () => {
+    const memberships = [makeMembership({ id: 'm-child', groupId: CHILD_ID })]
+    const groups = [
+      makeGroup({ id: CHILD_ID, code: 'child', name: 'Child', priority: 20, parentId: PARENT_ID }),
+      makeGroup({ id: PARENT_ID, code: 'parent', name: 'Parent', priority: 10, parentId: null }),
+    ]
+    const terms = [
+      makeTerms({ groupId: CHILD_ID, allowQuoteRequests: null }),
+      makeTerms({ groupId: PARENT_ID, allowQuoteRequests: true }),
+    ]
+    const em = createEm({ memberships, groups, terms })
+    const service = new DefaultCustomerGroupsService(em as never)
+
+    const result = await service.resolveTerms({ customerId: CUSTOMER_ID, tenantId: TENANT_ID })
+
+    expect(result.allowQuoteRequests).toBe(true)
+    expect(result.sources.allowQuoteRequests).toBe(PARENT_ID)
+  })
+
+  it('lets an explicit false on the child override an inherited allowQuoteRequests true', async () => {
+    const memberships = [makeMembership({ id: 'm-child', groupId: CHILD_ID })]
+    const groups = [
+      makeGroup({ id: CHILD_ID, code: 'child', name: 'Child', priority: 20, parentId: PARENT_ID }),
+      makeGroup({ id: PARENT_ID, code: 'parent', name: 'Parent', priority: 10, parentId: null }),
+    ]
+    const terms = [
+      makeTerms({ groupId: CHILD_ID, allowQuoteRequests: false }),
+      makeTerms({ groupId: PARENT_ID, allowQuoteRequests: true }),
+    ]
+    const em = createEm({ memberships, groups, terms })
+    const service = new DefaultCustomerGroupsService(em as never)
+
+    const result = await service.resolveTerms({ customerId: CUSTOMER_ID, tenantId: TENANT_ID })
+
+    expect(result.allowQuoteRequests).toBe(false)
+    expect(result.sources.allowQuoteRequests).toBe(CHILD_ID)
+  })
+
+  it('inherits requiresPoNumber from the parent when the child row leaves it unset (D-R5-28)', async () => {
+    const memberships = [makeMembership({ id: 'm-child', groupId: CHILD_ID })]
+    const groups = [
+      makeGroup({ id: CHILD_ID, code: 'child', name: 'Child', priority: 20, parentId: PARENT_ID }),
+      makeGroup({ id: PARENT_ID, code: 'parent', name: 'Parent', priority: 10, parentId: null }),
+    ]
+    const terms = [
+      makeTerms({ groupId: CHILD_ID, requiresPoNumber: null }),
+      makeTerms({ groupId: PARENT_ID, requiresPoNumber: true }),
+    ]
+    const em = createEm({ memberships, groups, terms })
+    const service = new DefaultCustomerGroupsService(em as never)
+
+    const result = await service.resolveTerms({ customerId: CUSTOMER_ID, tenantId: TENANT_ID })
+
+    expect(result.requiresPoNumber).toBe(true)
+    expect(result.sources.requiresPoNumber).toBe(PARENT_ID)
   })
 
   // Step 3.1 (D-R5-4/D-R5-37): `termsCurrencyCode` resolves through the same per-field

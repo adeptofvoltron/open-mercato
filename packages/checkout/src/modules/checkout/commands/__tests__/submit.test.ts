@@ -153,6 +153,23 @@ type Harness = {
   policyResolutionServiceAvailable: boolean
   salesCalculationService: { calculateDocumentTotals: jest.Mock }
   promotionsService: { useCode: jest.Mock; registerUsage: jest.Mock } | null
+  customerGroupsService: { resolveTerms: jest.Mock } | null
+}
+
+function makeTerms(overrides: FakeRow = {}): FakeRow {
+  return {
+    allowPurchaseOnAccount: true,
+    allowQuoteRequests: false,
+    requiresPoNumber: false,
+    minOrderValue: null,
+    termsCurrencyCode: 'USD',
+    approvalPolicy: 'buyer',
+    priceKindId: null,
+    paymentTermsDays: null,
+    approvalRequiredAbove: null,
+    sources: {},
+    ...overrides,
+  }
 }
 
 function buildHarness(opts: {
@@ -173,6 +190,9 @@ function buildHarness(opts: {
   seededQuotes?: FakeRow[]
   seededOrders?: FakeRow[]
   seededOrderLines?: FakeRow[]
+  seededQuoteLines?: FakeRow[]
+  customerGroupsServiceAvailable?: boolean
+  terms?: FakeRow
 } = {}): Harness {
   const seededSessions = [opts.session ?? makeSession()]
   const seededQuotes = opts.seededQuotes ?? []
@@ -262,6 +282,14 @@ function buildHarness(opts: {
         registerUsage: jest.fn(async () => (opts.registerUsageResult ?? { ok: true, budgetExceeded: [] })),
       }
 
+  const customerGroupsService = opts.customerGroupsServiceAvailable === false
+    ? null
+    : {
+        resolveTerms: jest.fn(async () => (opts.terms ?? makeTerms())),
+      }
+
+  const seededQuoteLines = opts.seededQuoteLines ?? []
+
   const registrations: Record<string, unknown> = {
     em: null, // set below once `em` is built (needs `registrations` reference first)
     commandBus: { execute: commandBusExecute },
@@ -271,6 +299,7 @@ function buildHarness(opts: {
     ...(opts.policyResolutionServiceAvailable === false ? {} : { policyResolutionService: {} }),
     ...(paymentGatewayService ? { paymentGatewayService } : {}),
     ...(promotionsService ? { promotionsService } : {}),
+    ...(customerGroupsService ? { customerGroupsService } : {}),
   }
 
   function unqualify(col: string): string {
@@ -318,7 +347,9 @@ function buildHarness(opts: {
             return rows.find((row) => builder.matches(row))
           },
           async execute() {
-            const rows = table === 'sales_order_lines' ? seededOrderLines : []
+            const rows = table === 'sales_order_lines' ? seededOrderLines
+              : table === 'sales_quote_lines' ? seededQuoteLines
+              : []
             return rows.filter((row) => builder.matches(row))
           },
         }
@@ -355,6 +386,7 @@ function buildHarness(opts: {
     policyResolutionServiceAvailable: opts.policyResolutionServiceAvailable !== false,
     salesCalculationService,
     promotionsService,
+    customerGroupsService,
   }
 }
 
@@ -544,8 +576,18 @@ describe('checkout.session.submit (B.4, steps 1-5 of §7.2/C19)', () => {
     await expect(getHandler().execute(BASE_INPUT, h.ctx)).rejects.toMatchObject({ status: 422, body: expect.objectContaining({ code: 'steps_incomplete' }) })
   })
 
-  it('refuses request_quote outright (Step 5.1 scope — purpose stays "order" in this Step)', async () => {
-    const h = buildHarness()
+  it('refuses request_quote with 422 payment_method_unavailable when allowQuoteRequests resolves false (entitlement never trusted from the client, §5.5)', async () => {
+    const h = buildHarness({ terms: makeTerms({ allowQuoteRequests: false }) })
+
+    await expect(getHandler().execute({ ...BASE_INPUT, paymentMethodCode: 'request_quote' }, h.ctx)).rejects.toMatchObject({
+      status: 422,
+      body: expect.objectContaining({ code: 'payment_method_unavailable' }),
+    })
+    expect(h.cartService.lock).not.toHaveBeenCalled()
+  })
+
+  it('refuses request_quote the same way when customer_groups is absent (fail-closed)', async () => {
+    const h = buildHarness({ customerGroupsServiceAvailable: false })
 
     await expect(getHandler().execute({ ...BASE_INPUT, paymentMethodCode: 'request_quote' }, h.ctx)).rejects.toMatchObject({
       status: 422,
@@ -718,5 +760,113 @@ describe('checkout.session.submit (B.4, steps 6-8 of §7.2/C19 — Step 4.2)', (
     expect(h.seededSessions[0]).toMatchObject({ status: 'awaiting_payment', submitProgress: 'payment_initiated' })
     expect(h.cartService.markConverted).not.toHaveBeenCalled()
     expect(result.salesOrderId).toBeTruthy()
+  })
+})
+
+describe('checkout.session.submit (B.5, §8/C15-C17, D-R5-20/23/26/28 — Step 5.1)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks()
+  })
+
+  it('the quote branch (request_quote, terms allow it): locks with purpose "quote", releases stock (never commits), reserves no credit, converts no order, markConverted with the quote lineMap, completes with outcomeKind "quote"', async () => {
+    const h = buildHarness({
+      terms: makeTerms({ allowQuoteRequests: true }),
+      seededQuoteLines: [
+        { id: 'quote-line-1', quote_id: 'quote-1', tenant_id: TENANT_ID, organization_id: ORG_ID, metadata: { cartLineId: 'line-1' }, deleted_at: null },
+      ],
+    })
+
+    const result = await getHandler().execute({ ...BASE_INPUT, paymentMethodCode: 'request_quote' }, h.ctx)
+
+    expect(h.cartService.lock).toHaveBeenCalledWith(expect.objectContaining({ purpose: 'quote' }))
+    expect(h.commandBusExecute).toHaveBeenCalledWith('availability.release', expect.objectContaining({
+      input: expect.objectContaining({ idempotencyKey: 'checkout:session-submit-1:1:stock', reason: 'quote' }),
+    }))
+    expect(h.commandBusExecute).not.toHaveBeenCalledWith('availability.commit', expect.anything())
+    expect(h.customerCreditService?.reserveCredit).not.toHaveBeenCalled()
+    expect(h.commandBusExecute).not.toHaveBeenCalledWith('sales.quotes.convert_to_order', expect.anything())
+    expect(h.cartService.markConverted).toHaveBeenCalledWith(expect.objectContaining({
+      salesQuoteId: result.salesQuoteId,
+      lineMap: [{ cartLineId: 'line-1', salesQuoteLineId: 'quote-line-1' }],
+    }))
+    expect(h.seededSessions[0]).toMatchObject({ status: 'completed', outcomeKind: 'quote', salesQuoteId: result.salesQuoteId })
+    expect(result.salesOrderId).toBeNull()
+  })
+
+  it('the quote branch never calls the payment gateway', async () => {
+    const h = buildHarness({ terms: makeTerms({ allowQuoteRequests: true }) })
+
+    await getHandler().execute({ ...BASE_INPUT, paymentMethodCode: 'request_quote' }, h.ctx)
+
+    const paymentGatewayService = h.ctx.container.resolve('paymentGatewayService') as { createPaymentSession: jest.Mock }
+    expect(paymentGatewayService.createPaymentSession).not.toHaveBeenCalled()
+  })
+
+  it('min_order_value refuses a too-small cart (goods gross below the threshold, same currency)', async () => {
+    const h = buildHarness({ terms: makeTerms({ minOrderValue: 500, termsCurrencyCode: 'USD' }) })
+
+    await expect(getHandler().execute(BASE_INPUT, h.ctx)).rejects.toMatchObject({
+      status: 409,
+      body: expect.objectContaining({ code: 'below_min_order_value', minOrderValue: 500, currencyCode: 'USD' }),
+    })
+    expect(h.cartService.unlock).toHaveBeenCalled()
+    expect(h.seededSessions[0].status).toBe('open')
+    expect(h.commandBusExecute).not.toHaveBeenCalledWith('availability.reserve', expect.anything())
+  })
+
+  it('min_order_value lets a cart at or above the threshold proceed', async () => {
+    const h = buildHarness({ terms: makeTerms({ minOrderValue: 120, termsCurrencyCode: 'USD' }) })
+
+    await expect(getHandler().execute(BASE_INPUT, h.ctx)).resolves.toMatchObject({ salesOrderId: expect.any(String) })
+  })
+
+  it('min_order_value is NOT checked when the cart currency differs from terms_currency_code (fail-open, D-R5-4/§8.5)', async () => {
+    const h = buildHarness({ terms: makeTerms({ minOrderValue: 999999, termsCurrencyCode: 'EUR' }) })
+
+    await expect(getHandler().execute(BASE_INPUT, h.ctx)).resolves.toMatchObject({ salesOrderId: expect.any(String) })
+  })
+
+  it('min_order_value is SKIPPED for a request_quote submit (D-R5-23), even far below the threshold', async () => {
+    const h = buildHarness({ terms: makeTerms({ allowQuoteRequests: true, minOrderValue: 999999, termsCurrencyCode: 'USD' }) })
+
+    await expect(getHandler().execute({ ...BASE_INPUT, paymentMethodCode: 'request_quote' }, h.ctx)).resolves.toMatchObject({ salesQuoteId: expect.any(String) })
+  })
+
+  it('requires a PO number with 422 purchase_order_number_required when the resolved term demands one and none was supplied', async () => {
+    const h = buildHarness({ terms: makeTerms({ requiresPoNumber: true }) })
+
+    await expect(getHandler().execute(BASE_INPUT, h.ctx)).rejects.toMatchObject({
+      status: 422,
+      body: expect.objectContaining({ code: 'purchase_order_number_required' }),
+    })
+    expect(h.cartService.lock).not.toHaveBeenCalled()
+  })
+
+  it('accepts a supplied PO number and writes it to customerReference at document creation', async () => {
+    const h = buildHarness({ terms: makeTerms({ requiresPoNumber: true }) })
+
+    await getHandler().execute({ ...BASE_INPUT, poNumber: 'PO-12345' }, h.ctx)
+
+    expect(h.commandBusExecute).toHaveBeenCalledWith('sales.quotes.create', expect.objectContaining({
+      input: expect.objectContaining({ customerReference: 'PO-12345' }),
+    }))
+  })
+
+  it('leaves the PO number absent/optional when the resolved term does not require one', async () => {
+    const h = buildHarness({ terms: makeTerms({ requiresPoNumber: false }) })
+
+    await expect(getHandler().execute(BASE_INPUT, h.ctx)).resolves.toMatchObject({ salesOrderId: expect.any(String) })
+    expect(h.commandBusExecute).toHaveBeenCalledWith('sales.quotes.create', expect.objectContaining({
+      input: expect.objectContaining({ customerReference: undefined }),
+    }))
+  })
+
+  it('a PO number is required for the quote outcome too (D-R5-28 applies regardless of purpose)', async () => {
+    const h = buildHarness({ terms: makeTerms({ allowQuoteRequests: true, requiresPoNumber: true }) })
+
+    await expect(getHandler().execute({ ...BASE_INPUT, paymentMethodCode: 'request_quote' }, h.ctx)).rejects.toMatchObject({
+      status: 422,
+      body: expect.objectContaining({ code: 'purchase_order_number_required' }),
+    })
   })
 })

@@ -54,9 +54,16 @@ export type SessionEventKind =
   | 'credit_reserved'
   | 'document_created'
   | 'stock_committed'
+  // Release 5, Step 5.1 (§7.2/§8.6, C16): the quote outcome's own successful stock
+  // release — distinct from `compensation`'s "something failed, release what was taken"
+  // and from `stock_committed`'s "stock was taken permanently".
+  | 'stock_released'
   | 'promotions_registered'
   | 'payment_initiated'
   | 'payment_result'
+  // Release 5, Step 5.1 (§8.6, D-R5-20): the quote outcome's own terminal event — distinct
+  // from `payment_result`, which implies a payment attempt that never happens for a quote.
+  | 'quote_completed'
   | 'approval_state'
   | 'recovery'
   | 'compensation'

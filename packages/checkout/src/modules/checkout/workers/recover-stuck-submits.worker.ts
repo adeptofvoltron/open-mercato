@@ -6,7 +6,7 @@ import { findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 import { createLogger } from '@open-mercato/shared/lib/logger'
 import type { CartService } from '@open-mercato/core/modules/cart/lib/cartService'
 import { CheckoutSession } from '../data/entities'
-import { compensate, continueOrderOutcome } from '../commands/submit'
+import { compensate, completeQuoteOutcome, continueOrderOutcome } from '../commands/submit'
 import { writeSessionEvent } from '../lib/sessionEvents'
 import { emitCheckoutEvent } from '../events'
 import { tryResolve } from '../lib/tryResolve'
@@ -71,6 +71,43 @@ export async function recoverOneStuckSubmit(
   scope: RecoveryScope,
 ): Promise<void> {
   const progress = session.submitProgress
+
+  // Release 5, Step 5.1 (§8.6, D-R5-20): a `request_quote` submit only ever reaches
+  // `submit_progress = 'document_created'` (never `finalized` — steps 6-8 do not exist
+  // for a quote outcome), and the live path completes it within the SAME call, well
+  // before this job's `STUCK_THRESHOLD_MS` could ever observe it mid-flight. The only way
+  // a session is found here with `paymentMethodCode === 'request_quote'` is a crash in
+  // the narrow window between document creation and `completeQuoteOutcome` returning —
+  // resumed through that EXACT function, never `continueOrderOutcome` (which would
+  // wrongly try to confirm/commit/gateway an order that for a quote outcome never exists).
+  if (progress === 'document_created' && session.paymentMethodCode === 'request_quote') {
+    if (!session.salesQuoteId) {
+      logger.error('[internal] recover-stuck-submits: quote-outcome session is missing salesQuoteId to resume forward', {
+        sessionId: session.id,
+        progress,
+      })
+      return
+    }
+    try {
+      await completeQuoteOutcome(container, em, session, scope, session.salesQuoteId, {
+        stockReservationKey: session.stockReservationKey ?? null,
+      })
+      await writeSessionEvent(em, { ...scope, sessionId: session.id, kind: 'recovery', actor: 'system', payload: { action: 'resumed', fromProgress: progress } })
+      return
+    } catch (err) {
+      const startedAt = session.submitStartedAt ? session.submitStartedAt.getTime() : 0
+      if (Date.now() - startedAt < RECOVERY_GIVE_UP_MS) {
+        logger.warn('[internal] recover-stuck-submits: quote resume attempt failed, will retry next tick', { err, sessionId: session.id, progress })
+        return
+      }
+      logger.error('[internal] recover-stuck-submits: giving up on an old stuck quote attempt, compensating', { err, sessionId: session.id, progress })
+      await safeUnlockCart(container, session, scope)
+      await em.nativeUpdate(CheckoutSession, { id: session.id, ...scope }, { status: 'failed', failureCode: 'submit_recovery_failed', updatedAt: new Date() })
+      await writeSessionEvent(em, { ...scope, sessionId: session.id, kind: 'recovery', actor: 'system', payload: { action: 'gave_up', fromProgress: progress } })
+      await emitCheckoutEvent('checkout.session.failed', { sessionId: session.id, tenantId: scope.tenantId, organizationId: scope.organizationId, cartId: session.cartId ?? null, attempt: session.submitAttempt, failureCode: 'submit_recovery_failed' }).catch(() => undefined)
+      return
+    }
+  }
 
   if (progress === 'document_created' || progress === 'finalized') {
     // §12.1: "Quote present, not converted, order outcome -> resume forward from 5b

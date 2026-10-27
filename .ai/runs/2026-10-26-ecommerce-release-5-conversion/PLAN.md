@@ -56,7 +56,7 @@
 | 4 | 4.4 | assisted_selling: threads/participants/messages + staff author routes wrapping `cart.proposal.create` | dispatch:standard | done | pending |
 | 4 | 4.4-fix | assisted_selling: terminal-state subscriber (buyer accept/reject/expiry → thread/proposal rows) + migrate Step 3.3's provisional re-author subscriber in from `cart` | dispatch:standard | done | pending |
 | 4 | 4.5 | assisted_selling: buyer thread routes (Phase 2.1) + `/thread/events` (Phase 2.2) + retention/erasure (Phase 2.5) | dispatch:standard | done | pending |
-| 5 | 5.1 | checkout: B.5 B2B — PO term, `min_order_value`, on-account eligibility, `request_quote` method (D-R5-20), quote branch (C15–C17) | dispatch:standard | todo | — |
+| 5 | 5.1 | checkout: B.5 B2B — PO term, `min_order_value`, on-account eligibility, `request_quote` method (D-R5-20), quote branch (C15–C17) | dispatch:standard | done | pending |
 | 5 | 5.2 | checkout: approval-resume subscriber (C11) + session-route identity binding (D-R5-33) | dispatch:standard | todo | — |
 | 5 | 5.3 | assisted_selling: rep console (Phase 2.3) — inbox, thread, composer, proposal builder | dispatch:standard | todo | — |
 | 5 | 5.4 | assisted_selling: Phase 4 attribution — entity, `cart.cart.converted` subscriber, `GET /attributions`, console report | dispatch:standard | todo | — |
@@ -1566,6 +1566,36 @@ commit `c92470d8d5`).
   Alternative considered: a new `store_required` buyer error code — rejected as an
   unnecessary, spec-silent addition to §6.10's closed error-code table for an edge case the
   spec itself never anticipated on this side.
+- Step 5.1 (`min_order_value` currency-mismatch posture, task brief vs. the authoritative
+  spec): the executor brief characterized D-R5-4 as one uniform "fail-closed-on-mismatch
+  rule" covering both the approval gate and `min_order_value`. The revised spec's own §7.1
+  precondition 8 and §8.5 say the opposite for `min_order_value`: "a cart in another currency
+  is not checked" — i.e. skipped (fail-open), not refused. Implemented per the spec (root
+  AGENTS.md: the spec is authoritative; same class of brief-vs-spec call Step 3.2 made for
+  K5's `approval_id`-clearing question). Alternative considered: implement the brief's literal
+  "fail-closed" instruction — rejected as contradicting the spec's own explicit, two-place
+  text with no stated reason to diverge.
+- Step 5.1 (PO number input location, §9's route table names a `POST .../current/payment`
+  route that does not exist anywhere in this worktree): added `poNumber` as an additive,
+  optional field on `checkout.session.submit`'s own input instead of building the missing
+  selection route — the identical resolved shape Step 4.1 already chose for
+  `paymentMethodCode` ("submit takes the method as a direct input... no selection route is
+  built"). Alternative considered: build the `POST .../current/payment` route now, since §8.4
+  literally says the PO is "captured at the payment step" — rejected as reopening a decision
+  Step 4.1 already made deliberately and explicitly for the sibling field on the exact same
+  route table row, for no reason specific to the PO number that wouldn't apply equally to
+  `paymentMethodCode` itself.
+- Step 5.1 (K3's fifth row — withdraw a cart's pending approval on a `purpose: 'quote'`
+  conversion, flagged by Step 3.2 for "whichever Step first makes `cart.markConverted`
+  reachable with `salesQuoteId` set"): this Step is that Step, but did NOT implement it — the
+  fix belongs inside `cart` (`commands/lock.ts#markConverted` or a `cart.cart.converted`
+  subscriber), outside this Step's own `checkout`-only Implementation bullet list and module
+  boundary. Left flagged exactly as Step 3.2 already flagged it, for a future Step (or a
+  dedicated follow-up) to pick up explicitly. Alternative considered: implement it here as a
+  small, additive `cart`-module change since the shape is simple — rejected as crossing into
+  a different module's command than this Step's brief named, and Step 3.2's own text already
+  noted the reason-value choice ("a fourth reason value may be needed... the owner should
+  decide which") needs an owner call this Step has no more standing to make than Step 3.2 did.
 
 ## External References
 

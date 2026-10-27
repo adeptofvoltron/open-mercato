@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { z } from 'zod'
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import { listCheckoutPaymentMethods } from '../../../../lib/paymentMethods'
+import { lookupCartPeerById } from '../../../../lib/cartPeer'
 import { readCheckoutSessionToken, resolveCurrentSession } from '../../../../lib/currentSessionRoute'
 import {
   buildCheckoutSessionScopedRateLimitKey,
@@ -52,9 +53,16 @@ export async function GET(req: Request) {
       linkGatewayProviderKey = link?.gatewayProviderKey ?? null
     }
 
+    // Release 5, Step 5.1 (§5.5's B.5 half): the cart's own buyer identity gates
+    // `on_account`/`request_quote` — a session with no cart attached yet (or whose cart
+    // peer cannot be read) has no identity to resolve terms against, same as a guest.
+    const cartPeer = session.cartId ? await lookupCartPeerById(em, session.cartId, scope) : null
+    const buyer = cartPeer ? { customerId: cartPeer.customerId, customerIds: cartPeer.customerIds } : null
+
     const methods = await listCheckoutPaymentMethods(container, scope, {
       currencyCode: session.currencyCode,
       linkGatewayProviderKey,
+      buyer,
     })
 
     return NextResponse.json({ methods })
