@@ -1950,3 +1950,61 @@ commit, credit link, codes/usage, gateway, lineMap, recovery — plus the public
   schedule registration itself. Full `checkout` suite: 53/53 suites, 407/407 tests (+1 suite,
   +10 tests over Step 4.2's own 52/397), zero regressions. `yarn tsc --noEmit` on `checkout`
   clean after wiping every `tsconfig.tsbuildinfo` repo-wide first.
+
+## 2026-10-27T06:18:18Z — executor: Step 4.3 landed, `assisted_selling` module scaffold + store settings
+- New module `packages/core/src/modules/assisted_selling/`: `index.ts` (no hard `requires` —
+  `cart`'s proposal seam and `ecommerce`'s `storeContextService.resolveForBuyer` are Step
+  4.4/4.5's own soft-dependency reads, nothing in this Step touches either), `acl.ts` (single
+  feature `assisted_selling.settings.manage`, matching §6.1's literal route table which names
+  no separate `.settings.view`), `setup.ts` (`admin: ['assisted_selling.*']` only — least
+  privilege, D-R5-7's precedent, no `employee` grant since there's no `.view` feature to split
+  off), `data/entities.ts` (`AssistedSellingStoreSettings`: full `ai|rep|both|off` mode enum
+  reserved per S10, `proposal_ttl_seconds`/`max_proposal_lines`/`conversation_retention_days`/
+  `idle_close_days`/`ai_proposals_require_rep_approval`/`ai_max_proposals_per_thread_per_hour`/
+  `ai_max_turns_per_thread_per_hour`/`ai_agent_user_id` all shipped now per §5.6's own "ship
+  with their defaults so Phase 3 is additive" instruction; unique `(tenant_id, organization_id,
+  store_id)`), `data/validators.ts` (`.strict()` update schema over exactly the five Release
+  5-exposed fields — a body naming any `ai_*` field is a `400`; `assistedSellingReleaseModeSchema
+  = z.enum(['rep', 'off'])` is the actual write-path refusal of `ai`/`both`), `lib/settings.ts`
+  (plain `loadAssistedSellingStoreSettings`/`resolveEffectiveAssistedSellingSettings`, no DI
+  service — mirrors `warranty_claims`'s own settings precedent), `commands/shared.ts` +
+  `commands/settings.ts` (`assisted_selling.settings.save`, upsert with the SAME
+  create-then-retry-on-unique-violation pattern `warranty_claims.settings.save` uses, optimistic-
+  locked via `enforceCommandOptimisticLockWithGuards`), `api/settings/[storeId]/route.ts`
+  (`GET`/`PUT`, both gated on `assisted_selling.settings.manage`; returns §5.6 defaults when no
+  row exists; `storeId` is an opaque FK — no `ecommerce.EcommerceStore` existence check, mirrors
+  `availability.AvailabilityPolicy.storeId`'s own precedent), `i18n/{en,de,es,ko,pl}.json`
+  (7 error keys, English text duplicated across locales per the `cart.errors.*` precedent),
+  `migrations/Migration20261027120000_assisted_selling.ts` + `.snapshot-open-mercato.json`
+  (hand-authored — the sandbox's local Postgres holds unrelated prior-session schema state,
+  same risk Step 2.10 already flagged for `yarn db:generate`). No `events.ts` (nothing to
+  declare yet — 15 other core modules ship with none either) and no `di.ts` (no cross-module DI
+  consumer exists yet; see PLAN.md's "Decisions taken without the owner" for the full reasoning
+  on both, plus the ACL/store-existence calls above).
+- Module registration: `apps/mercato/src/modules.ts` gets an active `{ id: 'assisted_selling',
+  from: '@open-mercato/core' }` right after `cart`. The create-app template stays commented out
+  via the MAINTAINER-AUTHORED mechanism (`scripts/template-sync.ts`'s `TEMPLATE_COMMENTED_
+  MODULES` map, applied by `yarn template:sync:fix`) — hand-editing the template file directly
+  does not survive a sync-fix run (verified: a first fix attempt before adding the map entry
+  silently uncommented it). Added the `assisted_selling` entry to that map (same shape/rationale
+  as `availability`'s own entry) and re-ran the fix; `template-modules-parity.test.ts`'s two
+  cases and `yarn template:sync` both pass clean.
+- Tests: `__tests__/validators.test.ts` (9 cases — mode refuses ai/both at both the bare-enum
+  and the scoped-save-schema level, `.strict()` refuses an `ai_*` field, TTL bounds), `commands/
+  __tests__/settings.test.ts` (6 cases — create-with-defaults, partial update, the first-save
+  optimistic-lock race mirrored from `warranty_claims`'s own concurrency test, cross-tenant and
+  cross-organization scope refusal before any DB read). 13/13 new tests pass
+  (`yarn jest src/modules/assisted_selling` in `packages/core`).
+- Checks (local mode, every `tsconfig.tsbuildinfo` wiped repo-wide first): `yarn generate` —
+  clean, new module/route/command discovered (`api-route-shard.002.assisted_selling.generated.ts`,
+  `assisted_selling:commands:settings` in `command-loaders.generated.ts`); fixed one real
+  mistake this surfaced (the OpenAPI bundler's static-import resolution caught a route importing
+  `ASSISTED_SELLING_STORE_SETTINGS_RESOURCE_KIND` from the wrong file — the constant is defined
+  in `commands/shared.ts`, not re-exported by `commands/settings.ts`; fixed the route's import
+  before the second `yarn generate` ran clean at 714/714 OpenAPI paths). `yarn tsc --noEmit` on `core`
+  clean. `eslint` on every changed/new file clean (exit 0; the "Pages directory cannot be
+  found" line is Next's own informational noise, unrelated). `yarn template:sync` clean.
+- Not built in this Step, by its own explicit scope: threads/participants/messages/proposals
+  (Step 4.4), buyer routes + retention/erasure (Step 4.5), the rep console (Step 5.3),
+  attribution (Step 5.4) — nothing in this Step's module reads or writes `cart`/`ecommerce` at
+  all yet.

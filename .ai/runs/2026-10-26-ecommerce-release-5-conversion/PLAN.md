@@ -52,7 +52,7 @@
 | 4 | 4.1 | checkout: B.4 submit sequence part 1 — preconditions, lock, `availability.reserve`, `reserveCredit`, idempotent document creation (C3/C7) | dispatch:standard | done | pending |
 | 4 | 4.2 | checkout: B.4 submit sequence part 2 — commit, credit link, codes/usage, gateway, `lineMap`, recovery table (C5/C6/C18/C24) | dispatch:standard | done | pending |
 | 4 | 4.2-fix | checkout: `expire-awaiting-payment` job (C1/§12 gap-fill — async gateway sessions never complete without it) | dispatch:standard | done | pending |
-| 4 | 4.3 | assisted_selling: module scaffold, store settings, `mode: rep\|off` validator, module registration (D-R5-36) | dispatch:standard | todo | — |
+| 4 | 4.3 | assisted_selling: module scaffold, store settings, `mode: rep\|off` validator, module registration (D-R5-36) | dispatch:standard | done | pending |
 | 4 | 4.4 | assisted_selling: threads/participants/messages + staff author routes wrapping `cart.proposal.create` | dispatch:standard | todo | — |
 | 4 | 4.5 | assisted_selling: buyer thread routes (Phase 2.1) + `/thread/events` (Phase 2.2) + retention/erasure (Phase 2.5) | dispatch:standard | todo | — |
 | 5 | 5.1 | checkout: B.5 B2B — PO term, `min_order_value`, on-account eligibility, `request_quote` method (D-R5-20), quote branch (C15–C17) | dispatch:standard | todo | — |
@@ -1294,6 +1294,70 @@ commit `c92470d8d5`).
   `CheckoutSession.paymentIntentRef` = the provider's own session id). No probe/no-match/
   probe-error are all treated identically as "no definitive answer" → compensate, per §12's
   own "otherwise compensate" (never treated as a success by default).
+
+- Step 4.3 (`assisted_selling` ACL, §6.1's own literal route table): declared only
+  `assisted_selling.settings.manage`, gating BOTH `GET` and `PUT /settings/:storeId` — the
+  spec's own §6.1 table names that one feature for both methods, with no sibling `.settings.
+  view`. Thread/message/proposal/attribution feature ids (also named in §6.1/§6.2) are Step
+  4.4/4.5's own scope and are deliberately NOT pre-declared, following Step 1.7's "defer a
+  feature id until the entity/route it gates exists" precedent rather than Step 1.7's rejected
+  alternative (placeholder features with nothing to test against). `setup.ts` gives `admin`
+  only (`assisted_selling.*`); `employee` gets nothing, since least-privilege (D-R5-7's
+  precedent) has no `.view` feature to grant separately from `.manage` here.
+- Step 4.3 (`di.ts`, not built): settings are read/written through plain exported functions
+  (`lib/settings.ts#loadAssistedSellingStoreSettings`/`resolveEffectiveAssistedSellingSettings`)
+  and a registered command (`commands/settings.ts`), mirroring `warranty_claims`'s own settings
+  precedent (`lib/settings.ts` + `commands/settings.ts`, no DI service) exactly rather than the
+  spec's `customer_groups`/`availability`-style DI-registered service classes. No other module
+  needs to resolve assisted-selling settings in this Step's scope (cart/ecommerce are callees
+  of `assisted_selling`, never the reverse), so there is no cross-module DI consumer to justify
+  a service yet. If Step 4.4/4.5 need the mode check from WITHIN this module's own commands/
+  routes, they import these same lib functions directly (same package, no DI indirection
+  needed); a DI service becomes worth building only if a FOREIGN module ever needs a
+  `tryResolve`-able read, which nothing in this run's scope does.
+- Step 4.3 (`store_id` existence, S9/§6.1's "404 for a store outside the caller's
+  organizations"): NOT validated against `ecommerce.EcommerceStore` — `storeId` is treated as
+  an opaque FK id, scoped only by `(tenant_id, organization_id, store_id)` on the settings row
+  itself, mirroring `availability.AvailabilityPolicy.storeId`'s own precedent (that module's
+  per-store policy doesn't verify the store exists either, per its own code comment "not yet a
+  real entity in this repo"). The spec's "404 for a store outside the caller's organizations"
+  guarantee falls out of the row itself being organization-scoped (a caller can only ever read/
+  write a settings row inside ITS OWN `organizationId`), not from a second cross-module
+  existence check. Revisit if a later Step (the rep console, 5.3) needs a store PICKER that
+  must enumerate only real stores — that is a UI concern for `ecommerce`'s own store list API,
+  not this route's job.
+- Step 4.3 (`events.ts`, omitted entirely rather than shipped empty): this Step declares and
+  emits no events (Step 4.4 is the first to need `assisted_selling.proposal.*`/`.message.
+  posted`), and 15 other `packages/core/src/modules/*` modules (e.g. `api_keys`, `audit_logs`,
+  `configs`, `dashboards`, `feature_toggles`, `portal`) already ship with no `events.ts` file
+  at all rather than one exporting an empty array — confirmed by listing every core module
+  directory. Matching that existing, more-common convention rather than inventing a vacuous
+  file.
+- Step 4.3 (module registration / create-app template, D22/D-R5-36 precedent, exact mechanism
+  found): `apps/mercato/src/modules.ts` gets an ACTIVE `{ id: 'assisted_selling', from:
+  '@open-mercato/core' }` entry (right after `cart`, its seam dependency). The create-app
+  template's own copy is NOT hand-edited directly — `scripts/template-sync.ts` exports a
+  `TEMPLATE_COMMENTED_MODULES` map (one entry per module that stays commented-out-with-an-
+  explanation in the template rather than stripped, e.g. `cart`/`availability`/`ecommerce`/
+  `promotions`) that `yarn template:sync:fix` applies as a literal find-and-replace over the
+  mirrored file; a module id missing from that map gets mirrored ACTIVE (verified the hard way:
+  a first `template:sync:fix` run before this map entry existed synced the template's
+  `assisted_selling` line uncommented, which `packages/create-app/src/lib/template-modules-
+  parity.test.ts`'s own byte-for-byte assertion would have caught before merge). Added an
+  `assisted_selling` entry to `TEMPLATE_COMMENTED_MODULES` (same shape, same no-harness-case
+  rationale as `availability`'s own entry, naming `.ai/guides/modules/assisted_selling/
+  index.md`), re-ran `yarn template:sync:fix`, and confirmed both
+  `template-modules-parity.test.ts` cases pass and `yarn template:sync` reports clean parity.
+  This is the established, maintainer-authored mechanism for "active in the app, commented out
+  in the template" — editing the template file by hand would have been silently overwritten by
+  the next `template:sync:fix` run.
+- Step 4.3 (migration, hand-authored rather than `yarn db:generate`): the sandbox's local
+  Postgres instance holds schema state from unrelated prior QA/dev sessions (`om_qa_*`/
+  `om_cart49` databases, confirmed via `psql -l`), the same condition Step 2.10's NOTIFY entry
+  already documented for this exact risk. Hand-authored `Migration20261027120000_assisted_
+  selling.ts` (one `create table` + one `unique` constraint, matching `data/entities.ts`
+  column-for-column) and its `.snapshot-open-mercato.json` entry directly, rather than risk an
+  unrelated-drift diff the "coding-agent exception" would then require manually pruning.
 
 ## External References
 
