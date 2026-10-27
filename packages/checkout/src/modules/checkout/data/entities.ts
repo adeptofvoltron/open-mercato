@@ -333,8 +333,12 @@ export class CheckoutLinkCartTemplate {
   properties: ['organizationId', 'tenantId', 'linkId', 'idempotencyKey'],
   options: { unique: true },
 })
+// Release 5, Step 4.2 (§4.4): the session-backed gateway step's own idempotent lookup
+// ("one `CheckoutTransaction` per session") — a session has no `linkId` to key by.
+@Index({ properties: ['organizationId', 'tenantId', 'sessionId'] })
 export class CheckoutTransaction {
   [OptionalProps]?:
+    | 'linkId'
     | 'idempotencyKey'
     | 'customerData'
     | 'firstName'
@@ -347,6 +351,9 @@ export class CheckoutTransaction {
     | 'acceptedLegalConsents'
     | 'ipAddress'
     | 'userAgent'
+    | 'sessionId'
+    | 'orderId'
+    | 'quoteId'
     | 'createdAt'
     | 'updatedAt'
 
@@ -359,8 +366,13 @@ export class CheckoutTransaction {
   @Property({ name: 'tenant_id', type: 'uuid' })
   tenantId!: string
 
-  @Property({ name: 'link_id', type: 'uuid' })
-  linkId!: string
+  // Release 5, Step 4.2 (§4.4, "extended, additive"). Nullable since this Step's own
+  // session-backed gateway payments (§7.2 step 7) create a `CheckoutTransaction` with NO
+  // link at all for a buyer-initiated session — Phase A's link-locking bookkeeping
+  // (`checkout.transaction.create`/`.updateStatus`) stays link-only; the session path
+  // writes this entity directly instead (see `commands/submit.ts`).
+  @Property({ name: 'link_id', type: 'uuid', nullable: true })
+  linkId?: string | null
 
   @Property({ type: 'text' })
   status!: 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled' | 'expired'
@@ -406,6 +418,17 @@ export class CheckoutTransaction {
 
   @Property({ name: 'user_agent', type: 'text', nullable: true })
   userAgent?: string | null
+
+  // Release 5, Step 4.2 (§4.4). Set only by the session-backed gateway step (§7.2 step 7,
+  // `commands/submit.ts`); null forever on every Phase A (link-only) row.
+  @Property({ name: 'session_id', type: 'uuid', nullable: true })
+  sessionId?: string | null
+
+  @Property({ name: 'order_id', type: 'uuid', nullable: true })
+  orderId?: string | null
+
+  @Property({ name: 'quote_id', type: 'uuid', nullable: true })
+  quoteId?: string | null
 
   @Property({ name: 'created_at', type: Date, onCreate: () => new Date() })
   createdAt: Date = new Date()

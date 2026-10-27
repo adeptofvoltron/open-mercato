@@ -1,4 +1,5 @@
 import type { EntityManager } from '@mikro-orm/postgresql'
+import { asValue } from 'awilix'
 import type { CommandBus, CommandHandler, CommandRuntimeContext } from '@open-mercato/shared/lib/commands'
 import { registerCommand } from '@open-mercato/shared/lib/commands'
 import { buildTrustedCommandContext } from '@open-mercato/shared/lib/commands/trusted-context'
@@ -13,12 +14,19 @@ import type {
   CustomerCreditService,
   ReserveCreditResult,
 } from '@open-mercato/core/modules/customer_groups/services/customerCreditService'
-import { CheckoutSession } from '../data/entities'
+import type { AppliedPromotion, PromotionsService } from '@open-mercato/core/modules/promotions/lib/types'
+import type { PaymentGatewayService } from '@open-mercato/core/modules/payment_gateways/lib/gateway-service'
+import { CheckoutSession, CheckoutTransaction } from '../data/entities'
 import {
   assertCartMatchesCheckoutScope,
   resolveRequestStoreIdForConsistencyCheck,
 } from '../lib/cartSessionConsistency'
-import { lookupCartEnteredCodes, lookupCartPeerById } from '../lib/cartPeer'
+import {
+  lookupCartAppliedPromotionEffects,
+  lookupCartEnteredCodes,
+  lookupCartPeerById,
+  lookupPromotionNames,
+} from '../lib/cartPeer'
 import { lookupCartLinePeers } from '../lib/cartLinesPeer'
 import { getOrComputeDeliveryOptions } from '../lib/deliveryRateCache'
 import { computeDeliveryOptions } from '../lib/deliveryRateQuote'
@@ -27,6 +35,7 @@ import { evaluateDeliveryDiscount } from '../lib/promotionsDeliveryEvaluation'
 import { writeSessionEvent } from '../lib/sessionEvents'
 import { tryResolve } from '../lib/tryResolve'
 import { emitCheckoutEvent } from '../events'
+import { mapGatewayStatusToCheckoutStatus } from '../lib/utils'
 
 // Release 5, Step 4.1 (checkout B.4 submit, §7.1/§7.2 steps 1-5, C3/C7/C19, D-R5-24/D-R5-30).
 // Builds EXACTLY steps 1-5 of the revised submit sequence — preconditions, `cart.lock`,
@@ -157,7 +166,7 @@ type CompensationFlags = { releaseCredit: boolean; releaseStock: boolean; unlock
  * the session is left `submitting` (recoverable by Step 4.2's own job) rather than silently
  * returning to `open` while a reservation may still be live (§7.3: "never swallowed").
  */
-async function compensate(
+export async function compensate(
   container: CommandRuntimeContext['container'],
   em: EntityManager,
   session: CheckoutSession,
@@ -322,6 +331,10 @@ const submitSessionCommand: CommandHandler<CheckoutSessionSubmitCommandInput, Ch
         submitIdempotencyKey: input.idempotencyKey,
         stockReservationKey,
         creditReservationKey,
+        // Step 4.2: persisted so `recover-stuck-submits` (C24) and a resumed continuation
+        // can read it back off the session — Step 4.1 took it as a direct command input
+        // but never wrote it onto the entity.
+        paymentMethodCode: input.paymentMethodCode,
         submitStartedAt: new Date(),
         submitProgress: null,
         failureCode: null,
@@ -336,6 +349,7 @@ const submitSessionCommand: CommandHandler<CheckoutSessionSubmitCommandInput, Ch
     session.submitAttempt = attempt
     session.stockReservationKey = stockReservationKey
     session.creditReservationKey = creditReservationKey
+    session.paymentMethodCode = input.paymentMethodCode
 
     await emitCheckoutEvent('checkout.session.submitted', {
       sessionId: session.id,
@@ -652,14 +666,28 @@ const submitSessionCommand: CommandHandler<CheckoutSessionSubmitCommandInput, Ch
 
     await writeSessionEvent(em, { ...scope, sessionId: session.id, kind: 'document_created', actor: 'system', payload: { quoteId, orderId } })
 
-    return {
+    // ---------------------------------------------------------------------
+    // Steps 6-8 (Step 4.2, C5/C6/C18/C24): order outcome only — `request_quote` is
+    // refused outright at the top of this function (Step 5.1's own scope), so the quote
+    // outcome branch of §7.2 step 5/6 is never reachable from this command yet (D-R5-26's
+    // quote `lineMap` is therefore also Step 5.1's gap to close, not this Step's).
+    // `continueOrderOutcome` is a tightly-coupled sibling of this `execute()`, not a
+    // parallel reimplementation — `recover-stuck-submits` (workers/recover-stuck-
+    // submits.worker.ts) calls the SAME function directly for a session whose
+    // `submit_progress` is already `document_created`/`finalized`, re-deriving its inputs
+    // from the session's own stored columns instead of local variables this function
+    // computed in steps 1-5.
+    return continueOrderOutcome(container, {
       session,
+      scope,
       attempt,
+      paymentMethodCode: input.paymentMethodCode,
       stockReservationKey: availabilityActive ? stockReservationKey : null,
       creditReservationKey: isOnAccount ? creditReservationKey : null,
-      salesQuoteId: quoteId,
-      salesOrderId: orderId,
-    }
+      quoteId,
+      orderId,
+      request: input.request,
+    })
   },
 }
 
@@ -697,6 +725,483 @@ async function findExistingOrderById(
     .where('deleted_at', 'is', null)
     .executeTakeFirst()
   return row ? { id: row.id } : null
+}
+
+// ===========================================================================
+// Step 4.2 (C5/C6/C18/C24): steps 6-8 of §7.2 — order outcome: commit, credit link,
+// codes/usage, gateway, lineMap, completion/compensation. A tightly-coupled sibling of
+// `submitSessionCommand.execute` above, called from exactly one place there AND from
+// `workers/recover-stuck-submits.worker.ts` (C24's "resume forward... each sub-step is
+// idempotent under its key" — the SAME function, not a parallel reimplementation).
+// ===========================================================================
+
+export type ContinueOrderOutcomeInput = {
+  session: CheckoutSession
+  scope: SubmitScope
+  attempt: number
+  paymentMethodCode: string
+  stockReservationKey: string | null
+  creditReservationKey: string | null
+  quoteId: string
+  orderId: string
+  request?: Request | null
+}
+
+// §12.1/C24: the order-status dictionary (`sales.order_status`) is a per-tenant,
+// per-organization DICTIONARY — `sales` has no plain `status` input on its own update
+// schema (only `statusEntryId`, resolved server-side to a value), so transitioning an
+// order to `confirmed`/`canceled` needs this id first. Read via the SAME "FK-id +
+// snapshot" raw read every other cross-module lookup in this file already uses — never an
+// import of `sales/lib/dictionaries.ts` or the `dictionaries` module's own entities, which
+// would turn `sales`'s soft D-R5-18 peer dependency into a hard one.
+async function resolveSalesOrderStatusEntryId(
+  em: EntityManager,
+  scope: SubmitScope,
+  value: 'confirmed' | 'canceled',
+): Promise<string> {
+  const candidates = value === 'canceled' ? ['canceled', 'cancelled'] : ['confirmed']
+  const row = await em
+    .getKysely<{
+      dictionaries: { id: string; tenant_id: string; organization_id: string; key: string; deleted_at: Date | null }
+      dictionary_entries: { id: string; dictionary_id: string; tenant_id: string; organization_id: string; normalized_value: string }
+    }>()
+    .selectFrom('dictionary_entries')
+    .innerJoin('dictionaries', 'dictionaries.id', 'dictionary_entries.dictionary_id')
+    .select(['dictionary_entries.id as id'])
+    .where('dictionaries.tenant_id', '=', scope.tenantId)
+    .where('dictionaries.organization_id', '=', scope.organizationId)
+    .where('dictionaries.key', '=', 'sales.order_status')
+    .where('dictionaries.deleted_at', 'is', null)
+    .where('dictionary_entries.tenant_id', '=', scope.tenantId)
+    .where('dictionary_entries.organization_id', '=', scope.organizationId)
+    .where('dictionary_entries.normalized_value', 'in', candidates)
+    .executeTakeFirst()
+  if (!row) {
+    throw new CrudHttpError(503, {
+      error: '[internal] the sales order-status dictionary is not provisioned for this organization',
+      code: 'checkout_sessions_unavailable',
+    })
+  }
+  return row.id
+}
+
+async function findCheckoutTransactionBySession(
+  em: EntityManager,
+  scope: SubmitScope,
+  sessionId: string,
+): Promise<CheckoutTransaction | null> {
+  return em.findOne(CheckoutTransaction, { sessionId, tenantId: scope.tenantId, organizationId: scope.organizationId })
+}
+
+async function loadOrderGrandTotalGross(
+  em: EntityManager,
+  scope: SubmitScope,
+  orderId: string,
+): Promise<{ amount: string; currencyCode: string }> {
+  const row = await em
+    .getKysely<{
+      sales_orders: { id: string; tenant_id: string; organization_id: string; grand_total_gross_amount: string; currency_code: string }
+    }>()
+    .selectFrom('sales_orders')
+    .select(['grand_total_gross_amount', 'currency_code'])
+    .where('id', '=', orderId)
+    .where('tenant_id', '=', scope.tenantId)
+    .where('organization_id', '=', scope.organizationId)
+    .executeTakeFirst()
+  if (!row) throw notFound('[internal] sales order not found')
+  return { amount: row.grand_total_gross_amount, currencyCode: row.currency_code }
+}
+
+// C18: `convert_to_order` copies each quote line's `metadata` (incl. `cartLineId`, set by
+// this command's own step 5) onto its order line verbatim — so the bijection
+// `cart.markConverted` needs is read straight off the order's own live lines, never
+// re-derived from the quote.
+async function buildOrderLineMap(
+  em: EntityManager,
+  scope: SubmitScope,
+  orderId: string,
+): Promise<Array<{ cartLineId: string; salesOrderLineId: string }>> {
+  const rows = await em
+    .getKysely<{
+      sales_order_lines: { id: string; order_id: string; tenant_id: string; organization_id: string; metadata: Record<string, unknown> | null; deleted_at: Date | null }
+    }>()
+    .selectFrom('sales_order_lines')
+    .select(['id', 'metadata'])
+    .where('order_id', '=', orderId)
+    .where('tenant_id', '=', scope.tenantId)
+    .where('organization_id', '=', scope.organizationId)
+    .where('deleted_at', 'is', null)
+    .execute()
+  const lineMap: Array<{ cartLineId: string; salesOrderLineId: string }> = []
+  for (const row of rows) {
+    const cartLineId = typeof row.metadata?.cartLineId === 'string' ? (row.metadata.cartLineId as string) : null
+    if (!cartLineId) continue
+    lineMap.push({ cartLineId, salesOrderLineId: row.id })
+  }
+  return lineMap
+}
+
+/**
+ * §7.3's "5c-8" row: once the order exists, EVERY later failure compensates by
+ * cancelling it — never a hand-rolled parallel release. `sales.order.cancelled`'s own
+ * subscribers (already shipped: `wms`'s order-hold release, `customer_groups`'s
+ * `order-cancelled-credit-release` via C6's `linkedOrderId`, `promotions`'s
+ * `order-cancelled-usage-revert` via `CodeUsage.orderId`) release whatever was linked to
+ * this order; this helper additionally unlocks the cart (no subscriber does that) and
+ * moves the session to `failed`.
+ */
+async function compensateByCancellingOrder(
+  container: CommandRuntimeContext['container'],
+  em: EntityManager,
+  session: CheckoutSession,
+  scope: SubmitScope,
+  orderId: string,
+  failureCode: string,
+): Promise<void> {
+  const trustedCtx = buildTrustedCtx(container, scope, `checkout:submit:compensate-cancel:${session.id}`)
+  const commandBus = container.resolve('commandBus') as CommandBus
+  try {
+    const canceledEntryId = await resolveSalesOrderStatusEntryId(em, scope, 'canceled')
+    await commandBus.execute('sales.orders.update', {
+      input: { id: orderId, statusEntryId: canceledEntryId },
+      ctx: trustedCtx,
+    })
+  } catch (err) {
+    logger.error('[internal] checkout submit compensation: order cancellation failed', { err, sessionId: session.id, orderId })
+  }
+
+  const cartService = tryResolve<CartService>(container, 'cartService')
+  if (cartService && session.cartId) {
+    try {
+      await cartService.unlock({ cartId: session.cartId, tenantId: scope.tenantId, organizationId: scope.organizationId, checkoutSessionId: session.id })
+    } catch (err) {
+      logger.error('[internal] checkout submit compensation: cart unlock failed', { err, sessionId: session.id })
+    }
+  }
+
+  await em.nativeUpdate(
+    CheckoutSession,
+    { id: session.id, ...scope },
+    { status: 'failed', failureCode, failureDetail: null, updatedAt: new Date() },
+  )
+  await writeSessionEvent(em, { ...scope, sessionId: session.id, kind: 'compensation', actor: 'system', payload: { stage: 'order_cancelled', orderId, failureCode } })
+  await emitCheckoutEvent('checkout.session.failed', { sessionId: session.id, tenantId: scope.tenantId, organizationId: scope.organizationId, cartId: session.cartId ?? null, attempt: session.submitAttempt, failureCode }).catch(() => undefined)
+}
+
+/**
+ * §7.2 steps 7 (on-account branch)/8: the order already exists and every pre-payment
+ * step (commit, credit link, codes/usage) is done — confirm it, build the C18 `lineMap`,
+ * `cart.markConverted`, and move the session to `completed`.
+ */
+async function confirmOrderAndComplete(
+  container: CommandRuntimeContext['container'],
+  em: EntityManager,
+  session: CheckoutSession,
+  scope: SubmitScope,
+  orderId: string,
+  quoteId: string,
+  reservationKeys: { stockReservationKey: string | null; creditReservationKey: string | null },
+): Promise<CheckoutSessionSubmitStageResult> {
+  const trustedCtx = buildTrustedCtx(container, scope, `checkout:submit:complete:${session.id}`)
+  const commandBus = container.resolve('commandBus') as CommandBus
+
+  const confirmedEntryId = await resolveSalesOrderStatusEntryId(em, scope, 'confirmed')
+  await commandBus.execute('sales.orders.update', {
+    input: { id: orderId, statusEntryId: confirmedEntryId },
+    ctx: trustedCtx,
+  })
+
+  const lineMap = await buildOrderLineMap(em, scope, orderId)
+  const cartService = tryResolve<CartService>(container, 'cartService')
+  if (cartService && session.cartId) {
+    await cartService.markConverted({
+      cartId: session.cartId,
+      tenantId: scope.tenantId,
+      organizationId: scope.organizationId,
+      checkoutSessionId: session.id,
+      salesOrderId: orderId,
+      lineMap,
+    })
+  }
+
+  await em.nativeUpdate(
+    CheckoutSession,
+    { id: session.id, ...scope },
+    { status: 'completed', outcomeKind: 'order', completedAt: new Date(), updatedAt: new Date() },
+  )
+  session.status = 'completed'
+  session.outcomeKind = 'order'
+
+  await writeSessionEvent(em, { ...scope, sessionId: session.id, kind: 'payment_result', actor: 'system', payload: { orderId, outcome: 'completed' } })
+  await emitCheckoutEvent('checkout.session.completed', {
+    sessionId: session.id,
+    tenantId: scope.tenantId,
+    organizationId: scope.organizationId,
+    cartId: session.cartId ?? null,
+    outcomeKind: 'order',
+    salesOrderId: orderId,
+    salesQuoteId: quoteId,
+    paymentMethodCode: session.paymentMethodCode ?? null,
+  }).catch(() => undefined)
+
+  return {
+    session,
+    attempt: session.submitAttempt,
+    stockReservationKey: reservationKeys.stockReservationKey,
+    creditReservationKey: reservationKeys.creditReservationKey,
+    salesQuoteId: quoteId,
+    salesOrderId: orderId,
+  }
+}
+
+export async function continueOrderOutcome(
+  container: CommandRuntimeContext['container'],
+  input: ContinueOrderOutcomeInput,
+): Promise<CheckoutSessionSubmitStageResult> {
+  const { session, scope, orderId, quoteId } = input
+  const em = (container.resolve('em') as EntityManager).fork()
+  const isOnAccount = input.paymentMethodCode === 'on_account'
+  const trustedCtx = buildTrustedCtx(container, scope, `checkout:submit:continue:${session.id}:${input.attempt}`)
+  const commandBus = container.resolve('commandBus') as CommandBus
+
+  if (!session.cartId) throw new CrudHttpError(500, { error: '[internal] checkout session has no cart to continue from', code: 'totals_mismatch' })
+
+  // ---------------------------------------------------------------------
+  // Step 6a (§7.2 step 6a, D-R5-8): availability.commit, right after document creation,
+  // before payment. A 404 `reservation_not_found` means nothing was ever reserved (every
+  // line was `not_tracked`, or availability is absent) — a no-op, not a failure.
+  // ---------------------------------------------------------------------
+  if (input.stockReservationKey) {
+    try {
+      const { result: commitResult } = await commandBus.execute<unknown, { reservationId: string; status: 'committed' | 'recovered' | 'stock_lost'; shortfall: Array<{ catalogProductId: string; catalogVariantId: string | null; requested: number; available: number }> }>(
+        'availability.commit',
+        { input: { tenantId: scope.tenantId, organizationId: scope.organizationId, idempotencyKey: input.stockReservationKey, orderId }, ctx: trustedCtx },
+      )
+      if (commitResult.status === 'stock_lost') {
+        logger.error('[internal] checkout submit: stock_lost_after_payment, raising an ops notification', { sessionId: session.id, orderId })
+        await compensateByCancellingOrder(container, em, session, scope, orderId, 'stock_lost_after_payment')
+        throw new CrudHttpError(409, { error: '[internal] stock could not be committed', code: 'stock_shortfall', shortfall: commitResult.shortfall })
+      }
+    } catch (err) {
+      if (err instanceof CrudHttpError && err.status === 404) {
+        // Nothing was ever reserved under this key — treat as no-op, matching
+        // `availability.release`'s own "not_found" result shape for the same case.
+      } else {
+        throw err
+      }
+    }
+  }
+  await writeSessionEvent(em, { ...scope, sessionId: session.id, kind: 'stock_committed', actor: 'system', payload: { orderId } })
+
+  // ---------------------------------------------------------------------
+  // Step 6b (§7.2 step 6b, C6): link the credit reservation to the order, on-account only.
+  // ---------------------------------------------------------------------
+  if (isOnAccount && input.creditReservationKey) {
+    const customerCreditService = tryResolve<CustomerCreditService>(container, 'customerCreditService')
+    if (customerCreditService) {
+      await customerCreditService.linkCreditReservationToOrder({ scope, idempotencyKey: input.creditReservationKey, orderId })
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Step 6c (§7.2 step 6c, C5): useCode per applied code, then registerUsage for every
+  // promotion that discounted this cart — before payment. A refusal or non-empty
+  // `budgetExceeded` compensates by cancelling the order and aborts `409
+  // promotion_unavailable`.
+  // ---------------------------------------------------------------------
+  const promotionsService = tryResolve<PromotionsService>(container, 'promotionsService')
+  if (promotionsService) {
+    const containerWithRegister = container as unknown as { register: (regs: Record<string, unknown>) => unknown }
+    // `promotionsService.useCode`/`.registerUsage` resolve their own scope off the
+    // container's `auth` registration (`lib/promotions-service.ts`), never off the
+    // command context — this is checkout's own system-initiated, in-process call, so it
+    // registers a minimal scope-only `auth` on the SAME per-request container, the exact
+    // pattern `api/codes/use/route.ts` already uses for its (human, authenticated) caller.
+    containerWithRegister.register({ auth: asValue({ tenantId: scope.tenantId, orgId: scope.organizationId }) })
+
+    const cartPeer = await lookupCartPeerById(em, session.cartId, scope)
+    const customerId = cartPeer?.customerId ?? null
+
+    const enteredCodes = await lookupCartEnteredCodes(em, session.cartId, scope)
+    for (const code of enteredCodes) {
+      try {
+        await promotionsService.useCode({
+          codeId: code.id,
+          codeString: code.codeString ?? '',
+          cartId: session.cartId,
+          orderId,
+          customerId,
+          type: code.type,
+        })
+      } catch (err) {
+        logger.error('[internal] checkout submit: a promotion code could not be redeemed before payment', { err, sessionId: session.id, codeId: code.id })
+        await compensateByCancellingOrder(container, em, session, scope, orderId, 'promotion_unavailable')
+        throw new CrudHttpError(409, { error: '[internal] a promotion code is no longer available', code: 'promotion_unavailable' })
+      }
+    }
+
+    const appliedEffects = await lookupCartAppliedPromotionEffects(em, session.cartId, scope)
+    if (appliedEffects.length > 0) {
+      const names = await lookupPromotionNames(em, appliedEffects.map((entry) => entry.promotionId), scope)
+      const appliedPromotions: AppliedPromotion[] = appliedEffects.map((entry) => ({
+        promotionId: entry.promotionId,
+        promotionName: names.get(entry.promotionId) ?? entry.promotionId,
+        effects: entry.effects as unknown as AppliedPromotion['effects'],
+      }))
+      let registerResult: { ok: true; budgetExceeded: string[] }
+      try {
+        registerResult = await promotionsService.registerUsage({
+          orderId,
+          orderType: 'order',
+          customerId,
+          currency: session.currencyCode,
+          appliedPromotions,
+        })
+      } catch (err) {
+        logger.error('[internal] checkout submit: registerUsage failed before payment', { err, sessionId: session.id, orderId })
+        await compensateByCancellingOrder(container, em, session, scope, orderId, 'promotion_unavailable')
+        throw new CrudHttpError(409, { error: '[internal] a promotion budget could not be registered', code: 'promotion_unavailable' })
+      }
+      if (registerResult.budgetExceeded.length > 0) {
+        logger.error('[internal] checkout submit: a promotion budget was exceeded before payment', { sessionId: session.id, orderId, budgetExceeded: registerResult.budgetExceeded })
+        await compensateByCancellingOrder(container, em, session, scope, orderId, 'promotion_unavailable')
+        throw new CrudHttpError(409, { error: '[internal] a promotion budget is exhausted', code: 'promotion_unavailable', budgetExceeded: registerResult.budgetExceeded })
+      }
+    }
+  }
+
+  await em.nativeUpdate(CheckoutSession, { id: session.id, ...scope }, { submitProgress: 'finalized', updatedAt: new Date() })
+  session.submitProgress = 'finalized'
+  await writeSessionEvent(em, { ...scope, sessionId: session.id, kind: 'promotions_registered', actor: 'system', payload: { orderId } })
+
+  // ---------------------------------------------------------------------
+  // Step 8 (§7.2 step 8): on-account has no gateway wait — confirm and complete directly.
+  // ---------------------------------------------------------------------
+  if (isOnAccount) {
+    return confirmOrderAndComplete(container, em, session, scope, orderId, quoteId, {
+      stockReservationKey: input.stockReservationKey,
+      creditReservationKey: input.creditReservationKey,
+    })
+  }
+
+  // ---------------------------------------------------------------------
+  // Step 7 (§7.2 step 7, C1): gateway. Extend the cart lock through the payment window,
+  // create (or reuse, idempotent-by-session) one `CheckoutTransaction`, call the gateway.
+  // ---------------------------------------------------------------------
+  const paymentGatewayService = tryResolve<PaymentGatewayService>(container, 'paymentGatewayService')
+  if (!paymentGatewayService) {
+    await compensateByCancellingOrder(container, em, session, scope, orderId, 'payment_unavailable')
+    throw new CrudHttpError(502, { error: '[internal] no payment gateway is available for this method', code: 'payment_unavailable' })
+  }
+
+  const cartService = tryResolve<CartService>(container, 'cartService')
+  const paymentWindowMs = 60 * 60 * 1000 + 15 * 60 * 1000
+  if (cartService) {
+    await cartService.lock({
+      cartId: session.cartId,
+      tenantId: scope.tenantId,
+      organizationId: scope.organizationId,
+      checkoutSessionId: session.id,
+      lockTtlMs: paymentWindowMs,
+      request: input.request,
+    })
+  }
+
+  let transaction = await findCheckoutTransactionBySession(em, scope, session.id)
+  if (!transaction) {
+    const { amount, currencyCode } = await loadOrderGrandTotalGross(em, scope, orderId)
+    transaction = em.create(CheckoutTransaction, {
+      organizationId: scope.organizationId,
+      tenantId: scope.tenantId,
+      linkId: session.linkId ?? null,
+      sessionId: session.id,
+      orderId,
+      quoteId,
+      status: 'processing',
+      amount,
+      currencyCode,
+      idempotencyKey: `checkout:${session.id}:${input.attempt}:payment`,
+    })
+    em.persist(transaction)
+    await em.flush()
+  }
+
+  let sessionResult: Awaited<ReturnType<PaymentGatewayService['createPaymentSession']>>
+  try {
+    sessionResult = await paymentGatewayService.createPaymentSession({
+      providerKey: input.paymentMethodCode,
+      paymentId: transaction.id,
+      idempotencyKey: `checkout:${session.id}:${input.attempt}:payment`,
+      orderId,
+      amount: Number(transaction.amount),
+      currencyCode: transaction.currencyCode,
+      organizationId: scope.organizationId,
+      tenantId: scope.tenantId,
+    })
+  } catch (err) {
+    logger.error('[internal] checkout submit: payment session creation failed', { err, sessionId: session.id, orderId })
+    await compensateByCancellingOrder(container, em, session, scope, orderId, 'payment_unavailable')
+    throw new CrudHttpError(502, { error: '[internal] the payment gateway could not start a session', code: 'payment_unavailable' })
+  }
+
+  const mappedStatus = mapGatewayStatusToCheckoutStatus(sessionResult.transaction.unifiedStatus)
+  const paymentExpiresAt = sessionResult.transaction.expiresAt ?? new Date(Date.now() + 60 * 60 * 1000)
+
+  await em.nativeUpdate(
+    CheckoutSession,
+    { id: session.id, ...scope },
+    {
+      status: 'awaiting_payment',
+      submitProgress: 'payment_initiated',
+      paymentIntentRef: sessionResult.session.sessionId,
+      paymentExpiresAt,
+      updatedAt: new Date(),
+    },
+  )
+  session.status = 'awaiting_payment'
+  session.submitProgress = 'payment_initiated'
+  session.paymentIntentRef = sessionResult.session.sessionId
+  session.paymentExpiresAt = paymentExpiresAt
+
+  await writeSessionEvent(em, { ...scope, sessionId: session.id, kind: 'payment_initiated', actor: 'system', payload: { orderId, transactionId: transaction.id } })
+  await emitCheckoutEvent('checkout.payment.initiated', {
+    sessionId: session.id,
+    tenantId: scope.tenantId,
+    organizationId: scope.organizationId,
+    orderId,
+    transactionId: transaction.id,
+    providerKey: input.paymentMethodCode,
+  }).catch(() => undefined)
+
+  if (mappedStatus === 'completed') {
+    const result = await confirmOrderAndComplete(container, em, session, scope, orderId, quoteId, {
+      stockReservationKey: input.stockReservationKey,
+      creditReservationKey: input.creditReservationKey,
+    })
+    await writeSessionEvent(em, { ...scope, sessionId: session.id, kind: 'payment_result', actor: 'system', payload: { orderId, outcome: 'succeeded' } })
+    await emitCheckoutEvent('checkout.payment.succeeded', { sessionId: session.id, tenantId: scope.tenantId, organizationId: scope.organizationId, orderId, transactionId: transaction.id }).catch(() => undefined)
+    return result
+  }
+  if (mappedStatus === 'failed' || mappedStatus === 'cancelled' || mappedStatus === 'expired') {
+    await compensateByCancellingOrder(container, em, session, scope, orderId, 'payment_failed')
+    await writeSessionEvent(em, { ...scope, sessionId: session.id, kind: 'payment_result', actor: 'system', payload: { orderId, outcome: 'failed' } })
+    await emitCheckoutEvent('checkout.payment.failed', { sessionId: session.id, tenantId: scope.tenantId, organizationId: scope.organizationId, orderId, transactionId: transaction.id, failureCode: 'payment_failed' }).catch(() => undefined)
+    throw new CrudHttpError(402, { error: '[internal] the payment was not successful', code: 'credit_refused' })
+  }
+
+  // Still pending/processing — the gateway hands the buyer off to complete payment
+  // asynchronously (webhook or polling, Phase A's own pattern); this call ends at
+  // `awaiting_payment`, matching §7.2 step 7's own two-part shape ("status =
+  // awaiting_payment" is this synchronous call's own terminal state; "Payment result" is
+  // a SEPARATE, later event).
+  return {
+    session,
+    attempt: input.attempt,
+    stockReservationKey: input.stockReservationKey,
+    creditReservationKey: input.creditReservationKey,
+    salesQuoteId: quoteId,
+    salesOrderId: orderId,
+  }
 }
 
 registerCommand(submitSessionCommand)

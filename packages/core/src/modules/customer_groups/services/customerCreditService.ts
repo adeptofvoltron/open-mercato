@@ -121,6 +121,19 @@ export type ReleaseCreditInput = {
 
 export type ReleaseCreditResult = { released: boolean; entryId: string | null }
 
+// Step 4.2 (C6, additive to the G contract — checkout's own §8.3 step 6b). Writes
+// `linked_order_id` on the `reserve` ledger entry named by `idempotencyKey` so
+// `order-cancelled-credit-release`'s own `linkedOrderId: orderId` lookup (built ahead of
+// this method existing, Phase 3) finds it the moment an order with this reservation is
+// ever cancelled (D-R5-2).
+export type LinkCreditReservationToOrderInput = {
+  scope: CommerceScope
+  idempotencyKey: string
+  orderId: string
+}
+
+export type LinkCreditReservationToOrderResult = { linked: boolean; entryId: string | null }
+
 export type SettleCreditInput = {
   scope: CommerceScope
   buyer: CreditBuyerInput
@@ -175,6 +188,13 @@ export interface CustomerCreditService {
   // both for the forward `/adjust` command and, with a negated amount, for its undo
   // (G20) — never a delete.
   adjustCredit(input: AdjustCreditInput): Promise<AdjustCreditResult>
+
+  // Step 4.2 (C6): links a `reserve` entry to the order it funded, so a later
+  // cancellation can find and release it. Idempotent — linking an already-linked entry
+  // to the SAME order is a no-op; a mismatch (the entry already names a DIFFERENT order)
+  // throws `idempotency_key_mismatch`, the same error class every other re-used key in
+  // this service raises.
+  linkCreditReservationToOrder(input: LinkCreditReservationToOrderInput): Promise<LinkCreditReservationToOrderResult>
 }
 
 // ---------------------------------------------------------------------------
@@ -818,6 +838,50 @@ export class DefaultCustomerCreditService implements CustomerCreditService {
     if (created) {
       await emitCreditAdjustedEvent({ scope, creditAccountId: result.entry.creditAccountId, customerId, currencyCode, entry: result.entry })
     }
+
+    return result
+  }
+
+  async linkCreditReservationToOrder(input: LinkCreditReservationToOrderInput): Promise<LinkCreditReservationToOrderResult> {
+    const { scope } = input
+    let result: LinkCreditReservationToOrderResult = { linked: false, entryId: null }
+
+    await withAtomicFlush(
+      this.em,
+      [
+        async () => {
+          // Lock the owning account row first — same convention as every other write on
+          // this service — even though this call only ever touches the `reserve` entry's
+          // own `linked_order_id` column, so a concurrent `releaseCredit`/`settleCredit`
+          // on the SAME account can never interleave with this write.
+          const reserveEntry = await this.em.findOne(CustomerCreditLedgerEntry, {
+            tenantId: scope.tenantId,
+            idempotencyKey: input.idempotencyKey,
+            entryType: 'reserve',
+          })
+          if (!reserveEntry) return
+
+          await this.em.findOne(
+            CustomerCreditAccount,
+            { id: reserveEntry.creditAccountId, tenantId: scope.tenantId, organizationId: scope.organizationId },
+            { lockMode: LockMode.PESSIMISTIC_WRITE },
+          )
+
+          if (reserveEntry.linkedOrderId === input.orderId) {
+            result = { linked: false, entryId: reserveEntry.id }
+            return
+          }
+          if (reserveEntry.linkedOrderId != null) {
+            throw idempotencyMismatchError()
+          }
+
+          reserveEntry.linkedOrderId = input.orderId
+          this.em.persist(reserveEntry)
+          result = { linked: true, entryId: reserveEntry.id }
+        },
+      ],
+      { transaction: true, label: 'customer_groups.credit.linkReservationToOrder' },
+    )
 
     return result
   }

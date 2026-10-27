@@ -333,7 +333,17 @@ export const checkoutSessionDeliverySelectSchema = z.object({
   deliveryMethodCode: requiredTrimmedString('checkout.validation.common.required'),
 })
 
+// Release 5, Step 4.2 (B.4, §9's route table: `POST /sessions/current/submit`).
+// `paymentMethodCode` is the command's own direct input per Step 4.1's resolved decision
+// ("submit takes the method as a direct input... no `POST /sessions/current/payment`
+// selection route is built"); the body carries nothing else — the `Idempotency-Key`
+// header (§7.1 precondition 2) is validated at the route, not in this schema.
+export const checkoutSessionSubmitSchema = z.object({
+  paymentMethodCode: requiredTrimmedString('checkout.validation.common.required'),
+})
+
 export type CheckoutSessionCreateInput = z.infer<typeof checkoutSessionCreateSchema>
 export type CheckoutSessionUpdateInput = z.infer<typeof checkoutSessionUpdateSchema>
 export type CheckoutSessionDeliverySelectInput = z.infer<typeof checkoutSessionDeliverySelectSchema>
+export type CheckoutSessionSubmitInput = z.infer<typeof checkoutSessionSubmitSchema>
 export type PublicSubmitInput = z.infer<typeof publicSubmitSchema>

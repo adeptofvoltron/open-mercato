@@ -543,6 +543,61 @@ describe('customerCreditService', () => {
     })
   })
 
+  // Step 4.2 (C6, checkout §8.3 step 6b): additive method — writes `linkedOrderId` on the
+  // `reserve` entry so `order-cancelled-credit-release` (Phase 3, already shipped) can find
+  // it later.
+  describe('linkCreditReservationToOrder', () => {
+    async function reserveAndSeed(em: FakeEm, service: DefaultCustomerCreditService, key: string) {
+      return service.reserveCredit({
+        scope: SCOPE,
+        buyer: { customerId: CUSTOMER_ID },
+        currencyCode: CURRENCY,
+        amount: '100.00',
+        sourceType: 'checkout',
+        sourceId: 'session-1',
+        idempotencyKey: key,
+      })
+    }
+
+    test('links the reserve entry to the order and is idempotent on a second call for the same order', async () => {
+      const { em, tables } = createFakeEm()
+      seedAccount(tables, { creditLimit: '500.00' })
+      const service = buildService(em, allowTerms(true))
+      await reserveAndSeed(em, service, 'reserve-link-1')
+
+      const first = await service.linkCreditReservationToOrder({ scope: SCOPE, idempotencyKey: 'reserve-link-1', orderId: 'order-1' })
+      const second = await service.linkCreditReservationToOrder({ scope: SCOPE, idempotencyKey: 'reserve-link-1', orderId: 'order-1' })
+
+      expect(first.linked).toBe(true)
+      expect(second.linked).toBe(false)
+      expect(second.entryId).toBe(first.entryId)
+      const entry = (tables.get(CustomerCreditLedgerEntry) ?? []).find((row) => row.id === first.entryId)
+      expect(entry?.linkedOrderId).toBe('order-1')
+    })
+
+    test('linking the same key to a DIFFERENT order throws idempotency_key_mismatch', async () => {
+      const { em, tables } = createFakeEm()
+      seedAccount(tables, { creditLimit: '500.00' })
+      const service = buildService(em, allowTerms(true))
+      await reserveAndSeed(em, service, 'reserve-link-2')
+      await service.linkCreditReservationToOrder({ scope: SCOPE, idempotencyKey: 'reserve-link-2', orderId: 'order-1' })
+
+      await expect(
+        service.linkCreditReservationToOrder({ scope: SCOPE, idempotencyKey: 'reserve-link-2', orderId: 'order-2' }),
+      ).rejects.toMatchObject({ code: 'idempotency_key_mismatch' })
+    })
+
+    test('a missing reservation is a no-op', async () => {
+      const { em, tables } = createFakeEm()
+      seedAccount(tables, { creditLimit: '500.00' })
+      const service = buildService(em, allowTerms(true))
+
+      const result = await service.linkCreditReservationToOrder({ scope: SCOPE, idempotencyKey: 'never-reserved', orderId: 'order-1' })
+
+      expect(result).toEqual({ linked: false, entryId: null })
+    })
+  })
+
   describe('settleCredit', () => {
     test('settle exceeding the reservation open amount throws settle_exceeds_reservation', async () => {
       const { em, tables } = createFakeEm()

@@ -32,6 +32,15 @@ const events = [
   { id: 'checkout.session.submitted', label: 'Checkout Session Submitted', entity: 'session', category: 'lifecycle' },
   { id: 'checkout.compensation.executed', label: 'Checkout Compensation Executed', entity: 'session', category: 'lifecycle' },
   { id: 'checkout.compensation.failed', label: 'Checkout Compensation Failed', entity: 'session', category: 'lifecycle' },
+  // Release 5, Step 4.2 (B.4 submit, §7.2 steps 6-8 / §10). The family's terminal members —
+  // `.completed`/`.failed` reach a terminal `CheckoutSession.status`; `checkout.payment.*`
+  // is additive and session-scoped, firing ALONGSIDE Phase A's own `checkout.transaction.*`
+  // events (§10's own text), never instead of them.
+  { id: 'checkout.session.completed', label: 'Checkout Session Completed', entity: 'session', category: 'lifecycle' },
+  { id: 'checkout.session.failed', label: 'Checkout Session Failed', entity: 'session', category: 'lifecycle' },
+  { id: 'checkout.payment.initiated', label: 'Checkout Payment Initiated', entity: 'session', category: 'lifecycle' },
+  { id: 'checkout.payment.succeeded', label: 'Checkout Payment Succeeded', entity: 'session', category: 'lifecycle' },
+  { id: 'checkout.payment.failed', label: 'Checkout Payment Failed', entity: 'session', category: 'lifecycle' },
 ] as const
 
 export const eventsConfig = createModuleEvents({ moduleId: 'checkout', events })

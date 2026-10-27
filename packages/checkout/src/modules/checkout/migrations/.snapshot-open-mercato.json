@@ -2404,7 +2404,23 @@
           "unsigned": false,
           "autoincrement": false,
           "primary": false,
-          "nullable": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "uuid"
+        },
+        "order_id": {
+          "name": "order_id",
+          "type": "uuid",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
           "unique": false,
           "length": null,
           "precision": null,
@@ -2462,6 +2478,22 @@
           "enumItems": [],
           "mappedType": "text"
         },
+        "quote_id": {
+          "name": "quote_id",
+          "type": "uuid",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "uuid"
+        },
         "selected_price_item_id": {
           "name": "selected_price_item_id",
           "type": "text",
@@ -2477,6 +2509,22 @@
           "comment": null,
           "enumItems": [],
           "mappedType": "text"
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "uuid",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "uuid"
         },
         "status": {
           "name": "status",
@@ -2601,6 +2649,18 @@
           "keyName": "checkout_transactions_pkey",
           "primary": true,
           "unique": true
+        },
+        {
+          "columnNames": [
+            "organization_id",
+            "tenant_id",
+            "session_id"
+          ],
+          "composite": true,
+          "constraint": false,
+          "keyName": "checkout_transactions_organization_id_tenant_id_se_8f1b2_index",
+          "primary": false,
+          "unique": false
         }
       ],
       "checks": [],

@@ -123,6 +123,20 @@ export const checkoutSubmitRateLimitConfig = readEndpointRateLimitConfig('CHECKO
   keyPrefix: 'checkout-submit',
 })
 
+// Release 5, Step 4.2 (B.4, §13: "`POST /sessions/current/submit` | 10/min per session,
+// 60/min per IP | fail-closed"). The session-scoped 10/min bucket reuses
+// `checkoutSubmitRateLimitConfig` above (same point budget, scoped by `keyOverride` to the
+// session's own token hash, same pattern `checkoutSessionMutateSessionRateLimitConfig`
+// already set) — this is the SEPARATE per-IP bucket enforced alongside it. Distinct
+// keyPrefix from Phase A's own `checkout-submit` (its pay-link `/pay/[slug]/submit` route,
+// 10/min per IP with NO session concept) so the two buckets never share a counter.
+export const checkoutSessionSubmitIpRateLimitConfig = readEndpointRateLimitConfig('CHECKOUT_SESSION_SUBMIT_IP', {
+  points: 60,
+  duration: 60,
+  blockDuration: 60,
+  keyPrefix: 'checkout-session-submit-ip',
+})
+
 export const checkoutPasswordRateLimitConfig = readEndpointRateLimitConfig('CHECKOUT_PASSWORD', {
   points: 5,
   duration: 60,

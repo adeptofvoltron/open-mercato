@@ -1807,3 +1807,103 @@ creation + the C7 equality check — STOPS there, Step 4.2 continues)
   to call the FULL sequence (steps 1-8) to ever reach a terminal session status, so building a
   half-finished route in this Step would strand a session in `submitting` with no way to
   complete. Flagging for whichever Step builds it (likely alongside or after Step 4.2).
+
+## 2026-10-28T02:30:00Z — Step 4.2 landed (checkout B.4 submit, steps 6-8 of C19/§7.2 —
+commit, credit link, codes/usage, gateway, lineMap, recovery — plus the public submit route)
+
+- Continued Step 4.1's `checkout.session.submit` IN PLACE (its own `execute()` now runs the
+  full 1-8 sequence via a new tail call into `continueOrderOutcome`, exported alongside
+  `compensate` from `commands/submit.ts`) rather than building a second, standalone command
+  — per the task brief's own conditional ("check Step 4.1's actual code structure... follow
+  whatever shape it already committed to") and confirmed by reading Step 4.1's code: it is
+  ONE function, not the §11 table's separately-named sub-commands. The full reasoning (and
+  the resulting test-suite rewrite this forced) is in PLAN.md's "Decisions taken without the
+  owner".
+- **Steps 6-8, in order:** 6a `availability.commit` (right after document creation, before
+  payment, D-R5-8) with a `404 reservation_not_found` treated as a no-op (nothing was ever
+  reserved); 6b `customerCreditService.linkCreditReservationToOrder` on-account only — this
+  method did NOT exist on the Step 1.6 service (confirmed missing) and was added here,
+  additive, writing `linked_order_id` on the `reserve` ledger entry; 6c `useCode` per entered
+  code then `registerUsage` for EVERY promotion that discounted the cart (not just code-
+  triggered ones — `cart_promotion_applications.effect` already stores the real
+  `ResolvedEffect` the evaluation engine produced, read back via two new `lib/cartPeer.ts`
+  helpers), a refusal or non-empty `budgetExceeded` compensating via order cancellation and
+  aborting `409 promotion_unavailable`; step 7 gateway — extends the cart lock through the
+  payment window (C1), creates one session-keyed `CheckoutTransaction` (new nullable
+  `session_id`/`order_id`/`quote_id` columns, `link_id` now nullable too — migration
+  `Migration20261028020000`), calls `paymentGatewayService.createPaymentSession`, and
+  branches on the gateway's own immediately-reported status: terminal success completes
+  inline (confirm order, build the C18 `lineMap` from `sales_order_lines.metadata.cartLineId`,
+  `cart.markConverted`, session `completed`), terminal failure compensates (cancel order,
+  session `failed`), still-pending leaves the session at `awaiting_payment`; step 8 on-account
+  skips the gateway and completes directly.
+- **Compensation is uniform from step 6 onward, exactly as instructed:** every failure
+  compensates by CANCELLING THE ORDER (`sales.orders.update` to the `canceled`/`cancelled`
+  dictionary entry, resolved via a new raw-SQL helper since `sales` has no plain `status`
+  input — only `statusEntryId` against a per-tenant/org dictionary) — never a hand-rolled
+  parallel release. The three `sales.order.cancelled` subscribers this release already shipped
+  (`wms`'s order-hold release, `customer_groups`'s `order-cancelled-credit-release` via C6's
+  `linkedOrderId`, `promotions`'s `order-cancelled-usage-revert` via `CodeUsage.orderId`) do
+  the actual releasing; this Step's own `compensateByCancellingOrder` helper only additionally
+  unlocks the cart (nothing else reacts to cancellation that way) and fails the session.
+- **Genuine unclaimed gap, flagged (not fixed in this Step):** a session that reaches
+  `awaiting_payment` because the gateway answered asynchronously (the common case for most
+  real redirect-based providers, as opposed to this Step's own test-gateway mocks, which
+  report a terminal status immediately) has NO mechanism anywhere in this run that ever moves
+  it to `completed`/`failed` afterward — §12's own `expire-awaiting-payment` job is the
+  obvious owner and is not part of this Step's Tasks-table title. A future Step should build
+  it (or a payment-gateway webhook subscriber), reusing `confirmOrderAndComplete`/
+  `compensateByCancellingOrder`, both exported by `commands/submit.ts`.
+- **`recover-stuck-submits` (C24), scoped to the `submitting`-only half of §12's job table**
+  (`awaiting_payment` recovery is the SAME `expire-awaiting-payment` gap named above, not this
+  Step's). A genuine implementation discovery reshaped the decision table itself: Step 4.1's
+  own steps 1-5 never persist `submit_progress` as `locked`/`stock_reserved`/`credit_reserved`
+  on the session row — only `null` and `document_created` are ever written, so the worker
+  collapses those three C24 rows into one: whenever progress precedes `document_created`,
+  release stock AND credit by the session's own stored keys (both release primitives already
+  no-op safely when nothing was actually reserved) plus a best-effort cart unlock that
+  swallows a "never actually locked" 404. `document_created`/`finalized` resume forward by
+  calling `continueOrderOutcome` again — the SAME function, re-deriving every input from the
+  session's own columns, proven idempotent by the same keys. A resume stuck past a 30-minute
+  give-up window compensates and fails with `submit_recovery_failed`, per §12.1's own final
+  row. Scheduled every minute via `setup.ts`'s `seedDefaults` (same `schedulerService.register`
+  pattern every sibling Release-5 sweeper already uses).
+- **Quote-outcome `lineMap` (D-R5-26) confirmed still deferred to Step 5.1**, not built here:
+  `request_quote` is refused outright at the top of `checkout.session.submit` (Step 4.1's own,
+  unchanged code), so the quote branch of §7.2 is unreachable from this command. Only the
+  order-outcome `lineMap` was built.
+- **Public route, `POST /api/checkout/sessions/current/submit`:** thin HTTP adapter over the
+  now-full `checkout.session.submit`, same shape every sibling `/sessions/current/*` route
+  already follows — D-R5-33 identity binding and cross-tenant scope collapse are inherited
+  from the shared `resolveCurrentSession` helper (not re-implemented); C14's 10/min-per-session
+  + 60/min-per-IP pair is enforced via the existing `checkoutSubmitRateLimitConfig` (session-
+  scoped by `keyOverride`) plus a new `checkoutSessionSubmitIpRateLimitConfig` for the IP half;
+  `Idempotency-Key` header validated (16-128 chars) before the command is ever dispatched.
+- Files: `packages/checkout/src/modules/checkout/commands/submit.ts` (+519 lines: `paymentMethodCode`
+  now persisted on the CAS write, `compensate` exported, `continueOrderOutcome` + 5 new helper
+  functions), `commands/__tests__/submit.test.ts` (harness extended for `availability.commit`/
+  `sales.orders.update`/the order-status dictionary/`cartService.markConverted`/
+  `paymentGatewayService`/`promotionsService`; 8 new tests for steps 6-8), `workers/
+  recover-stuck-submits.worker.ts` (new, +test), `api/sessions/current/submit/route.ts` (new,
+  +test), `data/entities.ts` (`CheckoutTransaction`: `link_id` nullable, +`session_id`/
+  `order_id`/`quote_id`), `data/validators.ts` (+`checkoutSessionSubmitSchema`), `events.ts`
+  (+5: `.session.completed`/`.session.failed`/`.payment.initiated`/`.succeeded`/`.failed`),
+  `lib/cartPeer.ts` (+`codeString` on `CartEnteredCodeRef`, +`lookupCartAppliedPromotionEffects`,
+  +`lookupPromotionNames`), `lib/rateLimiter.ts` (+`checkoutSessionSubmitIpRateLimitConfig`),
+  `setup.ts` (+schedule), `migrations/Migration20261028020000.ts` + `.snapshot-open-mercato.json`;
+  two Phase-A call sites fixed for `linkId` now being nullable (`api/transactions/route.ts`,
+  `commands/transactions.ts`). Cross-module: `packages/core/src/modules/customer_groups/
+  services/customerCreditService.ts` (+`linkCreditReservationToOrder`, +tests) — confirmed
+  missing from Step 1.6's shipped service, as the task brief itself anticipated.
+- Checks (local mode, from repo root, every `tsconfig.tsbuildinfo` wiped repo-wide first):
+  `yarn tsc --noEmit` on both `checkout` and `core` packages — clean, 0 errors. `eslint` on
+  every changed/new file — clean (one pre-existing, untouched warning in `checkout/data/
+  entities.ts`). `yarn generate` — clean, no unexpected diffs, new route/worker picked up by
+  auto-discovery. Full `checkout` suite: 52/52 suites, 397/397 tests (+2 suites, +27 tests on
+  Step 4.1's own 50/370 baseline), zero regressions. Full `cart` + `customer_groups` +
+  `availability` + `promotions` suites together: 116/119 suites (3 pre-existing pg-gated
+  skips), 1366/1383 tests, zero regressions.
+- Not built in this Step, by its own explicit scope or the gaps flagged above:
+  `expire-awaiting-payment` (§12's own separate job — the async-webhook-completion gap),
+  quote-outcome `lineMap` (D-R5-26, Step 5.1), B.5's `request_quote` payment method itself
+  (Step 5.1), `checkout.sessions.view`/`.manage` admin viewer UI (B.6).

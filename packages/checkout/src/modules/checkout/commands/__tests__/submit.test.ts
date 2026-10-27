@@ -19,9 +19,13 @@ jest.mock('../../lib/sessionEvents', () => ({
 
 const mockLookupCartPeerById = jest.fn()
 const mockLookupCartEnteredCodes = jest.fn(async () => [])
+const mockLookupCartAppliedPromotionEffects = jest.fn(async () => [])
+const mockLookupPromotionNames = jest.fn(async () => new Map())
 jest.mock('../../lib/cartPeer', () => ({
   lookupCartPeerById: (...args: unknown[]) => mockLookupCartPeerById(...args),
   lookupCartEnteredCodes: (...args: unknown[]) => mockLookupCartEnteredCodes(...args),
+  lookupCartAppliedPromotionEffects: (...args: unknown[]) => mockLookupCartAppliedPromotionEffects(...args),
+  lookupPromotionNames: (...args: unknown[]) => mockLookupPromotionNames(...args),
 }))
 
 jest.mock('../../lib/deliveryAddress', () => ({
@@ -144,10 +148,11 @@ type Harness = {
   seededQuotes: FakeRow[]
   seededOrders: FakeRow[]
   commandBusExecute: jest.Mock
-  cartService: { lock: jest.Mock; unlock: jest.Mock; getSalesSnapshot: jest.Mock }
-  customerCreditService: { reserveCredit: jest.Mock; releaseCredit: jest.Mock } | null
+  cartService: { lock: jest.Mock; unlock: jest.Mock; getSalesSnapshot: jest.Mock; markConverted: jest.Mock }
+  customerCreditService: { reserveCredit: jest.Mock; releaseCredit: jest.Mock; linkCreditReservationToOrder: jest.Mock } | null
   policyResolutionServiceAvailable: boolean
   salesCalculationService: { calculateDocumentTotals: jest.Mock }
+  promotionsService: { useCode: jest.Mock; registerUsage: jest.Mock } | null
 }
 
 function buildHarness(opts: {
@@ -159,8 +164,15 @@ function buildHarness(opts: {
   reserveCreditResult?: FakeRow
   customerCreditServiceAvailable?: boolean
   policyResolutionServiceAvailable?: boolean
+  paymentGatewayServiceAvailable?: boolean
+  promotionsServiceAvailable?: boolean
+  useCodeError?: Error
+  registerUsageResult?: FakeRow
+  commitResult?: FakeRow
+  createPaymentSessionResult?: FakeRow
   seededQuotes?: FakeRow[]
   seededOrders?: FakeRow[]
+  seededOrderLines?: FakeRow[]
 } = {}): Harness {
   const seededSessions = [opts.session ?? makeSession()]
   const seededQuotes = opts.seededQuotes ?? []
@@ -177,6 +189,7 @@ function buildHarness(opts: {
     lock: jest.fn(async () => ({ cart: { status: 'locked' }, priceChanges: [], extended: false })),
     unlock: jest.fn(async () => ({ cart: { status: 'active' } })),
     getSalesSnapshot: jest.fn(async () => snapshot),
+    markConverted: jest.fn(async () => ({ cart: { status: 'converted' } })),
   }
 
   const customerCreditService = opts.customerCreditServiceAvailable === false
@@ -189,11 +202,18 @@ function buildHarness(opts: {
           check: { allowed: true, reason: 'ok', customerId: 'customer-1', creditAccountId: 'account-1', creditLimit: '1000.00', exposure: '125.00', available: '875.00', currencyCode: 'USD' },
         })),
         releaseCredit: jest.fn(async () => ({ released: true, entryId: 'entry-2' })),
+        linkCreditReservationToOrder: jest.fn(async () => ({ linked: true, entryId: 'entry-1' })),
       }
 
   const salesCalculationService = {
     calculateDocumentTotals: jest.fn(async () => makeGoodsCalc(opts.goodsCalcTotals ?? SNAPSHOT_TOTALS)),
   }
+
+  const seededOrderLines = opts.seededOrderLines ?? []
+  const orderStatusEntries = [
+    { id: 'status-confirmed', normalized_value: 'confirmed', tenant_id: TENANT_ID, organization_id: ORG_ID, key: 'sales.order_status', deleted_at: null },
+    { id: 'status-canceled', normalized_value: 'canceled', tenant_id: TENANT_ID, organization_id: ORG_ID, key: 'sales.order_status', deleted_at: null },
+  ]
 
   const commandBusExecute = jest.fn(async (id: string, options: { input: any }) => {
     if (id === 'availability.reserve') {
@@ -202,6 +222,9 @@ function buildHarness(opts: {
     if (id === 'availability.release') {
       return { result: { reservationId: 'reservation-1', status: 'released', released: true } }
     }
+    if (id === 'availability.commit') {
+      return { result: opts.commitResult ?? { reservationId: 'reservation-1', status: 'committed', shortfall: [] } }
+    }
     if (id === 'sales.quotes.create') {
       const quoteId = `quote-${seededQuotes.length + 1}`
       seededQuotes.push({ id: quoteId, tenant_id: TENANT_ID, organization_id: ORG_ID, external_reference: options.input.externalReference, deleted_at: null })
@@ -209,11 +232,35 @@ function buildHarness(opts: {
     }
     if (id === 'sales.quotes.convert_to_order') {
       const orderId = options.input.quoteId
-      seededOrders.push({ id: orderId, tenant_id: TENANT_ID, organization_id: ORG_ID, deleted_at: null })
+      seededOrders.push({ id: orderId, tenant_id: TENANT_ID, organization_id: ORG_ID, deleted_at: null, grand_total_gross_amount: '125.00', currency_code: 'USD' })
       return { result: { orderId } }
+    }
+    if (id === 'sales.orders.update') {
+      const order = seededOrders.find((row) => row.id === options.input.id)
+      if (order) order.statusEntryId = options.input.statusEntryId
+      return { result: { order } }
     }
     throw new Error(`Unexpected command id: ${id}`)
   })
+
+  const paymentGatewayService = opts.paymentGatewayServiceAvailable === false
+    ? null
+    : {
+        createPaymentSession: jest.fn(async () => (opts.createPaymentSessionResult ?? {
+          transaction: { id: 'gateway-txn-1', unifiedStatus: 'captured', expiresAt: null },
+          session: { sessionId: 'gateway-session-1', status: 'captured' },
+        })),
+      }
+
+  const promotionsService = opts.promotionsServiceAvailable === false
+    ? null
+    : {
+        useCode: jest.fn(async () => {
+          if (opts.useCodeError) throw opts.useCodeError
+          return { ok: true }
+        }),
+        registerUsage: jest.fn(async () => (opts.registerUsageResult ?? { ok: true, budgetExceeded: [] })),
+      }
 
   const registrations: Record<string, unknown> = {
     em: null, // set below once `em` is built (needs `registrations` reference first)
@@ -222,6 +269,13 @@ function buildHarness(opts: {
     salesCalculationService,
     ...(customerCreditService ? { customerCreditService } : {}),
     ...(opts.policyResolutionServiceAvailable === false ? {} : { policyResolutionService: {} }),
+    ...(paymentGatewayService ? { paymentGatewayService } : {}),
+    ...(promotionsService ? { promotionsService } : {}),
+  }
+
+  function unqualify(col: string): string {
+    const idx = col.lastIndexOf('.')
+    return idx >= 0 ? col.slice(idx + 1) : col
   }
 
   const em: FakeRow = {
@@ -234,18 +288,38 @@ function buildHarness(opts: {
       }
       return 0
     }),
+    create: jest.fn((_entity: unknown, data: FakeRow) => ({ id: 'checkout-txn-1', ...data })),
+    persist: jest.fn(),
+    flush: jest.fn(async () => undefined),
+    findOne: jest.fn(async () => null),
     getKysely: () => ({
       selectFrom(table: string) {
-        const filters: Array<[string, unknown]> = []
+        const filters: Array<{ col: string; op: string; value: unknown }> = []
         const builder = {
           select() { return builder },
-          where(col: string, _op: string, value: unknown) {
-            filters.push([col, value])
+          innerJoin() { return builder },
+          where(col: string, op: string, value: unknown) {
+            filters.push({ col: unqualify(col), op, value })
             return builder
           },
+          matches(row: FakeRow): boolean {
+            return filters.every(({ col, op, value }) => {
+              if (op === 'in') return Array.isArray(value) && value.includes(row[col])
+              if (op === 'is') return value === null ? row[col] == null : row[col] === value
+              if (op === 'is not') return value === null ? row[col] != null : row[col] !== value
+              return row[col] === value
+            })
+          },
           async executeTakeFirst() {
-            const rows = table === 'sales_quotes' ? seededQuotes : table === 'sales_orders' ? seededOrders : []
-            return rows.find((row) => filters.every(([col, value]) => row[col] === value))
+            const rows = table === 'sales_quotes' ? seededQuotes
+              : table === 'sales_orders' ? seededOrders
+              : table === 'dictionary_entries' ? orderStatusEntries
+              : []
+            return rows.find((row) => builder.matches(row))
+          },
+          async execute() {
+            const rows = table === 'sales_order_lines' ? seededOrderLines : []
+            return rows.filter((row) => builder.matches(row))
           },
         }
         return builder
@@ -280,6 +354,7 @@ function buildHarness(opts: {
     customerCreditService,
     policyResolutionServiceAvailable: opts.policyResolutionServiceAvailable !== false,
     salesCalculationService,
+    promotionsService,
   }
 }
 
@@ -322,7 +397,14 @@ describe('checkout.session.submit (B.4, steps 1-5 of §7.2/C19)', () => {
     }))
     expect(h.commandBusExecute).toHaveBeenCalledWith('sales.quotes.convert_to_order', expect.objectContaining({ input: { quoteId: result.salesQuoteId } }))
     expect(result.salesOrderId).toBe(result.salesQuoteId)
-    expect(h.seededSessions[0]).toMatchObject({ status: 'submitting', submitProgress: 'document_created', salesQuoteId: result.salesQuoteId, salesOrderId: result.salesOrderId })
+    // Step 4.2 extends the SAME call through steps 6-8 — a gateway mock that returns a
+    // synchronously-terminal status (the common test-gateway shape) reaches `completed`
+    // within this one call, same as a real auto-capturing provider would.
+    expect(h.commandBusExecute).toHaveBeenCalledWith('availability.commit', expect.objectContaining({
+      input: expect.objectContaining({ idempotencyKey: 'checkout:session-submit-1:1:stock', orderId: result.salesOrderId }),
+    }))
+    expect(h.cartService.markConverted).toHaveBeenCalledWith(expect.objectContaining({ cartId: CART_ID, salesOrderId: result.salesOrderId }))
+    expect(h.seededSessions[0]).toMatchObject({ status: 'completed', outcomeKind: 'order', salesQuoteId: result.salesQuoteId, salesOrderId: result.salesOrderId })
   })
 
   it('1b. full happy path (on_account method): reserves credit for the full payable amount (D-R5-24)', async () => {
@@ -495,5 +577,146 @@ describe('checkout.session.submit (B.4, steps 1-5 of §7.2/C19)', () => {
       status: 402,
       body: expect.objectContaining({ code: 'credit_refused' }),
     })
+  })
+})
+
+describe('checkout.session.submit (B.4, steps 6-8 of §7.2/C19 — Step 4.2)', () => {
+  // `commandRegistry` is a module-level singleton already populated by the sibling
+  // describe block's own `beforeAll` above (same file, same Node module cache) — clearing
+  // and re-importing here would just wipe it with nothing left to repopulate it, since
+  // `import('../submit')` is memoized and its top-level `registerCommand(...)` never runs
+  // twice.
+
+  beforeEach(() => {
+    jest.clearAllMocks()
+  })
+
+  it('on-account: links the credit reservation to the order (C6) and completes with no gateway call', async () => {
+    const h = buildHarness()
+
+    const result = await getHandler().execute({ ...BASE_INPUT, paymentMethodCode: 'on_account' }, h.ctx)
+
+    expect(h.customerCreditService?.linkCreditReservationToOrder).toHaveBeenCalledWith({
+      scope: { tenantId: TENANT_ID, organizationId: ORG_ID },
+      idempotencyKey: 'checkout:session-submit-1:1:credit',
+      orderId: result.salesOrderId,
+    })
+    expect(h.seededSessions[0]).toMatchObject({ status: 'completed', outcomeKind: 'order' })
+  })
+
+  it('availability.commit (step 6a) is called BEFORE the gateway call (step 7) — ordering assertion', async () => {
+    const h = buildHarness()
+    const callOrder: string[] = []
+    const originalExecute = h.commandBusExecute.getMockImplementation()!
+    h.commandBusExecute.mockImplementation(async (id: string, options: unknown) => {
+      callOrder.push(id)
+      return originalExecute(id, options as { input: any })
+    })
+    const paymentGatewayService = h.ctx.container.resolve('paymentGatewayService') as { createPaymentSession: jest.Mock }
+    const originalCreatePaymentSession = paymentGatewayService.createPaymentSession.getMockImplementation()!
+    paymentGatewayService.createPaymentSession.mockImplementation(async (...args: unknown[]) => {
+      callOrder.push('paymentGatewayService.createPaymentSession')
+      return originalCreatePaymentSession(...args)
+    })
+
+    await getHandler().execute(BASE_INPUT, h.ctx)
+
+    const commitIndex = callOrder.indexOf('availability.commit')
+    const gatewayCallIndex = callOrder.indexOf('paymentGatewayService.createPaymentSession')
+    expect(commitIndex).toBeGreaterThanOrEqual(0)
+    expect(gatewayCallIndex).toBeGreaterThan(commitIndex)
+    expect(h.cartService.lock).toHaveBeenCalledTimes(2) // fresh lock (step 1) + payment-window extend (step 7, C1)
+  })
+
+  it('a refused promotion code (C5) compensates by CANCELLING the order (not a hand-rolled release) and aborts 409 promotion_unavailable', async () => {
+    const h = buildHarness({ promotionsServiceAvailable: true })
+    // `lookupCartEnteredCodes` is called both at §7.2 step 2 (delivery re-evaluation) and
+    // again inside step 6c — two chained `Once` resolutions (never a bare
+    // `mockResolvedValue`, which would leak this code into every later test sharing this
+    // module-level mock).
+    const enteredCode = [{ id: 'code-1', type: 'static', codeString: 'SAVE10' }]
+    mockLookupCartEnteredCodes.mockResolvedValueOnce(enteredCode).mockResolvedValueOnce(enteredCode)
+    h.promotionsService!.useCode.mockRejectedValue(new Error('code already used'))
+
+    await expect(getHandler().execute(BASE_INPUT, h.ctx)).rejects.toMatchObject({
+      status: 409,
+      body: expect.objectContaining({ code: 'promotion_unavailable' }),
+    })
+
+    // Compensation is "cancel the order" (statusEntryId -> canceled), never a hand-rolled
+    // parallel release of stock/credit — those release through the order's own
+    // `sales.order.cancelled` subscribers.
+    expect(h.commandBusExecute).toHaveBeenCalledWith('sales.orders.update', expect.objectContaining({
+      input: expect.objectContaining({ statusEntryId: 'status-canceled' }),
+    }))
+    expect(h.cartService.unlock).toHaveBeenCalled()
+    expect(h.seededSessions[0].status).toBe('failed')
+    expect(h.seededSessions[0].failureCode).toBe('promotion_unavailable')
+  })
+
+  it('a non-empty budgetExceeded (C5) compensates by cancelling the order and aborts 409 promotion_unavailable', async () => {
+    const h = buildHarness({ promotionsServiceAvailable: true, registerUsageResult: { ok: true, budgetExceeded: ['promotion-1'] } })
+    mockLookupCartAppliedPromotionEffects.mockResolvedValueOnce([{ promotionId: 'promotion-1', effects: [{ type: 'CART_DISCOUNT', amountNet: '-10.00', amountGross: '-10.00' }] }])
+
+    await expect(getHandler().execute(BASE_INPUT, h.ctx)).rejects.toMatchObject({
+      status: 409,
+      body: expect.objectContaining({ code: 'promotion_unavailable' }),
+    })
+
+    expect(h.commandBusExecute).toHaveBeenCalledWith('sales.orders.update', expect.objectContaining({
+      input: expect.objectContaining({ statusEntryId: 'status-canceled' }),
+    }))
+    expect(h.seededSessions[0].status).toBe('failed')
+  })
+
+  it('a gateway failure compensates by CANCELLING the order and the session ends failed', async () => {
+    const h = buildHarness({ createPaymentSessionResult: { transaction: { id: 'gw-1', unifiedStatus: 'failed', expiresAt: null }, session: { sessionId: 'gw-session-1', status: 'failed' } } })
+
+    await expect(getHandler().execute(BASE_INPUT, h.ctx)).rejects.toMatchObject({ status: 402 })
+
+    expect(h.commandBusExecute).toHaveBeenCalledWith('sales.orders.update', expect.objectContaining({
+      input: expect.objectContaining({ statusEntryId: 'status-canceled' }),
+    }))
+    expect(h.cartService.unlock).toHaveBeenCalled()
+    expect(h.seededSessions[0].status).toBe('failed')
+    expect(h.cartService.markConverted).not.toHaveBeenCalled()
+  })
+
+  it('a gateway intent-creation failure compensates by cancelling the order (502 payment_unavailable)', async () => {
+    const h = buildHarness({ paymentGatewayServiceAvailable: true })
+    const paymentGatewayService = h.ctx.container.resolve('paymentGatewayService') as { createPaymentSession: jest.Mock }
+    paymentGatewayService.createPaymentSession.mockRejectedValueOnce(new Error('gateway unreachable'))
+
+    await expect(getHandler().execute(BASE_INPUT, h.ctx)).rejects.toMatchObject({
+      status: 502,
+      body: expect.objectContaining({ code: 'payment_unavailable' }),
+    })
+
+    expect(h.seededSessions[0].status).toBe('failed')
+  })
+
+  it('builds the correct lineMap from the order lines (C18) and passes it to cart.markConverted', async () => {
+    const h = buildHarness({
+      seededOrderLines: [
+        { id: 'order-line-1', order_id: 'quote-1', tenant_id: TENANT_ID, organization_id: ORG_ID, metadata: { cartLineId: 'line-1' }, deleted_at: null },
+      ],
+    })
+
+    const result = await getHandler().execute(BASE_INPUT, h.ctx)
+
+    expect(h.cartService.markConverted).toHaveBeenCalledWith(expect.objectContaining({
+      salesOrderId: result.salesOrderId,
+      lineMap: [{ cartLineId: 'line-1', salesOrderLineId: 'order-line-1' }],
+    }))
+  })
+
+  it('stays at awaiting_payment when the gateway reports a still-pending status (async completion is a separate, later event)', async () => {
+    const h = buildHarness({ createPaymentSessionResult: { transaction: { id: 'gw-1', unifiedStatus: 'pending', expiresAt: null }, session: { sessionId: 'gw-session-1', status: 'pending' } } })
+
+    const result = await getHandler().execute(BASE_INPUT, h.ctx)
+
+    expect(h.seededSessions[0]).toMatchObject({ status: 'awaiting_payment', submitProgress: 'payment_initiated' })
+    expect(h.cartService.markConverted).not.toHaveBeenCalled()
+    expect(result.salesOrderId).toBeTruthy()
   })
 })

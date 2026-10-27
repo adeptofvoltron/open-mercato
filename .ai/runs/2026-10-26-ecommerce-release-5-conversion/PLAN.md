@@ -50,7 +50,7 @@
 | 3 | 3.4 | cart: §7a proposal routes + sweeper branches (K13–K16/S13–S15) + undo-merge refusal (D-R5-25) | dispatch:standard | done | pending |
 | 3 | 3.5 | checkout: B.2 cart-backed links — trusted pay-link seeding (D-R5-19) + store/channel/currency check (C9) | dispatch:standard | done | pending |
 | 4 | 4.1 | checkout: B.4 submit sequence part 1 — preconditions, lock, `availability.reserve`, `reserveCredit`, idempotent document creation (C3/C7) | dispatch:standard | done | pending |
-| 4 | 4.2 | checkout: B.4 submit sequence part 2 — commit, credit link, codes/usage, gateway, `lineMap`, recovery table (C5/C6/C18/C24) | dispatch:standard | todo | — |
+| 4 | 4.2 | checkout: B.4 submit sequence part 2 — commit, credit link, codes/usage, gateway, `lineMap`, recovery table (C5/C6/C18/C24) | dispatch:standard | done | pending |
 | 4 | 4.3 | assisted_selling: module scaffold, store settings, `mode: rep\|off` validator, module registration (D-R5-36) | dispatch:standard | todo | — |
 | 4 | 4.4 | assisted_selling: threads/participants/messages + staff author routes wrapping `cart.proposal.create` | dispatch:standard | todo | — |
 | 4 | 4.5 | assisted_selling: buyer thread routes (Phase 2.1) + `/thread/events` (Phase 2.2) + retention/erasure (Phase 2.5) | dispatch:standard | todo | — |
@@ -1117,6 +1117,154 @@ commit `c92470d8d5`).
   `salesCalculationService`). The SAME gate protects the compensation path's `availability
   .release` call, so a submit that never reserved stock (availability absent) never attempts a
   pointless release that would otherwise be misreported as a compensation failure.
+
+- Step 4.2 (code structure, the task's own explicit conditional): Step 4.1's committed
+  `checkout.session.submit` is ONE function performing steps 1-5 inline and returning early
+  — not a decomposition into the §11 table's separately-named sub-commands
+  (`checkout.session.finalize`/`.initiatePayment`/`.complete`/`.fail`, which are spec prose,
+  never shipped in code). Per the brief's own instruction to follow whatever shape Step 4.1
+  already committed to, steps 6-8 were added as a continuation of the SAME function
+  (`continueOrderOutcome`, called from `execute()`'s own tail instead of its old early
+  `return`) rather than new standalone commands. Consequence accepted and paid: EVERY
+  existing Step-4.1 test that asserted the OLD stop-point (`status: 'submitting'`,
+  `submitProgress: 'document_created'`) as a FINAL state needed updating to the new terminal
+  state, since that assertion was explicitly flagged in Step 4.1's own header comment as
+  "Step 4.2 continues from exactly this point" — not a frozen contract. Alternative
+  considered: build a second, standalone command/route pair calling `checkout.session.submit`
+  then a new `checkout.session.finalize` — rejected as literal non-compliance with the task's
+  own conditional, and because it would leave `checkout.session.submit`'s own CAS guard
+  (`status === 'submitting' -> 409`) unable to protect a second in-flight command the same
+  way.
+- Step 4.2 (`CheckoutTransaction.linkId` becomes nullable, §4.4's own "extended, additive"
+  framing): a session-backed gateway payment (no `CheckoutLink` at all for a buyer-initiated
+  session) still needs ONE `CheckoutTransaction` row per §4.4's own text ("creates one
+  `CheckoutTransaction` per attempt... with `session_id`, `order_id` and `quote_id` set").
+  Phase A's own `checkout.transaction.create`/`.updateStatus` commands are hard-coupled to a
+  real `CheckoutLink` row (reservation-count bookkeeping, `usageLimitReached`) that a session
+  has none of, so this Step writes/reads the entity DIRECTLY in `commands/submit.ts`
+  (`em.create`/`em.findOne`) for the session path, reusing only the PURE helpers
+  (`mapGatewayStatusToCheckoutStatus`, `assertValidCheckoutStatusTransition`) — never calling
+  the link-only commands for a link-less row. `link_id` therefore had to become nullable
+  (migration `Migration20261028020000`); the two existing call sites that assumed it was
+  always a string (`api/transactions/route.ts`'s admin list join, `commands/transactions.ts`'s
+  terminal-event payload) were fixed minimally (filter nulls; a documented non-null assertion
+  where that command's own 404-on-missing-link guard already proves it). Phase A's own rows
+  keep `link_id` set and are untouched. Alternative considered: seed a synthetic/placeholder
+  `CheckoutLink` for every session-backed payment so `link_id` could stay required — rejected
+  as inventing a fake link row purely to satisfy a type, polluting Phase A's own link listings
+  with rows that were never real payment links.
+- Step 4.2 (C6, `customerCreditService.linkCreditReservationToOrder`, confirmed missing):
+  grep-verified absent from Step 1.6's shipped service (confirmed by the task brief itself).
+  Added as a same-module, additive method on the EXISTING `customerCreditService` DI key
+  (G26: this release's own convention — one DI key per concern, never grown onto
+  `CustomerGroupsService`) — locks the owning `CustomerCreditAccount` row (same `§6.3`
+  convention every other write on this service already follows) and writes
+  `linked_order_id` on the `reserve` ledger entry found by `idempotencyKey`. Idempotent: the
+  SAME order on a second call is a no-op; a DIFFERENT order throws the service's own
+  `idempotency_key_mismatch`. `customer_groups:order-cancelled-credit-release` (shipped
+  Phase 3, before this method existed) already reads `linkedOrderId` — this method is the
+  missing write side that subscriber was always waiting for.
+- Step 4.2 (C5, `registerUsage`'s `appliedPromotions` source — NOT limited to code-triggered
+  promotions): `cart_promotion_applications.effect` already stores the exact `ResolvedEffect`
+  object `promotionsService.evaluate()` produced when the promotion was applied to the cart
+  (confirmed by reading `cart/lib/promotionContext.ts`'s own write and
+  `cart/lib/toSalesSnapshots.ts`'s own read of the SAME column, scope `'order'` only). Added
+  `lookupCartAppliedPromotionEffects`/`lookupPromotionNames` (`lib/cartPeer.ts`, same FK-id +
+  raw-SQL "snapshot" pattern this file already uses throughout) reading EVERY scope (`'line'`
+  and `'order'`), not just `'order'` — `registerUsage` tracks budget consumption for every
+  promotion that discounted the order, automatic or code-triggered, not only the delivery-
+  scoped subset `toSalesSnapshots.ts` cares about for its own, narrower purpose. `useCode`'s
+  `customerId` and `registerUsage`'s `customerId` both resolve to the cart's own plain
+  `customer_id` column (`cartPeer.customerId`, NOT the `customerIds` identity array
+  `reserveCredit` uses for its own company-first resolution) — confirmed by reading
+  `cart/commands/promotions.ts`'s existing `reserveCode`/`validateCode` call site, which
+  already uses `cart.customerId` for the SAME per-customer-limit eligibility check `useCode`
+  re-runs, so reusing it keeps eligibility consistent with whatever the code's original
+  reservation already decided. `promotionsService.useCode`/`.registerUsage` resolve their own
+  tenant/org scope off a container-registered `auth` token (`lib/promotions-service.ts`'s own
+  documented design, not this Step's choice) — `continueOrderOutcome` registers a minimal
+  `{ tenantId, orgId }` auth value on the per-call container immediately before resolving the
+  facade, the same pattern `api/codes/use/route.ts`'s own (human, authenticated) caller
+  already uses for itself.
+- Step 4.2 (compensation uniformity, the task's own explicit instruction): EVERY failure from
+  step 6 onward (stock_lost on commit, a refused code, a budget overrun, a gateway intent
+  failure, a gateway-reported payment failure) compensates through ONE path —
+  `compensateByCancellingOrder`, which resolves the `sales.order_status` dictionary's
+  `canceled`/`cancelled` entry and calls `sales.orders.update`, letting the THREE existing
+  `sales.order.cancelled` subscribers (wms's order-hold release, `customer_groups`'s
+  `order-cancelled-credit-release` via C6's `linkedOrderId`, `promotions`'s
+  `order-cancelled-usage-revert` via `CodeUsage.orderId`, all three already shipped by earlier
+  Phases) do the actual releasing — never a hand-rolled parallel release call on this path.
+  The order-status DICTIONARY lookup (`resolveSalesOrderStatusEntryId`, raw SQL against
+  `dictionaries`/`dictionary_entries`, never an import of `sales/lib/dictionaries.ts` or the
+  `dictionaries` module's own entities) was a genuine, unavoidable discovery: `sales`'s own
+  `documentUpdateSchema` has no plain `status` string field, only `statusEntryId` resolved
+  against a per-tenant, per-organization configurable dictionary — confirmed by reading
+  `commands/documents.ts`'s own `updateOrderCommand` and `lib/dictionaries.ts`'s seed
+  defaults (`'confirmed'`, `'canceled'` — note the single `-l`, matched defensively against
+  BOTH spellings since `isCancelledOrderStatus` itself already tolerates both).
+- Step 4.2 (gateway synchronous-completion assumption, task's own test priority #1 "ends with
+  completed" for BOTH on-account AND non-on-account/gateway variants): `continueOrderOutcome`
+  checks the gateway's OWN immediate `createPaymentSession` response status
+  (`mapGatewayStatusToCheckoutStatus`) and completes (or fails) INLINE when it is already
+  terminal (a test/mock gateway's typical shape, and some real providers' own synchronous-
+  capture flow) — this call's own terminal state is `awaiting_payment` ONLY when the gateway
+  reports a genuinely still-pending status. The webhook/polling-driven LATER completion of a
+  session left at `awaiting_payment` (§7.2's own "Payment result (webhook or polling, Phase A
+  path)" is written as a SEPARATE block from the synchronous "status = awaiting_payment" line)
+  has no owning Step anywhere in PLAN.md's Phase 1-6 list — `expire-awaiting-payment` (§12's
+  OWN separate job) is the closest candidate and is NOT part of this Step's own Tasks-table
+  title ("recover-stuck-submits decision table"). Flagging this as a genuine, unclaimed gap:
+  a session that reaches `awaiting_payment` via a gateway that answers asynchronously (the
+  common case for most real redirect-based providers) has no mechanism in this run that ever
+  moves it to `completed`/`failed` on its own. A future Step must build either a payment-
+  gateway webhook subscriber that completes a session-linked `CheckoutTransaction`, or
+  `expire-awaiting-payment` itself (§12), reusing `confirmOrderAndComplete`/
+  `compensateByCancellingOrder` (both exported by `commands/submit.ts`) rather than a third
+  reimplementation.
+- Step 4.2 (`recover-stuck-submits` scope, C24): built as the `submitting`-only half of §12's
+  job table — `awaiting_payment` recovery is §12's OWN separate, unbuilt job
+  (`expire-awaiting-payment`, same gap named above). A genuine implementation discovery
+  changed the table's own shape: `commands/submit.ts`'s steps 1-5 (Step 4.1) never persist
+  `submit_progress` as `locked`/`stock_reserved`/`credit_reserved` on the `CheckoutSession`
+  row — only `null` (at the CAS) and `document_created` (step 5d) are ever written; the
+  matching `writeSessionEvent` calls at each intermediate step append `CheckoutSessionEvent`
+  AUDIT rows, never a `submit_progress` column update. C24's own table is keyed on exactly
+  those three now-unreachable intermediate values, so the worker collapses them into ONE
+  branch: whenever progress is anything before `document_created`, probe-free compensate
+  (release stock AND credit by the session's own stored `stock_reservation_key`/
+  `credit_reservation_key` — both release calls already no-op gracefully when nothing was
+  actually reserved) plus a best-effort `cart.unlock` that swallows a 404 (never actually
+  locked) rather than reporting it as a failed compensation. `document_created`/`finalized`
+  resume forward by calling `continueOrderOutcome` again (the SAME function the live path
+  calls, re-deriving every input from the session's own stored columns) — proven idempotent
+  by the SAME idempotency keys steps 6-8 already use. An attempt stuck past a 30-minute
+  give-up window compensates by cancelling the order and fails the session with
+  `submit_recovery_failed`, per §12.1's own final row. Alternative considered: keep the
+  original three-way `locked`/`stock_reserved`/`credit_reserved` branching literally, reading
+  `CheckoutSessionEvent` rows instead of the (always-null) `submit_progress` column to
+  recover the real per-step granularity — rejected as a materially larger surface (a new,
+  dedicated audit-trail query plus a second probe mechanism) for a benefit the uniform
+  release-by-stored-key approach already gets for free, given both release primitives are
+  no-op-safe.
+- Step 4.2 (quote-outcome `lineMap`, D-R5-26, confirmed deferred): `request_quote` is refused
+  outright at the very top of `checkout.session.submit` (Step 4.1's own code, unchanged by
+  this Step), so the quote-outcome branch of §7.2 steps 5/6 is never reachable from this
+  command yet — confirmed by reading Step 4.1's own early refusal
+  (`payment_method_unavailable`) and PLAN.md's own Phase 5 listing of `request_quote` as Step
+  5.1's scope. This Step built ONLY the order-outcome `lineMap` (`buildOrderLineMap`, reading
+  `sales_order_lines.metadata.cartLineId`). Step 5.1 must build the quote-outcome's own
+  `lineMap` (`salesQuoteLineId` instead of `salesOrderLineId`, reading `sales_quote_lines`
+  instead) when it adds the reachable `request_quote` path.
+- Step 4.2 (public route rate limits, C14/§13): the route reuses the EXISTING
+  `checkoutSubmitRateLimitConfig` (points: 10, already shipped unused-by-this-route since
+  before this Step — Phase A's OWN link-based `/pay/[slug]/submit` route already consumes it,
+  IP-keyed, for an unrelated bucket) for the NEW per-session bucket, via the SAME
+  `keyOverride`-to-session-token-hash pattern every other `/sessions/current/*` mutation
+  route already uses — rather than declaring a second, numerically-identical config. A NEW
+  `checkoutSessionSubmitIpRateLimitConfig` (points: 60, distinct `keyPrefix` from Phase A's
+  own `checkout-submit` IP bucket) covers the per-IP half, enforced alongside, never instead
+  of, the per-session one.
 
 ## External References
 

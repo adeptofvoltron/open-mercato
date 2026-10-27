@@ -152,12 +152,17 @@ export type CartPromotionApplicationsDatabase = {
     cart_id: string
     tenant_id: string
     organization_id: string
+    promotion_id: string
+    code: string | null
     code_id: string | null
     code_type: string | null
+    effect: Record<string, unknown> | null
+    amount_net: string | null
+    amount_gross: string | null
   }
 }
 
-export type CartEnteredCodeRef = { id: string; type: 'static' | 'dynamic' }
+export type CartEnteredCodeRef = { id: string; type: 'static' | 'dynamic'; codeString: string | null }
 
 export async function lookupCartEnteredCodes(
   em: EntityManager,
@@ -167,7 +172,7 @@ export async function lookupCartEnteredCodes(
   const rows = await em
     .getKysely<CartPromotionApplicationsDatabase>()
     .selectFrom('cart_promotion_applications')
-    .select(['code_id', 'code_type'])
+    .select(['code_id', 'code_type', 'code'])
     .where('cart_id', '=', cartId)
     .where('tenant_id', '=', scope.tenantId)
     .where('organization_id', '=', scope.organizationId)
@@ -178,7 +183,72 @@ export async function lookupCartEnteredCodes(
   for (const row of rows) {
     if (!row.code_id) continue
     const type: 'static' | 'dynamic' = row.code_type === 'dynamic' ? 'dynamic' : 'static'
-    byId.set(row.code_id, { id: row.code_id, type })
+    byId.set(row.code_id, { id: row.code_id, type, codeString: row.code ?? null })
   }
   return Array.from(byId.values())
+}
+
+// Release 5, Step 4.2 (C5, §7.2 step 6c). `registerUsage`'s `appliedPromotions` needs
+// every promotion that actually discounted this cart (code-triggered or automatic), each
+// with its real `ResolvedEffect[]` — `cart_promotion_applications.effect` already stores
+// exactly that jsonb shape verbatim (`cart/lib/promotionContext.ts#` persists
+// `entry.effect` — the SAME object `promotionsService.evaluate()` returned), so this reads
+// it back rather than reconstructing a synthetic effect. A row synced to "zeroed" (no
+// longer active, `effect: {}`, `amount_net`/`amount_gross: null`) is excluded — only a row
+// that actually carries an amount is a live adjustment, same filter
+// `cart/lib/toSalesSnapshots.ts#buildCartSalesSnapshot` already applies to its own (order-
+// scope-only) read of this table.
+export type CartAppliedPromotionEffect = { promotionId: string; effects: Array<Record<string, unknown>> }
+
+export async function lookupCartAppliedPromotionEffects(
+  em: EntityManager,
+  cartId: string,
+  scope: { tenantId: string; organizationId: string },
+): Promise<CartAppliedPromotionEffect[]> {
+  const rows = await em
+    .getKysely<CartPromotionApplicationsDatabase>()
+    .selectFrom('cart_promotion_applications')
+    .select(['promotion_id', 'effect'])
+    .where('cart_id', '=', cartId)
+    .where('tenant_id', '=', scope.tenantId)
+    .where('organization_id', '=', scope.organizationId)
+    .where('amount_net', 'is not', null)
+    .where('amount_gross', 'is not', null)
+    .execute()
+
+  const byPromotion = new Map<string, Array<Record<string, unknown>>>()
+  for (const row of rows) {
+    const effect = row.effect
+    if (!effect || Object.keys(effect).length === 0) continue
+    const existing = byPromotion.get(row.promotion_id)
+    if (existing) existing.push(effect)
+    else byPromotion.set(row.promotion_id, [effect])
+  }
+  return Array.from(byPromotion.entries()).map(([promotionId, effects]) => ({ promotionId, effects }))
+}
+
+export type PromotionNameDatabase = {
+  promotions: { id: string; tenant_id: string; organization_id: string; name: string }
+}
+
+/** FK-id + snapshot read of `promotions.Promotion.name` (never an import of `promotions`'
+ * own entity) — `registerUsage`'s `AppliedPromotion.promotionName` needs it and nothing on
+ * `cart_promotion_applications` carries it. */
+export async function lookupPromotionNames(
+  em: EntityManager,
+  promotionIds: string[],
+  scope: { tenantId: string; organizationId: string },
+): Promise<Map<string, string>> {
+  const result = new Map<string, string>()
+  if (promotionIds.length === 0) return result
+  const rows = await em
+    .getKysely<PromotionNameDatabase>()
+    .selectFrom('promotions')
+    .select(['id', 'name'])
+    .where('id', 'in', promotionIds)
+    .where('tenant_id', '=', scope.tenantId)
+    .where('organization_id', '=', scope.organizationId)
+    .execute()
+  for (const row of rows) result.set(row.id, row.name)
+  return result
 }
