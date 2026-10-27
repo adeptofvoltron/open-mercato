@@ -850,7 +850,11 @@ async function buildOrderLineMap(
  * this order; this helper additionally unlocks the cart (no subscriber does that) and
  * moves the session to `failed`.
  */
-async function compensateByCancellingOrder(
+// Release 5, Step 4.2-fix (C1/§12, `expire-awaiting-payment`): exported so the job can
+// reuse the SAME cancel-order compensation `recover-stuck-submits`'s own `continueOrderOutcome`
+// calls internally — never a parallel reimplementation of "cancel the order, release
+// everything via `sales.order.cancelled`'s subscribers, fail the session".
+export async function compensateByCancellingOrder(
   container: CommandRuntimeContext['container'],
   em: EntityManager,
   session: CheckoutSession,
@@ -893,7 +897,11 @@ async function compensateByCancellingOrder(
  * step (commit, credit link, codes/usage) is done — confirm it, build the C18 `lineMap`,
  * `cart.markConverted`, and move the session to `completed`.
  */
-async function confirmOrderAndComplete(
+// Release 5, Step 4.2-fix (C1/§12, `expire-awaiting-payment`): exported for the SAME reason
+// as `compensateByCancellingOrder` above — the job that resolves a session left in
+// `awaiting_payment` by a gateway that answered asynchronously resumes through this EXACT
+// function on a gateway-confirmed success, never a duplicate order-confirm/markConverted path.
+export async function confirmOrderAndComplete(
   container: CommandRuntimeContext['container'],
   em: EntityManager,
   session: CheckoutSession,

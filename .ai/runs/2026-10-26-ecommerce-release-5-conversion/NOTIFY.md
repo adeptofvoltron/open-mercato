@@ -1919,3 +1919,34 @@ commit, credit link, codes/usage, gateway, lineMap, recovery — plus the public
   it before moving on to assisted_selling (Steps 4.3-4.5 don't depend on it, so no reordering
   needed beyond inserting the row) — a same-module, additive, spec-named fix, not a scope change
   requiring the owner.
+
+## 2026-10-28T02:10:00Z — executor: Step 4.2-fix landed, `expire-awaiting-payment` built
+- New worker `workers/expire-awaiting-payment.worker.ts` (queue
+  `checkout-expire-awaiting-payment`, `concurrency: 1`, matching the sibling jobs' own
+  idiom), scheduled every 5 min per (tenant, organization) in `setup.ts`, mirroring
+  `transaction-expiry`/`recover-stuck-submits`'s own registration pattern exactly.
+- Authoritative clock: `CheckoutSession.paymentExpiresAt` (§12's own table entry, verbatim —
+  see PLAN.md's "Decisions taken without the owner" for the full reasoning and the one
+  pre-existing Step 4.2 deviation this Step found and deliberately left alone, the fixed
+  75-min lock-extension margin not being derived from the real `payment_expires_at`).
+- Probe: `paymentGatewayService.findTransactionBySessionId(session.paymentIntentRef, scope,
+  session.paymentMethodCode)` then `.getPaymentStatus(gatewayTransaction.id, scope)` — Phase
+  A's own idiom (`api/pay/[slug]/status/[transactionId]/route.ts`), generalized because a
+  session-backed `CheckoutTransaction` never gets a `gatewayTransactionId` (that field is
+  only ever written by the link-only `checkout.transaction.updateStatus` command — confirmed
+  by reading `commands/transactions.ts:159-165`, which 404s without a `CheckoutLink`). No
+  match, no answer, or a thrown probe all collapse to "no definitive answer" → compensate,
+  per §12's own "otherwise compensate" wording — never defaulted to success.
+- Resume/compensate: calls `confirmOrderAndComplete`/`compensateByCancellingOrder` directly —
+  both exported from `commands/submit.ts` by this Step (the prior NOTIFY.md entry's claim
+  that they were "already exported" was stale; corrected here). No parallel reimplementation
+  of either "confirm the order + markConverted + complete" or "cancel the order + fail the
+  session" exists anywhere in this job.
+- Tests: `workers/__tests__/expire-awaiting-payment.worker.test.ts` (10 cases: tenant-scoped
+  query, gateway success resumes without a duplicate order, gateway failure/no-match/thrown-
+  probe all compensate with `failureCode: 'payment_expired'`, a session missing required
+  fields is skipped, a single session failure doesn't stop the batch, a session still within
+  its deadline is never selected) plus one new `setup-schedules.test.ts` case for the
+  schedule registration itself. Full `checkout` suite: 53/53 suites, 407/407 tests (+1 suite,
+  +10 tests over Step 4.2's own 52/397), zero regressions. `yarn tsc --noEmit` on `checkout`
+  clean after wiping every `tsconfig.tsbuildinfo` repo-wide first.

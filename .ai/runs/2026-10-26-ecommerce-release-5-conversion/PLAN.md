@@ -51,7 +51,7 @@
 | 3 | 3.5 | checkout: B.2 cart-backed links — trusted pay-link seeding (D-R5-19) + store/channel/currency check (C9) | dispatch:standard | done | pending |
 | 4 | 4.1 | checkout: B.4 submit sequence part 1 — preconditions, lock, `availability.reserve`, `reserveCredit`, idempotent document creation (C3/C7) | dispatch:standard | done | pending |
 | 4 | 4.2 | checkout: B.4 submit sequence part 2 — commit, credit link, codes/usage, gateway, `lineMap`, recovery table (C5/C6/C18/C24) | dispatch:standard | done | pending |
-| 4 | 4.2-fix | checkout: `expire-awaiting-payment` job (C1/§12 gap-fill — async gateway sessions never complete without it) | dispatch:standard | todo | — |
+| 4 | 4.2-fix | checkout: `expire-awaiting-payment` job (C1/§12 gap-fill — async gateway sessions never complete without it) | dispatch:standard | done | pending |
 | 4 | 4.3 | assisted_selling: module scaffold, store settings, `mode: rep\|off` validator, module registration (D-R5-36) | dispatch:standard | todo | — |
 | 4 | 4.4 | assisted_selling: threads/participants/messages + staff author routes wrapping `cart.proposal.create` | dispatch:standard | todo | — |
 | 4 | 4.5 | assisted_selling: buyer thread routes (Phase 2.1) + `/thread/events` (Phase 2.2) + retention/erasure (Phase 2.5) | dispatch:standard | todo | — |
@@ -1266,6 +1266,34 @@ commit `c92470d8d5`).
   `checkoutSessionSubmitIpRateLimitConfig` (points: 60, distinct `keyPrefix` from Phase A's
   own `checkout-submit` IP bucket) covers the per-IP half, enforced alongside, never instead
   of, the per-session one.
+- Step 4.2-fix (C1/§12, `expire-awaiting-payment`): the authoritative clock is
+  `CheckoutSession.payment_expires_at` — §12's own table entry states it verbatim
+  ("`awaiting_payment` past `payment_expires_at`"), not a re-derived TTL; this is the SAME
+  value `continueOrderOutcome`'s gateway step (§7.2 step 7) reads off the gateway's own
+  session response (`sessionResult.transaction.expiresAt ?? +60min default`) before the lock
+  is extended by `paymentWindowMs` (a fixed 75 min = 60 min default + 15 min margin, computed
+  BEFORE the gateway call, not from the real `payment_expires_at` — a pre-existing Step 4.2
+  deviation from §6's literal "payment_expires_at − now + 15 min" wording, left as-is: fixing
+  it is a cart-lock-margin change, not this job's own mandate, and the margin it actually
+  grants is never smaller than the spec's). Cadence set to the spec's own "every 5 min".
+  `confirmOrderAndComplete`/`compensateByCancellingOrder` were NOT already exported from
+  `commands/submit.ts` despite the prior NOTIFY.md entry's claim ("both exported") — that was
+  stale/aspirational; this Step adds `export` to both (additive, same file, no behavior
+  change) so the job calls the SAME functions rather than duplicating "confirm the order,
+  markConverted, complete" or "cancel the order, fail the session". The gateway probe does
+  NOT depend on `CheckoutTransaction.gatewayTransactionId` ever being populated for a
+  session-backed row — a genuine discovery: that field is only ever written by
+  `checkout.transaction.updateStatus`, which 404s for a session-backed `CheckoutTransaction`
+  (its own `linkId` is null, so the command's `tx.findOne(CheckoutLink, { id: null })` 404s;
+  see `commands/transactions.ts:159-165` and its own comment on line 243-244), so session-
+  backed rows never get a `gatewayTransactionId`. Instead the job resolves the live
+  `GatewayTransaction` via `paymentGatewayService.findTransactionBySessionId(session.
+  paymentIntentRef, scope, session.paymentMethodCode)` — Phase A's OWN idiom (`api/pay/
+  [slug]/status/[transactionId]/route.ts`'s `getPaymentStatus` refresh-on-read pattern,
+  generalized to the one lookup key a session-backed row actually carries,
+  `CheckoutSession.paymentIntentRef` = the provider's own session id). No probe/no-match/
+  probe-error are all treated identically as "no definitive answer" → compensate, per §12's
+  own "otherwise compensate" (never treated as a success by default).
 
 ## External References
 
