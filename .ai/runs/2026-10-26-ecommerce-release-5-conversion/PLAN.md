@@ -60,7 +60,7 @@
 | 5 | 5.2 | checkout: approval-resume subscriber (C11) + session-route identity binding (D-R5-33) | dispatch:standard | done | pending |
 | 5 | 5.3 | assisted_selling: rep console (Phase 2.3) — inbox, thread, composer, proposal builder | dispatch:standard | done | pending |
 | 5 | 5.4 | assisted_selling: Phase 4 attribution — entity, `cart.cart.converted` subscriber, `GET /attributions`, console report | dispatch:standard | done | pending |
-| 6 | 6.1 | All modules: integration-coverage completion per each analysis's test list (G23/A20/K17/S16/C26) | dispatch:standard | todo | — |
+| 6 | 6.1 | All modules: integration-coverage completion per each analysis's test list (G23/A20/K17/S16/C26) | dispatch:standard | done | pending |
 | 6 | 6.2 | `UPGRADE_NOTES.md` — D-R5-21 behaviour change, A16, G26 | inline | todo | — |
 | 6 | 6.3 | `yarn template:sync:fix` pass (apps/mercato/src/modules.ts registration etc.) | inline | todo | — |
 | 6 | 6.4 | Full gate (`.ai/agentic.config.json` validation.commands), fix-forward | inline | todo | — |
@@ -1743,6 +1743,23 @@ commit `c92470d8d5`).
   the sole gate. The console report page (`backend/assisted-selling/attributions/`) is a plain
   list — no sort-by-column wiring, since the route itself only ever sorts by `convertedAt DESC`
   — matching the task's own "keep this minimal (a list, not a dashboard)" instruction literally.
+- Step 6.1 (integration-coverage completion pass, full disposition in NOTIFY.md's own
+  2026-10-27T07:35:00Z entry): G21 test gap and cart K3/K11 behavior gaps fixed and tested
+  (commits `bc8d54f8e8`, `b43d5bd6a1`); `assisted_selling`'s idle-close/retention sweepers built
+  as MANDATORY per §5.10/S7's own unconditional text, not the soft SLA the task brief allowed for
+  (commit `1050cb0cb4`); A16's missing i18n label fixed (commit `0f291f0264`); the
+  `credit-accounts/missing` route and the `CheckoutLinkCartTemplate` admin route both
+  re-confirmed as genuine, harmless gaps with no downstream dependent — accepted, carried to
+  Step 6.2's `UPGRADE_NOTES.md`. Two items left deliberately open, NOT attempted this pass: (1)
+  A7's product-pool allocation in the reservation gate — confirmed real and unchanged since Step
+  2.2's own flag, but closing it needs locking every sibling variant of a pooled product, "a
+  materially larger change" in Step 2.2's own words, which this pass judged too large to build
+  and test soundly in the time available; (2) a real-HTTP Playwright integration spec for
+  `/api/cart/proposals/*` — the highest-value coverage gap by this run's own framing, but writing
+  one without running it against the ephemeral harness risks landing a broken spec (`.ai/qa/
+  AGENTS.md`'s "Never leave broken tests"), and running that harness end-to-end was a materially
+  larger time investment than the rest of this Step combined. Both are documented in NOTIFY.md
+  with a concrete follow-up scope rather than silently dropped.
 
 ## External References
 

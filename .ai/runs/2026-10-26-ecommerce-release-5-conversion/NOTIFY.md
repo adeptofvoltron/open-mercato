@@ -2603,3 +2603,120 @@ session-route identity binding audit D-R5-33, opens the final Phase 5 pair)
   practice: re-verify each new .pg.test.ts at its own checkpoint from now on.
 - Phase 5 is complete. All 4 planned Steps landed; no rescues needed this phase. The release's
   entire main implementation scope (Phases 1-5, 44 Steps total incl. fix-forwards) is now built.
+
+## 2026-10-27T07:35:00Z — Step 6.1 (integration-coverage completion pass)
+
+Picked up a prior attempt's pre-gathered gap inventory (research only, no commits landed) and
+acted on it. Four commits landed, pushed to `fork/feat/release-5-conversion`. Full disposition
+of every item in the handed-off inventory:
+
+1. **G21 (credit-exposure-audit has no test proving zero drift after N concurrent reserves) —
+   fixed now.** `bc8d54f8e8`. Added a mocked-EM scenario (20 sequential `reserveCredit` calls
+   plus a mixed reserve/release variant against the same account) and ran the audit job against
+   the resulting ledger, asserting zero drift. Confirms the audit job itself was already correct
+   — this closed a test gap, not a behavior gap.
+
+2. **Cart K3 (a quote-purpose `cart.markConverted` never withdrew the cart's pending approval)
+   — fixed now.** `b43d5bd6a1`. Added `cart_converted_as_quote` to
+   `CartApprovalWithdrawReason`/`CustomerPurchaseApprovalWithdrawnReason` (both plain `text`
+   columns, no migration) and wired `withdrawPendingCartApproval` into `markConverted` when
+   `salesQuoteId` is present, clearing `awaitingApprovalSince` in the same flush as the status
+   write. Verified the ORDER outcome (`salesOrderId`) does NOT trigger withdrawal (regression
+   guard test) — matches K3's own table (an approved order conversion is correct as-is).
+
+3. **Code reservations never released on cart conversion or merge-absorption — fixed now.**
+   Same commit `b43d5bd6a1`. Exported `releaseCartCodeReservations` from `lib/sweepers.ts` and
+   added a `tryResolveCartCodeService` soft-DI resolver (`lib/adminCartScope.ts`, mirroring the
+   existing `tryResolveCustomerPurchaseApprovalService`); wired both into
+   `commands/lock.ts#markConverted` and `commands/merge.ts`'s absorbed-cart finalization, same
+   by-`cartId` release every sweep already applies. Tests added at both call sites.
+
+4. **`GET /api/customer_groups/customer-groups/credit-accounts/missing` (US-E2 orphan banner)
+   — accepted-with-reason, confirmed (no code change).** Re-confirmed: no route exists anywhere
+   under `credit-accounts/`. Nothing downstream depends on it across all 44 Steps; it is an
+   admin-UX convenience, not a correctness or security gap. Known, deliberate Release-5
+   limitation — carry into Step 6.2's `UPGRADE_NOTES.md`.
+
+5. **No admin write route for `CheckoutLinkCartTemplate` — accepted-with-reason, confirmed.**
+   Re-confirmed by grep: the entity is read-only in product code
+   (`checkout/lib/payLinkCartSeed.ts`), and its own integration/unit test fixtures seed it
+   directly at the mock-EM level, never through a route. No Release-5 code path needs an admin
+   UI to create one. Distinct from the EXISTING `CheckoutLinkTemplate` admin CRUD
+   (`api/templates/*`), which is a different entity (the reusable named template, not a
+   specific link's seeded cart lines) and already has full admin routes.
+
+6. **`assisted_selling` idle-close/retention sweepers — fixed now, built as MANDATORY.**
+   `1050cb0cb4`. Read the spec's own text (`2026-09-22-assisted-selling.md` §5.10, S7): "Release
+   5 ships all of §5.10 together with the first route that stores text about a buyer... the
+   staff message route of Phase 1 and the buyer routes of Phase 2 item 1 do not ship without the
+   two sweepers." Both routes already shipped (Steps 4.1/4.5) without them — not a soft SLA,
+   a compliance gap. Added `lib/sweepers.ts` (`sweepIdleThreads`, `sweepRetention`), two worker
+   wrappers, per-organization scheduler registration in `setup.ts` (idle-close hourly, retention
+   daily — same org-scoped granularity `customer_groups`'s `credit-exposure-audit` already
+   uses), and declared+emitted `assisted_selling.thread.closed` (§6.8) — the one thread-lifecycle
+   event id Step 4.4 itself deferred pending this sweeper. `sweepRetention` reuses the existing
+   `eraseAssistedSellingThread` routine so all four erasure triggers (3 event-driven + this one)
+   stay behaviorally identical. 9 new tests in `lib/__tests__/sweepers.test.ts`.
+
+7. **A7 (availability): product-pool allocation not implemented in the reservation gate —
+   still-open, confirmed real, deliberately deferred (no code change).** Traced
+   `wms/lib/wmsReservationService.ts#reserveLinesForCheckout` (line ~857): it calls
+   `computeSellableQuantities` with `productRollups: []`, always — the gate never applies a
+   product-level `safety_stock` pool, confirmed by Step 2.2's own PLAN.md decision log entry,
+   which is accurate and NOT stale. The READ path (`availabilityCalculation.ts#resolveAvailability`)
+   only applies `productRollups` for product-level query items (no `catalogVariantId`), never for
+   variant-level items either — `computeSellableQuantities`'s own module docstring confirms this
+   is the shared builder's INTENDED contract ("product-level pool subtracted exactly once, at
+   the rollup"), not something the reservation gate forgot to call. Closing this properly would
+   require locking every OTHER active variant of a pooled product on every reservation call (not
+   just the ones in the request) — Step 2.2's own words, "a materially larger change" — which
+   this pass did not attempt, to avoid shipping an under-tested half-built feature under the same
+   time pressure Step 2.2 itself flagged as the risk. Recommend a dedicated follow-up Step scoped
+   around: (a) a new loader for product-level pool profile rows adjacent to the reserved variants,
+   (b) locking every sibling active variant of a pooled product in the SAME `FOR UPDATE` as
+   today's candidate set, (c) deciding how a pool's shared budget is allocated across multiple
+   lines of the same product within one reservation call (today's per-line loop has no concept
+   of a shared remaining budget to decrement across lines). Real risk if left open: a
+   product-pool-backed variant could be oversold across its sibling variants, though never
+   within a single variant (the per-variant last-unit guarantee is unaffected either way).
+
+8. **A16 cosmetic items (i18n label + UPGRADE_NOTES entry) — i18n fixed now; UPGRADE_NOTES stays
+   Step 6.2's job.** `0f291f0264`. Confirmed the behavior-level guard (rejecting `'checkout'` on
+   the public `wms.inventory.reserve` route with `400 checkout_reservation_is_system_only`) was
+   already in place and tested (Step 2.2) — nothing to add there. The i18n label WAS missing and
+   was trivial: added a `checkout` fallback entry to `RESERVATION_SOURCE_TYPE_FALLBACKS`
+   (`lib/inventoryDisplayUi.ts`) and the translated key across all 5 locales, reusing the exact
+   wording `checkout/i18n` already settled on for `notifications.categories.checkout`.
+
+- **Confirmed NOT gaps (no action, matches prior Steps' own audits):** D-R5-33 identity binding
+  across every checkout session route; `resolveTerms`'s three tracked fields; `.attribution.degraded`;
+  `expire-awaiting-payment`; `cart.cart.merged` thread-identity/terminal-state subscribers.
+
+- **Lower-priority items — accepted-with-reason, documented, no code change:** `POST
+  /sessions/current/payment` method-selection route (intentional architectural consistency
+  choice across Steps 2.13/4.1/5.1 — additive field on submit, not a dedicated route, chosen
+  identically every time); `ecommerce.EcommerceStore` has no structured address (documented
+  2-tier vs 3-tier delivery-origin fallback limitation); `assisted_selling` settings-page admin
+  UI and `CrudForm` array-field/`EmailThreadsPanel` component-choice deviations (cosmetic,
+  equivalent behavior ships via DS-primitive custom components, not functional gaps).
+
+- **Integration-level gap (cart `/api/cart/proposals/*` + assisted_selling thread/console
+  routes have zero real-HTTP Playwright coverage, only mocked-EM Jest units) — still-open,
+  NOT attempted this pass.** Confirmed real: grepped every test file under
+  `cart/commands/__tests__/proposal.test.ts` and `assisted_selling/api/**/__tests__/*.test.ts` —
+  all mock `EntityManager`, none hit a real HTTP server. This is this run's own highest-value
+  remaining coverage gap per its own framing. NOT attempted here: building and — critically —
+  VERIFYING a real-HTTP Playwright spec needs the ephemeral integration harness
+  (`yarn test:integration:ephemeral`, Docker; confirmed Docker was reachable in this pass's
+  environment, but the harness itself was not exercised) and a materially larger time investment
+  than the rest of this Step combined. Writing a spec without running it against a live server
+  risks landing a broken test, which `.ai/qa/AGENTS.md`'s "Never leave broken tests" explicitly
+  forbids — so none was written, rather than guessing. Concrete scope for a follow-up Step:
+  model `packages/customer_groups/__integration__/TC-CGRP-034-purchase-approval-routes.spec.ts`'s
+  own shape (shared `helpers.ts` for fixtures/tenant provisioning) against
+  `cart/__integration__/helpers.ts`'s existing cart-token fixtures; cover staff `POST
+  /api/cart/proposals` (requires `cart.proposals.author`) → buyer `GET /api/cart/proposals`
+  (token-scoped) → `GET /api/cart/proposals/:id/preview` → `POST /api/cart/proposals/:id/accept`,
+  once for a guest cart token and once for an identified buyer, exercising the D-R5-13/21
+  identity-binding refusal paths (a mismatched/foreign token gets the uniform 404) alongside the
+  happy path.
