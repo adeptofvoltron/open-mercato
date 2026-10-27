@@ -2981,3 +2981,89 @@ assertions rather than trusting that a test file exists. Disposition of each:
 - Verdict: approve-worthy once the quote-acceptance approval-gate deferral (item 4) gets an
   explicit maintainer go/no-go — everything else in the 7 priority areas is clean or already
   fixed.
+
+## 2026-10-27 — Browser UI QA attempt for the 6 new admin screens (pre-ready-for-review gate)
+
+**Environment setup (all real, all completed):** Fixed `apps/mercato/.env` for QA (fresh
+`openssl rand -hex 32` `JWT_SECRET`, `DEMO_MODE=false`), created disposable Postgres DB
+`om_qa_r5`, ran `yarn build:packages --force` and `yarn build:app --force` (confirmed
+`Cached: 0 cached` on both — fresh build against current source), ran migrations
+(`cart`: 4, `customer_groups`: 9, `assisted_selling`: 3, plus every other module) and
+`yarn mercato init` against `om_qa_r5` via the workspace form (bypassing turbo's env-stripping),
+seeded admin credentials (`admin@acme.com` / `secret`, confirmed working via
+`DEMO_MODE=false` init output — no separate password reset needed this time). Booted the app
+with `node ./scripts/dev.mjs --classic` (nohup + `node_modules/.bin` on `PATH`, per the
+"mercato server start dies when backgrounded" lesson) on port 3000.
+
+**Blocker — could not reach the browser-QA step.** Once booted, every route (`/api/healthz`,
+`/login`, `/api/auth/login`) compiled successfully per the server's own log
+(`○ Compiling /api/healthz ...` followed by a real response time, not a hang) but then either
+404d or, on later attempts, timed out completely (curl `000` after 45–60s). This matches a known
+prior pattern on this machine (memory: "fresh QA dev server 404s under heavy contention"):
+`uptime` showed load average 2.8–4.3 throughout, and `sysctl vm.swapusage` showed 35+ GB of a
+36 GB swap file in use with under 2 GB free — severe machine-wide memory pressure from many
+concurrent agent sessions/worktrees, not a defect in this branch. Postgres itself was healthy
+and idle (`pg_stat_activity` showed only 1 connection to `om_qa_r5`), ruling out DB-pool
+exhaustion as the cause. Retried the health endpoint repeatedly over ~6+ minutes with
+increasingly generous timeouts (including after the dev supervisor auto-restarted its
+`next-server` child once); the server never became responsive enough to drive a real browser
+against it. Did not sink further time per the established playbook for this failure mode.
+
+**Result: none of the 6 screens could be screenshotted this pass** — blocked before Playwright
+ever got to open a page, not because of anything specific to the cart/credit/assisted-selling
+UI. No screenshot files were produced; no fabricated/hypothetical screenshots were substituted.
+
+**Fixture-seeding plan (researched, not executed — blocked by the above):** confirmed via code
+reading that an admin-authenticated API path exists for every fixture needed:
+- Cart + approval + line: `cart.create`'s storefront path (`POST /api/cart/current` with a
+  `Host` header resolving through a domain mapping → store → channel chain, same shape as
+  `packages/core/src/modules/cart/__integration__/helpers.ts#createCartStorefrontFixture`),
+  `POST /api/cart/current/lines`, a `customer_groups` terms `approvalRequiredAbove` threshold
+  set below the line's gross total, then `POST /api/cart/current/request-approval`. The
+  "identified buyer" gate (`cart.customerUserId` must be set) only reads the persisted `carts`
+  row at call time — no FK constraint ties it to a real `customer_accounts.CustomerUser` row
+  (plain `uuid` column, consistent with this codebase's no-cross-module-FK rule) — so a direct
+  SQL patch of that one column on the freshly-created cart, before calling the real
+  `request-approval` endpoint, was the planned (not yet executed) way to get a `pending`
+  approval row without standing up a full portal buyer-login flow.
+- `customer_groups` credit account: straightforward, `POST /api/customer_groups/customer-groups/credit-accounts`
+  then `POST .../credit-accounts/{id}/adjust` for a non-zero balance/exposure.
+- `assisted_selling` thread + message + proposal: straightforward,
+  `POST /api/assisted_selling/threads` (seeded with an opening message) then
+  `POST /api/assisted_selling/threads/{id}/proposals`, reusing the cart from the first fixture.
+A seed script implementing this (`/tmp/seed-release5.mjs`, outside the repo) was written and
+partially run; it failed at the first `fetch` because the server was already unresponsive, not
+because of a logic error in the plan.
+
+**Purchase-approvals admin UI — confirmed finding: NO dedicated staff admin UI exists.**
+Checked `packages/core/src/modules/customer_groups/backend/` (no approvals references — only
+CRUD pages for the groups themselves), `widgets/injection-table.ts` (registers the credit-panel
+and person-groups tabs, nothing approvals-related), and every menu/ACL registration file in the
+module (`acl.ts` only declares the `customer_groups.approvals.view`/`.decide` feature strings,
+never wires a page/menu). The only API routes are
+`packages/core/src/modules/customer_groups/api/customer-groups/approvals/{route.ts,[id]/route.ts,[id]/decide/route.ts}`
+(staff: list/detail/decide) and the symmetric `api/portal/approvals/...` (buyer: list/detail/
+decide/withdraw) — neither side has a `.tsx` page consuming them. A repo-wide grep for any
+`backend/` page with "approval" in its path turned up only unrelated domains (AI agent
+auto-approval settings, staff HR leave-request approvals). The cart admin detail page
+(`cart/backend/cart/carts/[id]/page.tsx`) is the only staff-facing UI that even references an
+approval, and it is read-only (status + amount display, no approve/reject action — the only
+button on that page is "Re-price"). This is an accurate confirmation of a gap, not a bug to fix
+in this QA pass — reported as-is per instructions.
+
+**Fallback evidence for the areas this pass could not screenshot:** the branch's own review
+pass already exercised the same 7 priority areas (concurrency, security/tenant-scoping,
+money-correctness, visibility, compensation/idempotency) with real Postgres-backed
+unit/integration tests — see the review notes immediately above this entry in this file,
+including the one real bug found and fixed there (`promotions/lib/code-service.ts#useCode`
+non-idempotency on checkout-recovery retry, fixed with a regression test, both suites green).
+That test evidence stands independently of this UI-QA attempt.
+
+**Cleanup — completed:** killed the dev server (`dev.mjs` supervisor + its `next-server` child,
+confirmed port 3000 free via `lsof`), dropped `om_qa_r5` (confirmed absent from `psql -l`). No
+git changes were made to the worktree (only the gitignored `apps/mercato/.env` was edited, plus
+a throwaway `/tmp/seed-release5.mjs` outside the repo) — `git status --short` is clean.
+
+**Recommendation:** re-run this browser-QA pass once the machine is under lighter load; the
+seeding plan above is ready to execute as soon as the dev server stays responsive long enough
+for Playwright to drive it.
