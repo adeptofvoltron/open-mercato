@@ -2514,3 +2514,78 @@ session-route identity binding audit D-R5-33, opens the final Phase 5 pair)
   priced proposal cards; built from DS primitives instead, same interaction conventions.
   Recommend a dedicated Step — or Step 5.4/6.1 — pick up the settings page if the full
   Release-5 console scope (D-R5-15) is still the bar.
+
+## 2026-10-27T10:21:14Z — executor: Step 5.4 landed, assisted_selling Phase 4 attribution — entity, converted-cart subscriber, attributions route and console report
+
+- **Closes Phase 5 and this run's main scope** (PLAN.md Tasks row 5.4 -> done). Phase 6
+  (6.1-6.4, integration-coverage completion + UPGRADE_NOTES + template-sync + full gate)
+  is the only remaining work.
+- **`AssistedSellingAttribution`** (`data/entities.ts`, migration
+  `Migration20261027180000_assisted_selling.ts`): append-only (no `updated_at`/`deleted_at`,
+  same shape as `cart.CartMergeLog`), columns per §5.5 — `sales_order_id`/`sales_order_line_id`
+  XOR `sales_quote_id`/`sales_quote_line_id` (DB check constraint), `cart_id`/`cart_line_id`
+  (the latter nullable — degraded rows carry none), `actor_type`/`actor_id` (mirrors
+  `CartLine.added_by_actor_type`/`_id`), `thread_id`/`proposal_id` (local to this module,
+  nullable), `line_net_amount`/`line_gross_amount`/`currency_code` (snapshots), `converted_at`.
+  Partial unique indexes on `(tenant_id, sales_order_line_id)` and `(tenant_id,
+  sales_quote_line_id)` where not null; a plain `(tenant_id, cart_id)` index doubles as the
+  subscriber's own redelivery guard.
+- **`cart.cartService.getAttributionLines`** (new, additive, 5th method on the existing
+  Step-4.4/4.5/5.3 facade): reads a basket's live `CartLine` rows (actor, snapshot amounts
+  from `lineTotals`) plus every `CartMergeLog` that ever targeted it with a `proposal_cart_id`
+  set, resolving each target line's originating proposal cart through `outcome`'s own
+  `targetLineId` map (§6.7's "target cart line -> outcome entry -> proposal_cart_id" path) —
+  all `cart`-internal reads, exposed as one more module-boundary-respecting service method
+  (no cross-module entity import). 3 new unit tests in `cart/lib/__tests__/cartService.test.ts`.
+- **Subscriber** (`subscribers/cart-converted-attribution.ts` + `lib/attribution.ts`,
+  persistent, mirrors Step 4.4-fix's terminal-state-subscriber precedent exactly): on
+  `cart.cart.converted`,
+  - **attributed** — a populated, line-covering `lineMap` writes one row per cart line,
+    `threadId`/`proposalId` resolved per line via `getAttributionLines`' `proposalCartId` and
+    this module's own `AssistedSellingProposal` lookup; buyer-added lines get NULL
+    thread/proposal (correct, not degraded);
+  - **degraded** — a missing or incomplete `lineMap` (on a conversion that DOES name an order
+    or a quote) writes one document-level row per distinct actor (line id NULL, amounts
+    summed) and emits `assisted_selling.attribution.degraded` (not broadcast — an operator
+    signal, §6.7's own reasoning repeated from `cart.line.visibility_rejected`);
+  - **nothing** — a conversion naming neither `salesOrderId` nor `salesQuoteId` (the
+    pre-Release-5 call shape) has no document to attribute against; skipped silently, not
+    degraded.
+  Idempotent on redelivery via the `(tenant_id, cart_id)` existence check before any read.
+  **Scope decision, flagged in PLAN.md:** attribution is NOT gated on "did this cart ever have
+  an accepted proposal" — the spec's own §6.7/§10.4 text is unconditional ("writes one row per
+  cart line"; "a mixed cart... produces the correct split"), so every converted basket cart
+  with an order/quote outcome gets fully attributed, including ones this module never touched
+  (buyer-only lines, `actor_type: 'buyer'`, `thread_id`/`proposal_id` NULL) — this is what lets
+  the report answer "% of revenue assisted," not just list the assisted slice. The task brief's
+  own "no proposal -> do nothing" framing was not followed; see PLAN.md's decision entry for
+  the full reasoning.
+- **`GET /api/assisted_selling/attributions`**: staff route, `assisted_selling.attributions.view`
+  (new ACL feature, §6.9's last one — `admin` wildcard only, not granted to `employee`, matching
+  §6.9's own least-privilege text), tenant/organization-scoped (S9 precedent), filters by
+  `proposalId`/`threadId`/`cartId`/`salesOrderId`/`salesQuoteId`/`convertedAt` range, `pageSize`
+  <= 100.
+- **Console report** (`backend/assisted-selling/attributions/page.tsx`): a plain `DataTable`
+  list (converted-at, outcome badge + id, attributed-to, cart line or "document-level
+  (degraded)" badge, net amount) with text/date-range filters — no sorting UI (the route only
+  ever sorts `convertedAt DESC`), deliberately minimal per the task's own "a list, not a
+  dashboard" instruction.
+- **i18n**: 14 new keys, added identically to en/de/es/ko/pl (every locale in this module
+  already carries identical English placeholder text pre-dating this Step — Phase 1 of the
+  i18n remediation plan stays advisory).
+- **Tests**: `lib/__tests__/attribution.test.ts` (new, 9 cases — order outcome mixed-actor
+  split, quote outcome, missing-lineMap degrade, incomplete-lineMap degrade, no-prior-proposal
+  still-attributed, redelivery no-op, neither-id skip, incomplete-payload skip, cross-tenant
+  redelivery-guard isolation); `api/attributions/__tests__/route.test.ts` (new, 5 cases — 401,
+  org-scoping, filter-to-where mapping, serialized response shape, empty-orgs short-circuit);
+  `cart/lib/__tests__/cartService.test.ts` (+2 cases for `getAttributionLines`).
+- **Checks (local mode, every `tsconfig.tsbuildinfo` wiped first):** `yarn generate` clean
+  (new route/page/migration discovered, no unrelated diffs). `yarn typecheck` — 40/40 package
+  tasks green. `yarn build:packages` — 40/40 green (`@open-mercato/core` built the new
+  entity/subscriber/route/page cleanly). `eslint` on every changed/new file — clean (exit 0).
+  `yarn jest src/modules/assisted_selling` — 154/154 (140 pre-existing + 14 new). `yarn jest
+  src/modules/cart` — 444/444 (zero regressions from the additive `cartService` method).
+  `yarn jest` in `packages/checkout` — 462/462 (zero regressions; this is the first real
+  consumer tying `assisted_selling`/`cart`/`checkout` together via the converted-cart event,
+  per the task's own framing). `yarn i18n:check-hardcoded` — zero `assisted_selling`/`cart`
+  findings (advisory gate either way).

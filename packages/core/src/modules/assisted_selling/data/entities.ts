@@ -1,5 +1,5 @@
 import { OptionalProps } from '@mikro-orm/core'
-import { Entity, Index, PrimaryKey, Property, Unique } from '@mikro-orm/decorators/legacy'
+import { Check, Entity, Index, PrimaryKey, Property, Unique } from '@mikro-orm/decorators/legacy'
 
 // Full column enum per spec §5.6 — `ai`/`both` stay reserved so Phase 3 adds behaviour without a
 // migration (S10, D-R5-15). The Release 5 WRITE-PATH validator (`data/validators.ts`) is the
@@ -432,4 +432,119 @@ export class AssistedSellingProposal {
 
   @Property({ name: 'deleted_at', type: Date, nullable: true })
   deletedAt?: Date | null
+}
+
+// ---------------------------------------------------------------------------
+// Step 5.4 — §5.5/§6.7. Written once, at conversion, by the `cart.cart.converted` subscriber
+// (`lib/attribution.ts`), and never updated — an append-only ledger, the same shape
+// `cart.CartMergeLog` itself documents for the identical reason ("a ledger row must outlive
+// the thing it audited"; no `updated_at`, no `deleted_at`). `sales_order_id`/`sales_quote_id`
+// and every other cross-module id (`cart_id`, `cart_line_id`, `actor_id`; `thread_id`/
+// `proposal_id` are LOCAL to this module) stays a plain `uuid` with no `@ManyToOne` — root
+// AGENTS.md "no direct ORM relationships between modules".
+// ---------------------------------------------------------------------------
+
+export type AssistedSellingAttributionActorType = 'buyer' | 'rep' | 'ai_agent' | 'merge' | 'system'
+
+// §5.5's own check constraint: "exactly one of sales_order_id and sales_quote_id" — one
+// conversion outcome is either an order or a quote, never both, never neither (a row with
+// neither has nothing to attribute and is never written at all, §6.7).
+@Entity({ tableName: 'assisted_selling_attributions' })
+@Check({
+  name: 'assisted_selling_attributions_order_xor_quote_chk',
+  expression:
+    '("sales_order_id" is not null and "sales_quote_id" is null) or ("sales_order_id" is null and "sales_quote_id" is not null)',
+})
+@Index({ name: 'assisted_selling_attributions_tenant_org_idx', properties: ['tenantId', 'organizationId'] })
+@Index({ name: 'assisted_selling_attributions_tenant_cart_idx', properties: ['tenantId', 'cartId'] })
+@Index({
+  name: 'assisted_selling_attributions_tenant_actor_converted_idx',
+  properties: ['tenantId', 'actorType', 'actorId', 'convertedAt'],
+})
+@Index({
+  // Partial unique: NULL in the degraded case (§6.7), so multiple degraded rows for the
+  // same cart never collide on this index.
+  name: 'assisted_selling_attributions_order_line_unique_idx',
+  expression:
+    'create unique index "assisted_selling_attributions_order_line_unique_idx" on "assisted_selling_attributions" ("tenant_id", "sales_order_line_id") where "sales_order_line_id" is not null',
+})
+@Index({
+  name: 'assisted_selling_attributions_quote_line_unique_idx',
+  expression:
+    'create unique index "assisted_selling_attributions_quote_line_unique_idx" on "assisted_selling_attributions" ("tenant_id", "sales_quote_line_id") where "sales_quote_line_id" is not null',
+})
+export class AssistedSellingAttribution {
+  [OptionalProps]?: 'createdAt'
+
+  @PrimaryKey({ type: 'uuid', defaultRaw: 'gen_random_uuid()' })
+  id!: string
+
+  @Property({ name: 'organization_id', type: 'uuid' })
+  organizationId!: string
+
+  @Property({ name: 'tenant_id', type: 'uuid' })
+  tenantId!: string
+
+  /** `sales.SalesOrder.id`. Set for the order outcome. */
+  @Property({ name: 'sales_order_id', type: 'uuid', nullable: true })
+  salesOrderId?: string | null
+
+  /** `sales.SalesOrderLine.id`. NULL only in the degraded case (§6.7). */
+  @Property({ name: 'sales_order_line_id', type: 'uuid', nullable: true })
+  salesOrderLineId?: string | null
+
+  /** `sales.SalesQuote.id`. Set for the `request_quote` outcome (D-R5-20/D-R5-26). */
+  @Property({ name: 'sales_quote_id', type: 'uuid', nullable: true })
+  salesQuoteId?: string | null
+
+  /** `sales.SalesQuoteLine.id`. NULL only in the degraded case (§6.7). Not re-linked when
+   * the quote later converts to an order (outside Release 5, D-R5-26). */
+  @Property({ name: 'sales_quote_line_id', type: 'uuid', nullable: true })
+  salesQuoteLineId?: string | null
+
+  /** `cart.Cart.id` (`kind: 'basket'`). Provenance; also the subscriber's own redelivery
+   * guard (§5.5: "a `cart.cart.converted` for a cart that already has attribution rows
+   * writes nothing"). */
+  @Property({ name: 'cart_id', type: 'uuid' })
+  cartId!: string
+
+  /** `cart.CartLine.id`. NULL only in the degraded, document-level case (§6.7). */
+  @Property({ name: 'cart_line_id', type: 'uuid', nullable: true })
+  cartLineId?: string | null
+
+  /** Mirrors `cart.CartLine.added_by_actor_type` — the actor comes straight off the line,
+   * which survives a merge unrewritten (`cart` §14). */
+  @Property({ name: 'actor_type', type: 'text' })
+  actorType!: AssistedSellingAttributionActorType
+
+  @Property({ name: 'actor_id', type: 'uuid', nullable: true })
+  actorId?: string | null
+
+  /** This module's own `AssistedSellingThread.id`. NULL for a line the buyer added
+   * themselves (no merge log entry at all — correct, not degraded) and for every row of a
+   * degraded, document-level conversion. */
+  @Property({ name: 'thread_id', type: 'uuid', nullable: true })
+  threadId?: string | null
+
+  /** This module's own `AssistedSellingProposal.id`. Same NULL rule as `thread_id`. */
+  @Property({ name: 'proposal_id', type: 'uuid', nullable: true })
+  proposalId?: string | null
+
+  /** Snapshot at conversion — never joined back to a live `sales` row, so a later credit
+   * does not change a commission report run today (§5.5's own "must not change" rule). In
+   * the degraded case this is the SUM across every line sharing this row's actor. */
+  @Property({ name: 'line_net_amount', type: 'numeric', precision: 16, scale: 4 })
+  lineNetAmount!: string
+
+  @Property({ name: 'line_gross_amount', type: 'numeric', precision: 16, scale: 4 })
+  lineGrossAmount!: string
+
+  @Property({ name: 'currency_code', type: 'text' })
+  currencyCode!: string
+
+  @Property({ name: 'converted_at', type: Date })
+  convertedAt!: Date
+
+  @Property({ name: 'created_at', type: Date, onCreate: () => new Date() })
+  createdAt: Date = new Date()
 }

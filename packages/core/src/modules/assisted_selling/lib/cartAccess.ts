@@ -71,6 +71,25 @@ export type AssistedSellingResolvedBasket = {
   customerUserId: string | null
 }
 
+/**
+ * Step 5.4 (§5.5/§6.7, S18). The `cart.cart.converted` attribution subscriber's own read —
+ * a converted basket's live lines with their actor provenance, snapshot amounts, and (when a
+ * line arrived via an accepted proposal) the `proposal_cart_id` it came from.
+ */
+export type AssistedSellingAttributionLine = {
+  id: string
+  addedByActorType: string
+  addedByActorId: string | null
+  netAmount: string
+  grossAmount: string
+  proposalCartId: string | null
+}
+
+export type AssistedSellingAttributionCartDetail = {
+  currencyCode: string
+  lines: AssistedSellingAttributionLine[]
+} | null
+
 export type AssistedSellingCartServiceLike = {
   getForOrganizations(input: {
     tenantId: string
@@ -92,6 +111,13 @@ export type AssistedSellingCartServiceLike = {
     organizationId: string
     proposalCartId: string
   }): Promise<AssistedSellingProposalCartPricedDetail>
+  /** Step 5.4 (§5.5/§6.7, S18). A `kind: 'basket'` cart's own live lines, for the attribution
+   * subscriber — `null` when the basket no longer exists. */
+  getAttributionLines(input: {
+    tenantId: string
+    organizationId: string
+    cartId: string
+  }): Promise<AssistedSellingAttributionCartDetail>
 }
 
 export function resolveCartService(container: {

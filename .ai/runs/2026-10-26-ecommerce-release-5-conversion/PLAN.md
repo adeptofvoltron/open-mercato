@@ -59,7 +59,7 @@
 | 5 | 5.1 | checkout: B.5 B2B — PO term, `min_order_value`, on-account eligibility, `request_quote` method (D-R5-20), quote branch (C15–C17) | dispatch:standard | done | pending |
 | 5 | 5.2 | checkout: approval-resume subscriber (C11) + session-route identity binding (D-R5-33) | dispatch:standard | done | pending |
 | 5 | 5.3 | assisted_selling: rep console (Phase 2.3) — inbox, thread, composer, proposal builder | dispatch:standard | done | pending |
-| 5 | 5.4 | assisted_selling: Phase 4 attribution — entity, `cart.cart.converted` subscriber, `GET /attributions`, console report | dispatch:standard | todo | — |
+| 5 | 5.4 | assisted_selling: Phase 4 attribution — entity, `cart.cart.converted` subscriber, `GET /attributions`, console report | dispatch:standard | done | pending |
 | 6 | 6.1 | All modules: integration-coverage completion per each analysis's test list (G23/A20/K17/S16/C26) | dispatch:standard | todo | — |
 | 6 | 6.2 | `UPGRADE_NOTES.md` — D-R5-21 behaviour change, A16, G26 | inline | todo | — |
 | 6 | 6.3 | `yarn template:sync:fix` pass (apps/mercato/src/modules.ts registration etc.) | inline | todo | — |
@@ -1696,6 +1696,53 @@ commit `c92470d8d5`).
   `GET /threads` query already accepts a bare uuid, so a future rep-picker widget needs no
   server change) — the filter UI itself offers only `mine`/`unassigned` today, with a bare
   store-id text filter alongside it. Flagged as a UX gap, not a missing server capability.
+
+- Step 5.4 (§6.7, S18, task brief's gate condition vs. the authoritative spec's literal text):
+  the task brief's own framing ("a converted cart's lines map to `cartLineId`s... IF the
+  cart's conversion came from an accepted proposal at all — a converted cart with NO accepted
+  proposal in its history has NOTHING to attribute") reads as a per-cart gate: skip entirely
+  when no proposal was ever accepted. The REVISED, authoritative spec text says the opposite,
+  twice: §6.7 itself ("a subscriber on `cart.cart.converted` writes one `AssistedSellingAttribution`
+  per cart line" — unconditional, no proposal-existence precondition anywhere in the prose) and
+  §10.4's own gate text ("a mixed cart (buyer lines + two reps' proposals) produces the correct
+  split" — which only makes sense if BUYER lines get rows too, not just proposal-authored ones).
+  A cart that never had a proposal accepted is simply the degenerate case where every line's
+  row has `actor_type: 'buyer'`/`'system'`/`'merge'` and `thread_id`/`proposal_id` NULL — still
+  written, not skipped. Implemented per the spec (root AGENTS.md: the spec is the authoritative
+  contract; the task brief is only the analysis-era paraphrase that produced it — the same class
+  of call Steps 2.5/2.7/2.9/3.2/5.1/5.2 already made in this run). This also means the subscriber
+  fires, and writes rows, for every converted BASKET cart that names an order or a quote outcome
+  — including one `assisted_selling` never touched — which is the only way a commission report
+  can show "% of revenue assisted" rather than only the assisted slice. Alternative considered:
+  gate the whole subscriber on "does an `AssistedSellingProposal` exist with this cart somewhere
+  in its merge-log ancestry" and no-op otherwise — rejected as contradicting the spec's own
+  literal, twice-stated unconditional text, and as actively harmful to the report's own stated
+  purpose (a commission report that only ever shows carts reps touched cannot answer "how much
+  of total revenue was assisted," the comparison the whole feature exists to support).
+- Step 5.4 (§5.5's column table vs. its own prose, `cart_line_id` nullability): §5.5's column
+  table lists `cart_id / cart_line_id | uuid` with no "nullable" annotation on either, but §6.7's
+  prose two paragraphs later is explicit that the degraded path writes "the line id NULL." Made
+  `cart_line_id` a nullable uuid column (Postgres `uuid null`) — the column table's own formatting
+  groups `cart_id`/`cart_line_id` together as "Provenance" without a per-column nullability
+  breakdown, and the prose is unambiguous that degraded rows carry no line id. Alternative
+  considered: follow the table literally and make the column non-null, forcing the degraded path
+  to invent a sentinel line id — rejected as fabricating data the spec explicitly says has none.
+- Step 5.4 (§6.9's full feature table vs. `setup.ts`'s existing employee grant): declared
+  `assisted_selling.attributions.view` in `acl.ts` (the last of §6.9's five features this run's
+  earlier Steps had deferred) but did NOT add it to `setup.ts`'s `employee` grant — §6.9's own
+  grant text is explicit that this feature "stay[s] with `admin` or [is] granted by hand to the
+  reps who sell," the same least-privilege line Step 4.4/5.3 already drew for `proposals.author`.
+  The `admin: ['assisted_selling.*']` wildcard already covers it.
+- Step 5.4 (`GET /attributions` route shape, no literal spec route table for Phase 4): §6.1's own
+  route table only enumerates Phase 1/2 routes; Phase 4's own text says only "`GET /attributions`
+  and the console report" without a literal path, query shape, or response schema. Built
+  `/api/assisted_selling/attributions` (not `/attributions/report` or similar — mirrors `GET
+  /threads`'s own top-level-resource-noun convention) with filters by `proposalId`/`threadId`/
+  `cartId`/`salesOrderId`/`salesQuoteId`/`convertedAt` range (every id a report consumer already
+  has on hand, per the task brief's own filter list) and `assisted_selling.attributions.view` as
+  the sole gate. The console report page (`backend/assisted-selling/attributions/`) is a plain
+  list — no sort-by-column wiring, since the route itself only ever sorts by `convertedAt DESC`
+  — matching the task's own "keep this minimal (a list, not a dashboard)" instruction literally.
 
 ## External References
 

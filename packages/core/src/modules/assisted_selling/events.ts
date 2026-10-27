@@ -14,12 +14,18 @@ import { createModuleEvents } from '@open-mercato/shared/modules/events'
 //
 // Step 5.3 adds `.participant.left` — the console's own `POST /threads/:id/join`'s
 // counterpart (`/leave`), the one remaining id §6.8's own table names that Step 4.4 had not
-// yet built a writer for. `.thread.closed` and `.attribution.degraded` stay deferred —
-// neither mechanism (the §5.10 retention/erasure sweepers, the §6.7 attribution subscriber)
-// ships in this Step either.
+// yet built a writer for. `.thread.closed` stays deferred — the §5.10 idle-close sweeper
+// does not ship in this run (PLAN.md's Step 4.5 decision).
 //
-// `clientBroadcast: true` on every one of them (§6.8: "on thread, participant, message and
-// proposal events so the rep console updates without polling").
+// Step 5.4 adds `.attribution.degraded` (§6.7/§6.8) — the `cart.cart.converted` subscriber's
+// own operator-facing safety-net signal, emitted when a proposal-touched conversion arrives
+// with no (or an incomplete) `lineMap`. Deliberately NOT `clientBroadcast: true` — §6.7's own
+// text: "not broadcast to either [bridge]: it is an operator signal, the same reasoning
+// `cart.line.visibility_rejected` already applies."
+//
+// `clientBroadcast: true` on every one of the thread/participant/message/proposal events
+// (§6.8: "on thread, participant, message and proposal events so the rep console updates
+// without polling").
 const events = [
   { id: 'assisted_selling.thread.opened', label: 'Assisted Selling Thread Opened', entity: 'thread', category: 'lifecycle', clientBroadcast: true },
   { id: 'assisted_selling.participant.joined', label: 'Assisted Selling Participant Joined', entity: 'participant', category: 'lifecycle', clientBroadcast: true },
@@ -31,6 +37,7 @@ const events = [
   { id: 'assisted_selling.proposal.accepted', label: 'Assisted Selling Proposal Accepted', entity: 'proposal', category: 'lifecycle', clientBroadcast: true },
   { id: 'assisted_selling.proposal.rejected', label: 'Assisted Selling Proposal Rejected', entity: 'proposal', category: 'lifecycle', clientBroadcast: true },
   { id: 'assisted_selling.proposal.expired', label: 'Assisted Selling Proposal Expired', entity: 'proposal', category: 'lifecycle', clientBroadcast: true },
+  { id: 'assisted_selling.attribution.degraded', label: 'Assisted Selling Attribution Degraded', entity: 'attribution', category: 'lifecycle' },
 ] as const
 
 export const eventsConfig = createModuleEvents({

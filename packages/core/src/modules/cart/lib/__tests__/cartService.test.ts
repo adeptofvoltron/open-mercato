@@ -261,3 +261,55 @@ describe('CartServiceImpl.getProposalCartPricedLines (Step 5.3, §7.1/§7.2, S22
     ])
   })
 })
+
+describe('CartServiceImpl.getAttributionLines (Step 5.4, §5.5/§6.7, S18)', () => {
+  it('returns null when the basket no longer exists', async () => {
+    mockFindOneWithDecryption.mockResolvedValueOnce(null)
+    const { container } = makeContainer()
+    const service = new CartServiceImpl(container)
+
+    const result = await service.getAttributionLines({ tenantId: 'tenant-1', organizationId: 'org-1', cartId: 'cart-1' })
+
+    expect(result).toBeNull()
+    const [, , where] = mockFindOneWithDecryption.mock.calls[0]
+    expect(where).toMatchObject({ kind: 'basket', id: 'cart-1' })
+  })
+
+  it('maps each live line\'s actor/amounts and resolves its originating proposal cart via CartMergeLog.outcome', async () => {
+    mockFindOneWithDecryption.mockResolvedValueOnce({ id: 'cart-1', tenantId: 'tenant-1', organizationId: 'org-1', currencyCode: 'USD' })
+    mockFindWithDecryption
+      .mockResolvedValueOnce([
+        {
+          id: 'line-buyer',
+          addedByActorType: 'buyer',
+          addedByActorId: 'customer-user-1',
+          lineTotals: { netAmount: 10, grossAmount: 12.3 },
+        },
+        {
+          id: 'line-rep',
+          addedByActorType: 'rep',
+          addedByActorId: 'rep-1',
+          lineTotals: { netAmount: 20, grossAmount: 24.6 },
+        },
+      ])
+      .mockResolvedValueOnce([
+        {
+          targetCartId: 'cart-1',
+          proposalCartId: 'proposal-cart-1',
+          outcome: [{ sourceLineId: 'source-line-1', targetLineId: 'line-rep', disposition: 'merged' }],
+        },
+      ])
+    const { container } = makeContainer()
+    const service = new CartServiceImpl(container)
+
+    const result = await service.getAttributionLines({ tenantId: 'tenant-1', organizationId: 'org-1', cartId: 'cart-1' })
+
+    expect(result).toEqual({
+      currencyCode: 'USD',
+      lines: [
+        { id: 'line-buyer', addedByActorType: 'buyer', addedByActorId: 'customer-user-1', netAmount: '10.0000', grossAmount: '12.3000', proposalCartId: null },
+        { id: 'line-rep', addedByActorType: 'rep', addedByActorId: 'rep-1', netAmount: '20.0000', grossAmount: '24.6000', proposalCartId: 'proposal-cart-1' },
+      ],
+    })
+  })
+})

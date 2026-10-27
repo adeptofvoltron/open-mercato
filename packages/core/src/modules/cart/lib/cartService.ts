@@ -12,7 +12,7 @@ import type {
 } from '../commands/lock'
 import { toCartSummary, type CartSummary } from '../commands/cart'
 import { toCartLineSnapshot, type CartLineSnapshot } from '../commands/lines'
-import { Cart, CartLine } from '../data/entities'
+import { Cart, CartLine, CartMergeLog } from '../data/entities'
 import { isCartStoreContextUnavailableError, resolveCartRouteContext } from './routeContext'
 import { getCartSalesSnapshot, type CartSalesSnapshot, type GetCartSalesSnapshotInput } from './toSalesSnapshots'
 import { hashCartToken } from './token'
@@ -142,6 +142,47 @@ export type CartServiceProposalCartPricedDetail = {
   lines: CartServiceProposalCartPricedLine[]
 } | null
 
+/**
+ * Step 5.4 (`assisted_selling` §5.5/§6.7, S18/D-R5-16/D-R5-26). The `cart.cart.converted`
+ * attribution subscriber needs, per converted BASKET cart, every live line's provenance
+ * (`added_by_actor_type`/`_id`, which `cart` §14 asserts survives a merge unrewritten) and
+ * its snapshot amounts — plus, for a line that arrived via an accepted proposal, the
+ * `proposal_cart_id` it came from, resolved through `CartMergeLog.outcome`'s own
+ * source→target line mapping (§6.7's own "the path is target cart line → outcome entry →
+ * proposal_cart_id"). All of this is `cart`-internal (`CartLine`, `CartMergeLog`), so it is
+ * exposed as one more additive `cartService` read rather than a cross-module entity import.
+ */
+export type CartServiceGetAttributionLinesInput = {
+  tenantId: string
+  organizationId: string
+  cartId: string
+}
+
+export type CartServiceAttributionLine = {
+  id: string
+  addedByActorType: CartLine['addedByActorType']
+  addedByActorId: string | null
+  /** Decimal string, numeric(16,4)-shaped — `CartLine.lineTotals.netAmount` snapshotted. */
+  netAmount: string
+  /** Decimal string, numeric(16,4)-shaped — `CartLine.lineTotals.grossAmount` snapshotted. */
+  grossAmount: string
+  /** The `cart.Cart` (`kind: 'proposal'`) this line's CURRENT target line was merged from,
+   * resolved via `CartMergeLog.outcome`, or `null` for a line the buyer added themselves
+   * (no merge log entry at all — correct, not degraded, per §6.7). */
+  proposalCartId: string | null
+}
+
+export type CartServiceAttributionDetail = {
+  currencyCode: string
+  lines: CartServiceAttributionLine[]
+} | null
+
+function toDecimalString(value: unknown): string {
+  const n = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN
+  if (!Number.isFinite(n)) return '0.0000'
+  return (Math.round((n + Number.EPSILON) * 10000) / 10000).toFixed(4)
+}
+
 export type CartService = {
   lock(input: CartServiceLockInput): Promise<CartLockResult>
   unlock(input: CartUnlockInput): Promise<CartUnlockResult>
@@ -166,6 +207,10 @@ export type CartService = {
   getProposalCartPricedLines(
     input: CartServiceGetProposalCartPricedLinesInput,
   ): Promise<CartServiceProposalCartPricedDetail>
+  /** Step 5.4 (§5.5/§6.7, S18). A `kind: 'basket'` cart's own live lines, with provenance
+   * (actor, snapshot amounts, originating proposal cart) for the attribution subscriber —
+   * `null` when the basket no longer exists. */
+  getAttributionLines(input: CartServiceGetAttributionLinesInput): Promise<CartServiceAttributionDetail>
 }
 
 type CartServiceAuthContext = CommandRuntimeContext['auth']
@@ -324,6 +369,60 @@ export class CartServiceImpl implements CartService {
           priceKindId: snapshot.priceKindId,
           priceRowId: snapshot.priceRowId,
           lineTotals: snapshot.lineTotals,
+        }
+      }),
+    }
+  }
+
+  async getAttributionLines(input: CartServiceGetAttributionLinesInput): Promise<CartServiceAttributionDetail> {
+    const em = (this.container.resolve('em') as EntityManager).fork()
+    const scope = { tenantId: input.tenantId, organizationId: input.organizationId }
+    const cart = (await findOneWithDecryption(
+      em,
+      Cart,
+      { id: input.cartId, tenantId: input.tenantId, organizationId: input.organizationId, kind: 'basket' as const },
+      {},
+      scope,
+    )) as Cart | null
+    if (!cart) return null
+
+    const lines = (await findWithDecryption(
+      em,
+      CartLine,
+      { cartId: input.cartId, deletedAt: null, tenantId: input.tenantId, organizationId: input.organizationId },
+      { orderBy: { lineNumber: 'ASC' } },
+      scope,
+    )) as CartLine[]
+
+    // §6.7: "the path is target cart line -> outcome entry -> proposal_cart_id" — every
+    // merge log that ever targeted THIS cart and carries a `proposal_cart_id` (a proposal
+    // acceptance, §4.4), mapped from its own `outcome` entries' `targetLineId`.
+    const mergeLogs = (await findWithDecryption(
+      em,
+      CartMergeLog,
+      { targetCartId: input.cartId, tenantId: input.tenantId, organizationId: input.organizationId, proposalCartId: { $ne: null } },
+      {},
+      scope,
+    )) as CartMergeLog[]
+    const targetLineProposalCartId = new Map<string, string>()
+    for (const log of mergeLogs) {
+      if (!log.proposalCartId) continue
+      for (const entry of log.outcome) {
+        if (entry.targetLineId) targetLineProposalCartId.set(entry.targetLineId, log.proposalCartId)
+      }
+    }
+
+    return {
+      currencyCode: cart.currencyCode,
+      lines: lines.map((line) => {
+        const totals = (line.lineTotals ?? {}) as Record<string, unknown>
+        return {
+          id: line.id,
+          addedByActorType: line.addedByActorType,
+          addedByActorId: line.addedByActorId ?? null,
+          netAmount: toDecimalString(totals.netAmount),
+          grossAmount: toDecimalString(totals.grossAmount),
+          proposalCartId: targetLineProposalCartId.get(line.id) ?? null,
         }
       }),
     }
