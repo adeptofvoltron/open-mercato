@@ -14,6 +14,8 @@ import { cartMarkConvertedLineMapSchema, type CartMarkConvertedLineMapEntry } fr
 import { resolveCartLockTimeoutMs } from '../lib/sweepConfig'
 import { assertCartNotLocked } from '../lib/lockGuard'
 import { emitCartEvent } from '../events'
+import { computeGoodsGrossAmount } from '../lib/approvalGate'
+import { tryResolveCustomerPurchaseApprovalService } from '../lib/adminCartScope'
 import { repriceCartCommand, toCartSummary } from './cart'
 import type { CartRepriceInput, CartRepriceResult, CartSummary } from './cart'
 
@@ -104,6 +106,12 @@ export type CartLockInput = {
    * `resolveCartLockTimeoutMs()` (today's behaviour) when omitted. Additive — every pre-
    * Release-5 caller that never passed this keeps the exact same TTL it always got. */
   lockTtlMs?: number
+  /** (rev 10 — K2/D-R5-23, §9a.3/§9a.6) Default `'order'`. `'quote'` is how checkout locks
+   * for the `request_quote` payment method — it skips the approval gate (§9a.3) entirely;
+   * the re-price and visibility pass still run unconditionally either way. Additive —
+   * every pre-Release-5 caller that never passed this keeps running the gate exactly as an
+   * `'order'` lock always has. */
+  purpose?: 'order' | 'quote'
 }
 
 export type CartLockResult = {
@@ -198,6 +206,49 @@ const lockCartCommand: CommandHandler<CartLockInput, CartLockResult> = {
     // dispatch was in flight.
     assertCartNotLocked(cart)
     if (cart.status !== 'active') throw notFound('[internal] cart not found')
+
+    // §9a.3 (rev 10 — K2-K5, D-R5-12, D-R5-23, D-R5-29): the approval gate, run AFTER the
+    // visibility pass and BEFORE the lock columns are written, exactly per §9.1's "Order of
+    // checks on a fresh lock." `cart.requiresApproval` is already fresh at this point — the
+    // forced re-price dispatched above (`trigger: 'lock'`) just recomputed it from live
+    // terms as the final phase of `buildRecomputeCartTotalsPhase` (`lib/reprice.ts`), so
+    // this reads it off the cart this function already re-loaded post-reprice rather than
+    // calling `resolveTerms` a second time. `purpose: 'quote'` (D-R5-23) skips the gate
+    // entirely — the re-price and visibility pass above still ran unconditionally.
+    if (input.purpose !== 'quote' && cart.requiresApproval) {
+      // D-R5-12/D-R5-29: a guest cannot request approval (no `CustomerUser`, X7) — fail
+      // closed with the distinct, clearer refusal rather than falling through to the
+      // generic gate refusal. No channel exemption (D-R5-29): this runs identically for
+      // every channel, since `requiresApproval` and `customerUserId` are both plain cart
+      // columns with no channel branch.
+      if (!cart.customerUserId) {
+        throw new CrudHttpError(409, {
+          error: '[internal] approval_requires_identified_buyer',
+          code: 'approval_requires_identified_buyer',
+        })
+      }
+      const goodsGrossAmount = computeGoodsGrossAmount(cart.totals)
+      const approvalService = tryResolveCustomerPurchaseApprovalService(ctx.container)
+      const approval = cart.approvalId && approvalService
+        ? await approvalService.getApproval({ scope, approvalId: cart.approvalId })
+        : null
+      const qualifies =
+        !!approval &&
+        approval.status === 'approved' &&
+        approval.currencyCode === cart.currencyCode &&
+        Number(approval.amountGross) >= goodsGrossAmount
+      if (!qualifies) {
+        throw new CrudHttpError(409, {
+          error: '[internal] cart_requires_approval',
+          code: 'cart_requires_approval',
+          approval: approval
+            ? { id: approval.id, status: approval.status, amountGross: approval.amountGross, currencyCode: approval.currencyCode }
+            : null,
+          amountGross: String(goodsGrossAmount),
+          currencyCode: cart.currencyCode,
+        })
+      }
+    }
 
     const now = new Date()
     await withAtomicFlush(

@@ -2,6 +2,7 @@ import { asFunction, asValue } from 'awilix'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import type { AppContainer } from '@open-mercato/shared/lib/di/container'
 import type { ModuleConfigService } from '@open-mercato/core/modules/configs/lib/module-config-service'
+import type { BaseCurrencyService } from '@open-mercato/core/modules/currencies/services/baseCurrencyService'
 import { createCustomerGroupsService } from './services/customerGroupsService'
 import { createCustomerCreditService } from './services/customerCreditService'
 import { createCustomerPurchaseApprovalService } from './services/customerPurchaseApprovalService'
@@ -32,7 +33,13 @@ export function register(container: AppContainer) {
     // here resolves to "one instance per request container", not one instance for
     // the process — same pattern as `warrantyClaimNumberGenerator` in
     // `warranty_claims/di.ts`.
-    customerGroupsService: asFunction(({ em }: AppCradle) => createCustomerGroupsService(em))
+    // Step 3.1 (D-R5-37): `currencies` is a soft peer (not in `index.ts`'s own
+    // `requires`) — `baseCurrencyService` resolves to `null` through the same
+    // `softCradle` shape `customerPurchaseApprovalService` already uses for
+    // `moduleConfigService` whenever `currencies` is not registered.
+    customerGroupsService: asFunction((cradle: AppCradle) =>
+      createCustomerGroupsService(cradle.em, softCradle<BaseCurrencyService>(cradle, 'baseCurrencyService')),
+    )
       .singleton()
       .proxy(),
     // Release 5 Phase 3 (G26): its own DI key and interface, registered beside

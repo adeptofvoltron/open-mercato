@@ -74,7 +74,17 @@ function makeResolvedLinePrice(overrides: Row = {}) {
   }
 }
 
-function makeContainer(opts: { resolveLinePrice?: jest.Mock; calculateLine?: jest.Mock; calculateDocumentTotals?: jest.Mock }) {
+function makeContainer(opts: {
+  resolveLinePrice?: jest.Mock
+  calculateLine?: jest.Mock
+  calculateDocumentTotals?: jest.Mock
+  // Step 3.1 (K1/K2) — undefined by default, matching every token this fake container did
+  // not already know: `buildRecomputeCartTotalsPhase` defensively `tryResolve`s
+  // `customerGroupsService` (`../approvalGate.ts`), so every EXISTING test below (none of
+  // which pass this) keeps hitting the `Unexpected DI token` throw, caught internally,
+  // degrading `cart.requiresApproval` to `false` exactly as before this Step.
+  customerGroupsService?: unknown
+}) {
   const resolveLinePrice = opts.resolveLinePrice ?? jest.fn(async () => makeResolvedLinePrice())
   const calculateLine = opts.calculateLine ?? jest.fn(async ({ line }: any) => ({
     line,
@@ -103,6 +113,10 @@ function makeContainer(opts: { resolveLinePrice?: jest.Mock; calculateLine?: jes
     resolve: (token: string): any => {
       if (token === 'catalogBuyerPricingService') return { resolveLinePrice }
       if (token === 'salesCalculationService') return { calculateLine, calculateDocumentTotals }
+      if (token === 'customerGroupsService') {
+        if (opts.customerGroupsService !== undefined) return opts.customerGroupsService
+        throw new Error(`Unexpected DI token: ${token}`)
+      }
       throw new Error(`Unexpected DI token: ${token}`)
     },
     resolveLinePrice,
@@ -381,5 +395,79 @@ describe('buildRecomputeCartTotalsPhase', () => {
       { lineId: 'line-1', productId: 'product-1', oldUnitPriceNet: '10', newUnitPriceNet: '8', oldUnitPriceGross: '12', newUnitPriceGross: '9.6', reason: 'stale_snapshot' },
     ])()
     expect(changedCart.lastPriceChangeAt).toBe(now)
+  })
+
+  // Step 3.1 (K2, §9a.2) — TC-CART-APR-01: `requiresApproval` is recomputed on EVERY call
+  // to this phase (i.e. every totals-changing command: line writes, `cart.reprice` itself,
+  // and everything that dispatches `cart.reprice` — merge, promotions, `cart.lock`'s own
+  // forced re-price), not only at `cart.lock`. The default `calculateDocumentTotals` stub
+  // returns `grandTotalGrossAmount: 19.2` (see `makeContainer`).
+  it('recomputes cart.requiresApproval from fresh terms on every call, above and below the threshold', async () => {
+    const cart = makeCart()
+    const line = makeLine()
+    const now = new Date('2026-02-01T00:00:00.000Z')
+    const resolveTerms = jest.fn(async () => ({
+      priceKindId: null,
+      paymentTermsDays: null,
+      allowPurchaseOnAccount: false,
+      approvalRequiredAbove: 10,
+      minOrderValue: null,
+      approvalPolicy: 'buyer' as const,
+      termsCurrencyCode: 'USD',
+      sources: {
+        priceKindId: null,
+        paymentTermsDays: null,
+        allowPurchaseOnAccount: null,
+        approvalRequiredAbove: null,
+        minOrderValue: null,
+        approvalPolicy: null,
+        termsCurrencyCode: null,
+      },
+    }))
+    const container = makeContainer({ customerGroupsService: { resolveTerms } })
+
+    await buildRecomputeCartTotalsPhase(container, cart, [line], now, [])()
+
+    // 19.2 (the stub's grandTotalGrossAmount) > 10 (the threshold).
+    expect(cart.requiresApproval).toBe(true)
+    expect(resolveTerms).toHaveBeenCalledWith({
+      customerId: cart.customerId ?? null,
+      customerIds: cart.customerIds ?? [],
+      tenantId: cart.tenantId,
+      organizationId: cart.organizationId,
+    })
+
+    // A second call with a higher threshold (simulating the group terms changing between
+    // calls) brings it back to false — "recomputed... on every totals change," not cached.
+    resolveTerms.mockResolvedValueOnce({
+      priceKindId: null,
+      paymentTermsDays: null,
+      allowPurchaseOnAccount: false,
+      approvalRequiredAbove: 1000,
+      minOrderValue: null,
+      approvalPolicy: 'buyer',
+      termsCurrencyCode: 'USD',
+      sources: {
+        priceKindId: null,
+        paymentTermsDays: null,
+        allowPurchaseOnAccount: null,
+        approvalRequiredAbove: null,
+        minOrderValue: null,
+        approvalPolicy: null,
+        termsCurrencyCode: null,
+      },
+    })
+    await buildRecomputeCartTotalsPhase(container, cart, [line], now, [])()
+    expect(cart.requiresApproval).toBe(false)
+  })
+
+  it('degrades requiresApproval to false, never throwing, when customerGroupsService cannot be resolved (customer_groups absent)', async () => {
+    const cart = makeCart()
+    const line = makeLine()
+    const container = makeContainer({})
+    const now = new Date('2026-02-01T00:00:00.000Z')
+
+    await expect(buildRecomputeCartTotalsPhase(container, cart, [line], now, [])()).resolves.toBeUndefined()
+    expect(cart.requiresApproval).toBe(false)
   })
 })

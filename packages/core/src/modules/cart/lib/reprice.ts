@@ -11,6 +11,7 @@ import type {
 import type { SalesCalculationService } from '@open-mercato/core/modules/sales/services/salesCalculationService'
 import type { SalesAdjustmentDraft, SalesLineSnapshot } from '@open-mercato/core/modules/sales/lib/types'
 import { Cart, CartLine } from '../data/entities'
+import { computeGoodsGrossAmount, resolveCartRequiresApproval } from './approvalGate'
 
 // Step 5.1 — the whole-cart re-pricing engine behind the `cart.reprice` command (triggers
 // 2-4, §5.2) and the real `Cart.totals` aggregate (§3.2). Closes the gap NOTIFY.md has
@@ -289,6 +290,16 @@ export function toCartTotalsLineSnapshot(line: CartLine, currencyCode: string): 
  * `lines` is filtered to `flagState == null` here (not by the caller) so this is the one
  * place that ever has to remember a flagged line is excluded from totals (§4.2/§6a.2) —
  * mirrors `buildCartLineRepricePhases`'s own defensive filter above.
+ *
+ * Step 3.1 (K2, §9a.2): the SAME phase also recomputes `Cart.requiresApproval` — this is
+ * the one function every totals-changing command (line writes via `commands/lines.ts`,
+ * `cart.reprice` itself, and everything `cart.reprice` is dispatched FROM: `cart.merge`/
+ * `.mergeUndo`, `cart.promotions.apply`/`.remove`, and `cart.lock`'s own forced re-price)
+ * already funnels through, so hooking the gate's "whenever totals change" requirement in
+ * here — rather than adding a second phase every call site would have to remember to add
+ * — also satisfies "recomputes it from fresh terms at `cart.lock`" for free: the lock
+ * command always forces a re-price (`trigger: 'lock'`) immediately before it ever reads
+ * `cart.requiresApproval` for the gate check (`commands/lock.ts`).
  */
 export function buildRecomputeCartTotalsPhase(
   container: { resolve: <T = unknown>(name: string) => T },
@@ -315,5 +326,6 @@ export function buildRecomputeCartTotalsPhase(
     cart.totals = result.totals as unknown as Record<string, unknown>
     cart.totalsComputedAt = now
     if (changes.length > 0) cart.lastPriceChangeAt = now
+    cart.requiresApproval = await resolveCartRequiresApproval(container, cart, computeGoodsGrossAmount(cart.totals))
   }
 }

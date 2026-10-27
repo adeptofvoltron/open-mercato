@@ -1,19 +1,35 @@
 import type { EntityManager } from '@mikro-orm/postgresql'
 import { unionScopes } from '@open-mercato/shared/lib/catalog-visibility'
 import type { AssortmentScope, EffectiveAssortmentScope } from '@open-mercato/shared/lib/catalog-visibility'
+// Release 5 Phase 4 (D-R5-37): `currencies` stays a SOFT peer of `customer_groups` (not in
+// `index.ts`'s own `requires`) — only the type is imported here; the concrete service is
+// threaded in by `di.ts` via the same `softCradle` shape `customerPurchaseApprovalService`
+// already uses for `moduleConfigService`, never a hard static value import or a direct
+// `new BaseCurrencyService(em)` bypassing DI.
+import type { BaseCurrencyService } from '@open-mercato/core/modules/currencies/services/baseCurrencyService'
 import { CustomerGroup, CustomerGroupMembership, CustomerGroupTerms, type CustomerGroupApprovalPolicy } from '../data/entities'
 import { CUSTOMER_GROUP_MAX_ANCESTOR_DEPTH } from '../data/validators'
 
 // Release 5 Phase 4 (D-R5-1, §6.0): "approvalPolicy" is added to TERMS_FIELD_NAMES so it
 // resolves through the exact same per-field, highest-priority-group-with-a-non-null-value
 // algorithm every other scalar term already uses (§6.1) — `customerPurchaseApprovalService
-// #requestApproval` snapshots this value at creation. §6.0 also names `termsCurrencyCode`,
-// `allowQuoteRequests` and `requiresPoNumber` for the same TERMS_FIELD_NAMES treatment;
-// those three have no caller in this Step and are deliberately left unresolved here — see
-// PLAN.md "Decisions taken without the owner" — the next Step that reads one of them
-// (cart's approval gate for `termsCurrencyCode`, checkout B.5 for the other two) must add
-// it the same way this one adds `approvalPolicy`, not invent a parallel mechanism.
+// #requestApproval` snapshots this value at creation.
+//
+// Step 3.1 (cart approval gate, K1/D-R5-4/D-R5-37) adds `termsCurrencyCode` the same way,
+// PLUS one extra, field-specific step `applyTermsCurrencyFallback` runs after the generic
+// per-field loop below: when no group in the chain sets it, fall back to the buyer's
+// organization's base currency (D-R5-37) rather than leaving it `null`. §6.0 also names
+// `allowQuoteRequests` and `requiresPoNumber` for the plain TERMS_FIELD_NAMES treatment;
+// those two still have no caller in this run and are deliberately left unresolved here —
+// see PLAN.md "Decisions taken without the owner" — checkout B.5 (Step 5.1) must add them
+// the same way `approvalPolicy`/`termsCurrencyCode` were added, not invent a parallel
+// mechanism.
 const DEFAULT_APPROVAL_POLICY: CustomerGroupApprovalPolicy = 'buyer'
+// Step 3.1 (D-R5-37): the sentinel `sources.termsCurrencyCode` carries when the value came
+// from the organization's base currency rather than any group's own `terms_currency_code`
+// column — every other field's `sources` entry is a real group id (or `null`); this is the
+// one field whose resolution can also come from a THIRD place outside the group chain.
+const TERMS_CURRENCY_SOURCE_BASE_CURRENCY = 'base_currency'
 
 export type GroupResolution = {
   groupIds: string[]
@@ -31,6 +47,7 @@ const TERMS_FIELD_NAMES = [
   'approvalRequiredAbove',
   'minOrderValue',
   'approvalPolicy',
+  'termsCurrencyCode',
 ] as const
 type TermsFieldName = (typeof TERMS_FIELD_NAMES)[number]
 
@@ -53,6 +70,11 @@ export type ResolvedTerms = {
   minOrderValue: number | null
   // Release 5 Phase 4 (D-R5-1): tenant default 'buyer' — see DEFAULT_APPROVAL_POLICY.
   approvalPolicy: CustomerGroupApprovalPolicy
+  // Release 5 Phase 4 (D-R5-4/D-R5-37): currency of `approvalRequiredAbove`/
+  // `minOrderValue`. `null` only when no group in the chain sets it AND the organization
+  // has no base currency (or no `organizationId` was supplied to resolve one against) —
+  // every other case falls back to the base currency, see `applyTermsCurrencyFallback`.
+  termsCurrencyCode: string | null
   sources: ResolvedTermsSources
 }
 
@@ -92,6 +114,15 @@ export type ResolveTermsInput = {
   tenantId: string
   at?: Date
   groupIds?: string[]
+  /**
+   * Step 3.1 (D-R5-37): the buyer's organization, used ONLY to resolve the base-currency
+   * fallback for `termsCurrencyCode` when no group in the chain sets it. Optional and
+   * additive — every pre-existing caller that never passed this (e.g.
+   * `customerCreditService`'s own `resolveTerms` calls, the `explain-terms` route) keeps
+   * `termsCurrencyCode` resolving to `null` in that case, exactly as it did before this
+   * field existed; `cart`'s approval gate is the first caller that supplies it.
+   */
+  organizationId?: string
 }
 
 // Same shape as `ResolveGroupsInput` — `resolveAssortmentScope` delegates straight to
@@ -216,6 +247,7 @@ function tenantDefaultTerms(): ResolvedTerms {
     approvalRequiredAbove: null,
     minOrderValue: null,
     approvalPolicy: DEFAULT_APPROVAL_POLICY,
+    termsCurrencyCode: null,
     sources: {
       priceKindId: null,
       paymentTermsDays: null,
@@ -223,6 +255,7 @@ function tenantDefaultTerms(): ResolvedTerms {
       approvalRequiredAbove: null,
       minOrderValue: null,
       approvalPolicy: null,
+      termsCurrencyCode: null,
     },
   }
 }
@@ -250,6 +283,8 @@ function termsFieldIsSet(terms: CustomerGroupTerms, field: TermsFieldName): bool
       return terms.minOrderValue != null
     case 'approvalPolicy':
       return terms.approvalPolicy != null
+    case 'termsCurrencyCode':
+      return terms.termsCurrencyCode != null
   }
 }
 
@@ -278,12 +313,21 @@ function applyTermsField(
     case 'approvalPolicy':
       result.approvalPolicy = (terms.approvalPolicy ?? DEFAULT_APPROVAL_POLICY) as CustomerGroupApprovalPolicy
       break
+    case 'termsCurrencyCode':
+      result.termsCurrencyCode = terms.termsCurrencyCode ?? null
+      break
   }
   result.sources[field] = sourceGroupId
 }
 
 export class DefaultCustomerGroupsService implements CustomerGroupsService {
-  constructor(private readonly em: EntityManager) {}
+  constructor(
+    private readonly em: EntityManager,
+    // Step 3.1 (D-R5-37): `null` when `currencies` is not registered (soft peer) — the
+    // fallback below then leaves `termsCurrencyCode` exactly as the group chain resolved
+    // it (possibly `null`), never throwing.
+    private readonly baseCurrencyService: BaseCurrencyService | null = null,
+  ) {}
 
   async resolveGroups(input: ResolveGroupsInput): Promise<GroupResolution> {
     const at = input.at ?? new Date()
@@ -359,7 +403,11 @@ export class DefaultCustomerGroupsService implements CustomerGroupsService {
         })
       ).groupIds
 
-    if (!groupIds.length) return tenantDefaultTerms()
+    if (!groupIds.length) {
+      const result = tenantDefaultTerms()
+      await this.applyTermsCurrencyFallback(result, input)
+      return result
+    }
 
     // One ancestor chain per matching group, in the SAME priority order `groupIds`
     // arrived in (self first, then parent, then grandparent, ... up to the depth
@@ -392,7 +440,30 @@ export class DefaultCustomerGroupsService implements CustomerGroupsService {
       }
     }
 
+    await this.applyTermsCurrencyFallback(result, input)
     return result
+  }
+
+  // Step 3.1 (D-R5-37): the one field-specific step outside the generic per-field loop
+  // above. Runs AFTER it, so an explicit group-level `terms_currency_code` always wins —
+  // this only fills the gap when every group in the chain (and the tenant default) left
+  // it `null`. `sources.termsCurrencyCode` is set to the `TERMS_CURRENCY_SOURCE_BASE_
+  // CURRENCY` sentinel (not a group id) so a caller displaying provenance can tell "this
+  // came from the org's base currency" apart from "this came from group X."  Never throws:
+  // an absent `currencies` module, a missing `organizationId`, or an `ambiguous`/
+  // `unavailable`/`missing` resolution all leave `termsCurrencyCode` `null`, which is
+  // D-R5-4's fail-closed baseline.
+  private async applyTermsCurrencyFallback(result: ResolvedTerms, input: ResolveTermsInput): Promise<void> {
+    if (result.termsCurrencyCode != null) return
+    if (!input.organizationId || !this.baseCurrencyService) return
+    const resolution = await this.baseCurrencyService.resolveBaseCurrency({
+      tenantId: input.tenantId,
+      organizationIds: [input.organizationId],
+    })
+    if (resolution.status === 'resolved') {
+      result.termsCurrencyCode = resolution.code
+      result.sources.termsCurrencyCode = TERMS_CURRENCY_SOURCE_BASE_CURRENCY
+    }
   }
 
   async resolveAssortmentScope(input: ResolveAssortmentScopeInput): Promise<ResolvedAssortmentScope> {
@@ -425,6 +496,9 @@ export class DefaultCustomerGroupsService implements CustomerGroupsService {
   }
 }
 
-export function createCustomerGroupsService(em: EntityManager): CustomerGroupsService {
-  return new DefaultCustomerGroupsService(em)
+export function createCustomerGroupsService(
+  em: EntityManager,
+  baseCurrencyService: BaseCurrencyService | null = null,
+): CustomerGroupsService {
+  return new DefaultCustomerGroupsService(em, baseCurrencyService)
 }

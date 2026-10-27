@@ -1110,3 +1110,79 @@ payment methods listing)
   across the entire run (3 UI surfaces accumulated). Committing the next UI-touching Step, or
   Step 6.1 at the latest, to actually do this.
 - Phase 2 is complete. All 13 Steps landed; no rescues needed this phase.
+
+## 2026-10-27T22:00:00Z — Step 3.1 landed (cart: approval gate — K1-K5/§9a, Phase 3 opens)
+
+- Closed the tracked `resolveTerms` gap first (flagged after Step 2.5): `termsCurrencyCode`
+  was still unresolved as of `5db46425d1`. Added it to `customerGroupsService.ts`'s per-field
+  resolution loop the same way Step 2.5 added `approvalPolicy`, PLUS one extra, field-only
+  step (`applyTermsCurrencyFallback`) implementing D-R5-37: when no group in the chain sets
+  it, fall back to the buyer's organization's base currency. Found and reused an EXISTING
+  `currencies.BaseCurrencyService`/`baseCurrencyService` DI key (nobody in this run had
+  wired it up yet) rather than writing a second raw-SQL lookup — threaded in via the same
+  `softCradle` shape `customerPurchaseApprovalService` already uses for
+  `moduleConfigService`, since `currencies` stays a soft peer of `customer_groups`.
+  `ResolveTermsInput.organizationId` is new, optional and additive. Still did NOT resolve
+  `allowQuoteRequests`/`requiresPoNumber` — no caller yet; Step 5.1 owns those.
+- `cart/lib/approvalGate.ts` (new): the gate's pure math and its one soft-DI read, shared by
+  the totals phase and `cart.lock` — `computeGoodsGrossAmount` (K1: parses
+  `totals.grandTotalGrossAmount`), `computeRequiresApproval` (§9a.2's literal formula),
+  `tryResolveCustomerGroupsService`, `resolveCartRequiresApproval` (orchestrates
+  `resolveTerms` + the formula, degrading to `false` when `customer_groups` cannot be
+  resolved — documented degrade, same precedent Step 2.10 set for the approval-service
+  sibling).
+- `cart/lib/reprice.ts#buildRecomputeCartTotalsPhase`: now also sets `cart.requiresApproval`
+  on every call, right after `cart.totals` is written. This ONE function is already the
+  universal hook every totals-changing command funnels through (`commands/lines.ts`'s line
+  writes directly; `commands/cart.ts`'s `cart.reprice` for everything that DISPATCHES it —
+  merge, promotions apply/remove, admin reprice, and `cart.lock`'s own forced re-price) — so
+  this single change satisfies §9a.2's "whenever totals change" AND "recomputes it from fresh
+  terms at `cart.lock`" (the lock's forced reprice IS a totals-change event, strictly before
+  the gate ever reads the flag back) without a second `resolveTerms` call anywhere.
+- `cart/commands/lock.ts`: added `purpose?: 'order' | 'quote'` to `CartLockInput` (default
+  `'order'`). The gate sits between the visibility-pass check and `withAtomicFlush`, per
+  §9.1's own "order of checks." `purpose === 'quote'` skips it entirely (D-R5-23). Otherwise,
+  when `cart.requiresApproval` (freshly read post-reprice): a guest (`customerUserId` null)
+  gets `409 approval_requires_identified_buyer` (D-R5-12) instead of the generic gate
+  refusal; an identified buyer's `Cart.approvalId` is read LIVE through
+  `customerPurchaseApprovalService.getApproval` (soft-resolved via the existing
+  `tryResolveCustomerPurchaseApprovalService` in `lib/adminCartScope.ts`) and must be
+  `approved`, same-currency, and `amountGross >= current goods gross` to qualify; otherwise
+  `409 cart_requires_approval` with `{ approval, amountGross, currencyCode }`. No channel
+  branch anywhere in this logic (D-R5-29) — `pay_link`/`api`/`agent` carts hit the exact same
+  code path as `storefront`.
+- i18n: added REAL `cart.errors.cart_requires_approval`/
+  `cart.errors.approval_requires_identified_buyer` keys to all 5 locales (per this Step's own
+  explicit instruction) — English text duplicated into the non-English files, matching the
+  existing `cart.errors.store_context_unavailable` precedent (no `cart.errors.*` key is
+  actually localized today). The command's thrown message itself stays `[internal]`-prefixed
+  (no public route calls `cart.lock` yet), same convention `cart_has_unavailable_lines`/
+  `invalid_lock_ttl_ms` already follow.
+- Did NOT build `/current/request-approval` (Step 3.2's scope) or the §7a proposal seam
+  (Steps 3.3/3.4) — this Step is the gate mechanism only, exactly as scoped.
+- Did NOT implement `min_order_value` anywhere in `cart` — confirmed via grep it does not
+  exist in this module today, and §9a.6 is explicit that it is checkout's own concern (Step
+  5.1), not the cart's.
+- Tests (TC-CART-APR-01..09, one extra for the documented `customer_groups`-absent degrade):
+  `cart/lib/__tests__/approvalGate.test.ts` (new, 11 cases) — pure-function coverage for
+  `computeGoodsGrossAmount`/`computeRequiresApproval`/the soft-DI helpers.
+  `cart/lib/__tests__/reprice.test.ts` — 2 new cases: `requiresApproval` recomputed on every
+  call (above AND below a threshold, in the SAME test, proving it is not cached), and the
+  absent-service degrade. `cart/commands/__tests__/lock.test.ts` — 14 new cases under a new
+  `describe('cart.lock — approval gate ...')`: refusal without a qualifying approval,
+  success with one, refusal when the total rose above the approved amount (D-R5-3), BOTH
+  currency-mismatch sub-cases (no usable currency at all → fail-closed; a resolved
+  `termsCurrencyCode` matching the cart → passes), guest refusal with the distinct error
+  code, `purpose: 'quote'` skipping the gate for a guest-over-threshold cart, the same
+  refusal across `pay_link`/`api`/`agent` channels (`it.each`), and the `customer_groups`-
+  absent degrade. All pre-existing tests in `reprice.test.ts`/`lock.test.ts` (36 + 13 before
+  this Step) pass UNMODIFIED — the new DI tokens are optional and default to the same
+  `Unexpected DI token` throw every other unlisted token already got, caught internally.
+- Checks: `yarn workspace @open-mercato/core typecheck` — one pre-existing, unrelated error
+  in `ecommerce/api/stores/crud.ts` (confirmed present on a clean `git stash` of this Step's
+  changes too; from Step 2.13's `shipping` settings addition, not touched here). Full
+  `src/modules/cart` suite: 24/24 suites, 312/312 tests, zero regressions. Full
+  `src/modules/customer_groups` suite: 44/46 suites (2 pre-existing pg-gated skips),
+  472/472 tests, zero regressions. Full `src/modules/currencies` suite: 27/27, 203/203,
+  zero regressions (unaffected — `baseCurrencyService` itself was not touched, only
+  consumed).

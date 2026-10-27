@@ -267,6 +267,13 @@ function makeCtx(opts: {
   salesCalculationService?: unknown
   promotionsService?: unknown
   catalogScopedProductService?: unknown
+  // Step 3.1 (K1-K5) — undefined by default, matching every DI token this fake container
+  // did not already know before this Step: `cart.reprice`'s totals phase defensively
+  // `tryResolve`s `customerGroupsService` (`lib/approvalGate.ts`), so the EXISTING tests
+  // above (none of which pass this) keep getting the `Unexpected DI token` throw, caught
+  // internally, degrading to `requiresApproval: false` exactly as before this Step.
+  customerGroupsService?: unknown
+  customerPurchaseApprovalService?: unknown
 }): CommandRuntimeContext {
   const dataEngine = opts.dataEngine ?? makeDataEngine()
   const salesCalculationService = opts.salesCalculationService ?? makeSalesCalculationService()
@@ -282,6 +289,14 @@ function makeCtx(opts: {
         if (token === 'salesCalculationService') return salesCalculationService
         if (token === 'promotionsService') return opts.promotionsService ?? { evaluate: jest.fn(async () => ({ appliedPromotions: [] })) }
         if (token === 'catalogScopedProductService') return opts.catalogScopedProductService ?? makeDefaultCatalogScopedProductService()
+        if (token === 'customerGroupsService') {
+          if (opts.customerGroupsService !== undefined) return opts.customerGroupsService
+          throw new Error(`Unexpected DI token: ${token}`)
+        }
+        if (token === 'customerPurchaseApprovalService') {
+          if (opts.customerPurchaseApprovalService !== undefined) return opts.customerPurchaseApprovalService
+          throw new Error(`Unexpected DI token: ${token}`)
+        }
         throw new Error(`Unexpected DI token: ${token}`)
       },
       register: jest.fn(),
@@ -554,6 +569,250 @@ describe('cart.lock', () => {
       expect((captured as { status: number }).status).toBe(400)
       expect((captured as { body?: Record<string, unknown> }).body).toMatchObject({ code: 'invalid_lock_ttl_ms' })
     })
+  })
+})
+
+// Step 3.1 (K1-K5, D-R5-4/12/23/29/37) — the approval gate inside `cart.lock`. Every test
+// here stubs `customerGroupsService`/`customerPurchaseApprovalService` directly (the fake
+// DI container throws `Unexpected DI token` for either when a test omits them, matching
+// the pre-Step-3.1 tests above) rather than exercising the real `resolveTerms`/base-
+// currency chain, which `customer_groups/__tests__/resolveTerms.test.ts` already covers on
+// its own. `makeSalesCalculationService()`'s default `calculateDocumentTotals` returns
+// `grandTotalGrossAmount: 24` — every threshold below is chosen relative to that fixed
+// goods-gross figure.
+describe('cart.lock — approval gate (K1-K5, D-R5-4/12/23/29/37)', () => {
+  function makeCustomerGroupsServiceStub(overrides: {
+    approvalRequiredAbove?: number | null
+    termsCurrencyCode?: string | null
+  } = {}) {
+    return {
+      resolveGroups: jest.fn(async () => ({ groupIds: [], groups: [] })),
+      resolveTerms: jest.fn(async () => ({
+        priceKindId: null,
+        paymentTermsDays: null,
+        allowPurchaseOnAccount: false,
+        approvalRequiredAbove: overrides.approvalRequiredAbove === undefined ? 100 : overrides.approvalRequiredAbove,
+        minOrderValue: null,
+        approvalPolicy: 'buyer',
+        // `??` would treat an EXPLICIT `null` (the fail-closed test case below) the same
+        // as "not provided" — only default when the caller omitted the key entirely.
+        termsCurrencyCode: overrides.termsCurrencyCode === undefined ? 'USD' : overrides.termsCurrencyCode,
+        sources: {
+          priceKindId: null,
+          paymentTermsDays: null,
+          allowPurchaseOnAccount: null,
+          approvalRequiredAbove: null,
+          minOrderValue: null,
+          approvalPolicy: null,
+          termsCurrencyCode: null,
+        },
+      })),
+      resolveAssortmentScope: jest.fn(async () => ({ scope: {}, sourceGroupIds: [], sourceCustomerOverrideId: null })),
+    }
+  }
+
+  function makeApprovalServiceStub(approval: FakeRow | null) {
+    return {
+      requestApproval: jest.fn(),
+      getApproval: jest.fn(async () => approval),
+      getActiveApprovalForSubject: jest.fn(),
+      withdrawApproval: jest.fn(),
+      decideApproval: jest.fn(),
+    }
+  }
+
+  // TC-CART-APR-02
+  it('refuses with 409 cart_requires_approval when the gate is above threshold and no approval exists', async () => {
+    seededCarts = [makeCartFixture({ customerUserId: 'buyer-1', customerIds: ['buyer-1'], approvalId: null })]
+    const handler = getHandler<CartLockInput, CartLockResult>('cart.lock')
+    const em = makeEm()
+    const customerGroupsService = makeCustomerGroupsServiceStub({ approvalRequiredAbove: 10 })
+    const ctx = makeCtx({ em, customerGroupsService })
+
+    let captured: unknown
+    try {
+      await handler.execute({ cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, checkoutSessionId: 'checkout-session-1' }, ctx)
+    } catch (err) {
+      captured = err
+    }
+
+    expect(isCrudHttpError(captured)).toBe(true)
+    expect((captured as { status: number }).status).toBe(409)
+    expect((captured as { body?: Record<string, unknown> }).body).toMatchObject({ code: 'cart_requires_approval', approval: null })
+    expect(seededCarts.find((row) => row.id === CART_ID)!.status).toBe('active')
+  })
+
+  // TC-CART-APR-03
+  it('allows the lock when a qualifying approval covers the current goods gross', async () => {
+    seededCarts = [makeCartFixture({ customerUserId: 'buyer-1', customerIds: ['buyer-1'], approvalId: 'approval-1' })]
+    const handler = getHandler<CartLockInput, CartLockResult>('cart.lock')
+    const em = makeEm()
+    const customerGroupsService = makeCustomerGroupsServiceStub({ approvalRequiredAbove: 10 })
+    const customerPurchaseApprovalService = makeApprovalServiceStub({
+      id: 'approval-1',
+      status: 'approved',
+      currencyCode: 'USD',
+      amountGross: '24',
+    })
+    const ctx = makeCtx({ em, customerGroupsService, customerPurchaseApprovalService })
+
+    const result = await handler.execute(
+      { cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, checkoutSessionId: 'checkout-session-1' },
+      ctx,
+    )
+
+    expect(result.cart.status).toBe('locked')
+    expect(customerPurchaseApprovalService.getApproval).toHaveBeenCalledWith({
+      scope: { tenantId: TENANT_ID, organizationId: ORG_ID },
+      approvalId: 'approval-1',
+    })
+  })
+
+  // TC-CART-APR-04 (K1/D-R5-3 "only a higher total invalidates")
+  it('refuses the lock when the goods gross has risen above the approved amount, even with an existing approval', async () => {
+    seededCarts = [makeCartFixture({ customerUserId: 'buyer-1', customerIds: ['buyer-1'], approvalId: 'approval-1' })]
+    const handler = getHandler<CartLockInput, CartLockResult>('cart.lock')
+    const em = makeEm()
+    const customerGroupsService = makeCustomerGroupsServiceStub({ approvalRequiredAbove: 10 })
+    const customerPurchaseApprovalService = makeApprovalServiceStub({
+      id: 'approval-1',
+      status: 'approved',
+      currencyCode: 'USD',
+      amountGross: '20',
+    })
+    const ctx = makeCtx({ em, customerGroupsService, customerPurchaseApprovalService })
+
+    let captured: unknown
+    try {
+      await handler.execute({ cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, checkoutSessionId: 'checkout-session-1' }, ctx)
+    } catch (err) {
+      captured = err
+    }
+
+    expect(isCrudHttpError(captured)).toBe(true)
+    expect((captured as { status: number }).status).toBe(409)
+    expect((captured as { body?: Record<string, unknown> }).body).toMatchObject({
+      code: 'cart_requires_approval',
+      approval: { id: 'approval-1', status: 'approved', currencyCode: 'USD', amountGross: '20' },
+    })
+  })
+
+  // TC-CART-APR-05a (D-R5-4/D-R5-37 fail-closed: no usable currency at all)
+  it('is fail-closed when termsCurrencyCode cannot be resolved, even for a goods gross below the threshold', async () => {
+    seededCarts = [makeCartFixture({ customerUserId: 'buyer-1', customerIds: ['buyer-1'], approvalId: null })]
+    const handler = getHandler<CartLockInput, CartLockResult>('cart.lock')
+    const em = makeEm()
+    // Goods gross (24) is well below the threshold (1000) — a currency-matched read would
+    // never require approval. `termsCurrencyCode: null` (no group set one AND the
+    // organization has no base currency, D-R5-37) means the comparison cannot be made, so
+    // §9a.2's "currency mismatch" branch forces `requiresApproval = true` regardless.
+    const customerGroupsService = makeCustomerGroupsServiceStub({ approvalRequiredAbove: 1000, termsCurrencyCode: null })
+    const ctx = makeCtx({ em, customerGroupsService })
+
+    let captured: unknown
+    try {
+      await handler.execute({ cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, checkoutSessionId: 'checkout-session-1' }, ctx)
+    } catch (err) {
+      captured = err
+    }
+
+    expect(isCrudHttpError(captured)).toBe(true)
+    expect((captured as { status: number }).status).toBe(409)
+    expect((captured as { body?: Record<string, unknown> }).body).toMatchObject({ code: 'cart_requires_approval' })
+  })
+
+  // TC-CART-APR-05b (D-R5-37 success path: the base-currency fallback resolved and matches)
+  it('passes when termsCurrencyCode resolves (via the base-currency fallback) to the same currency as the cart', async () => {
+    seededCarts = [makeCartFixture({ customerUserId: 'buyer-1', customerIds: ['buyer-1'], approvalId: null })]
+    const handler = getHandler<CartLockInput, CartLockResult>('cart.lock')
+    const em = makeEm()
+    const customerGroupsService = makeCustomerGroupsServiceStub({ approvalRequiredAbove: 1000, termsCurrencyCode: 'USD' })
+    const ctx = makeCtx({ em, customerGroupsService })
+
+    const result = await handler.execute(
+      { cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, checkoutSessionId: 'checkout-session-1' },
+      ctx,
+    )
+
+    expect(result.cart.status).toBe('locked')
+  })
+
+  // TC-CART-APR-06 (D-R5-12 guest fail-closed, distinct refusal from cart_requires_approval)
+  it('refuses a guest cart over the threshold with 409 approval_requires_identified_buyer, not cart_requires_approval', async () => {
+    seededCarts = [makeCartFixture({ customerUserId: null, approvalId: null })]
+    const handler = getHandler<CartLockInput, CartLockResult>('cart.lock')
+    const em = makeEm()
+    const customerGroupsService = makeCustomerGroupsServiceStub({ approvalRequiredAbove: 10 })
+    const ctx = makeCtx({ em, customerGroupsService })
+
+    let captured: unknown
+    try {
+      await handler.execute({ cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, checkoutSessionId: 'checkout-session-1' }, ctx)
+    } catch (err) {
+      captured = err
+    }
+
+    expect(isCrudHttpError(captured)).toBe(true)
+    expect((captured as { status: number }).status).toBe(409)
+    expect((captured as { body?: Record<string, unknown> }).body).toMatchObject({ code: 'approval_requires_identified_buyer' })
+  })
+
+  // TC-CART-APR-07 (D-R5-23: purpose: 'quote' skips the gate entirely)
+  it('a purpose: "quote" lock skips the gate even for a guest cart over the threshold', async () => {
+    seededCarts = [makeCartFixture({ customerUserId: null, approvalId: null })]
+    const handler = getHandler<CartLockInput, CartLockResult>('cart.lock')
+    const em = makeEm()
+    const customerGroupsService = makeCustomerGroupsServiceStub({ approvalRequiredAbove: 10 })
+    const ctx = makeCtx({ em, customerGroupsService })
+
+    const result = await handler.execute(
+      { cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, checkoutSessionId: 'checkout-session-1', purpose: 'quote' },
+      ctx,
+    )
+
+    expect(result.cart.status).toBe('locked')
+  })
+
+  // TC-CART-APR-08 (D-R5-29: no channel exemption)
+  it.each(['pay_link', 'api', 'agent'] as const)(
+    'applies the SAME gate to a %s-channel cart as to a storefront cart (no channel exemption)',
+    async (channel) => {
+      seededCarts = [makeCartFixture({ channel, customerUserId: 'buyer-1', customerIds: ['buyer-1'], approvalId: null })]
+      const handler = getHandler<CartLockInput, CartLockResult>('cart.lock')
+      const em = makeEm()
+      const customerGroupsService = makeCustomerGroupsServiceStub({ approvalRequiredAbove: 10 })
+      const ctx = makeCtx({ em, customerGroupsService })
+
+      let captured: unknown
+      try {
+        await handler.execute({ cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, checkoutSessionId: 'checkout-session-1' }, ctx)
+      } catch (err) {
+        captured = err
+      }
+
+      expect(isCrudHttpError(captured)).toBe(true)
+      expect((captured as { status: number }).status).toBe(409)
+      expect((captured as { body?: Record<string, unknown> }).body).toMatchObject({ code: 'cart_requires_approval' })
+    },
+  )
+
+  // TC-CART-APR-09 (documented degrade: `customer_groups` absent -> requiresApproval always
+  // false, never a thrown error and never a gate nobody can check)
+  it('locks successfully when customerGroupsService cannot be resolved at all (customer_groups absent)', async () => {
+    seededCarts = [makeCartFixture({ customerUserId: 'buyer-1', customerIds: ['buyer-1'], approvalId: null })]
+    const handler = getHandler<CartLockInput, CartLockResult>('cart.lock')
+    const em = makeEm()
+    // No `customerGroupsService` passed to `makeCtx` — the fake container throws
+    // `Unexpected DI token`, caught by `tryResolveCustomerGroupsService`.
+    const ctx = makeCtx({ em })
+
+    const result = await handler.execute(
+      { cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, checkoutSessionId: 'checkout-session-1' },
+      ctx,
+    )
+
+    expect(result.cart.status).toBe('locked')
+    expect(result.cart.requiresApproval).toBe(false)
   })
 })
 

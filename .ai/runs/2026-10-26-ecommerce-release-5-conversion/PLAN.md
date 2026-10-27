@@ -43,7 +43,7 @@
 | 2 | 2.11 | cart: abandonment payload (K9) + code-reservation release on expire/abandon (K11) | dispatch:standard | done | pending |
 | 2 | 2.12 | checkout: B.1 session entity + step machine + token hash + C14 minimum (rate limits, encryption, redaction) | dispatch:standard | done | pending |
 | 2 | 2.13 | checkout: B.3 delivery + payment step (rate quoting C13, delivery-promotions evaluation C8) | dispatch:standard | done | pending |
-| 3 | 3.1 | cart: approval gate K1–K5 (`requiresApproval`, lock refusal, `purpose: 'quote'` skip D-R5-23, guest fail-closed D-R5-12/29) | dispatch:standard | todo | — |
+| 3 | 3.1 | cart: approval gate K1–K5 (`requiresApproval`, lock refusal, `purpose: 'quote'` skip D-R5-23, guest fail-closed D-R5-12/29) | dispatch:standard | done | pending |
 | 3 | 3.2 | cart: `/current/request-approval` route + lifecycle withdrawal wiring (K3/K4/K7, `awaiting_approval_since` K5) | dispatch:standard | todo | — |
 | 3 | 3.3 | cart: §7a proposal seam commands (create/withdraw/supersede/re-author, D-R5-14) | dispatch:standard | todo | — |
 | 3 | 3.4 | cart: §7a proposal routes + sweeper branches (K13–K16/S13–S15) + undo-merge refusal (D-R5-25) | dispatch:standard | todo | — |
@@ -723,6 +723,59 @@ commit `c92470d8d5`).
   selection + PO capture) is NOT built in this Step — the task brief's own route list names only
   `delivery-options`, `delivery`, and `payment-methods`; §5.5's write side stays with whichever
   Step actually needs it (B.5-adjacent). Full reasoning: NOTIFY.md's Step 2.13 entry.
+
+- Step 3.1 (K1/K2, D-R5-4/D-R5-37): the `resolveTerms` gap NOTIFY.md flagged after Step 2.5
+  (`termsCurrencyCode` never resolved) was still open — fixed it here the same way Step 2.5
+  added `approvalPolicy`: `TERMS_FIELD_NAMES`/`ResolvedTerms`/`tenantDefaultTerms`/
+  `termsFieldIsSet`/`applyTermsField`, PLUS one field-specific extra step
+  (`applyTermsCurrencyFallback`) for D-R5-37's base-currency fallback, since this field (unlike
+  every sibling scalar term) can resolve from a THIRD place outside the group chain. Found an
+  existing, unused-until-now `currencies.BaseCurrencyService` (`resolveBaseCurrency({ tenantId,
+  organizationIds })`, DI key `baseCurrencyService`) rather than writing a second raw-SQL
+  lookup against the `currencies` table — reused it via the SAME `softCradle` shape
+  `customerPurchaseApprovalService` already uses for `moduleConfigService` (`currencies` stays
+  a soft peer, not added to `customer_groups`'s `requires`). `ResolveTermsInput.organizationId`
+  is a new, optional, additive field — every pre-existing caller (`customerCreditService`,
+  the `explain-terms` route, `ecommerce`'s `buyerContext.ts`) never passes it and keeps
+  `termsCurrencyCode` resolving to `null` in that case, unaffected. Did NOT add
+  `allowQuoteRequests`/`requiresPoNumber` — still no caller in this run; Step 5.1 (checkout
+  B.5) must add them the same way.
+- Step 3.1 (K2, §9a.2 "recomputes it... at cart.lock"): did NOT add a second `resolveTerms`
+  call inside `commands/lock.ts` itself. `cart.lock` already unconditionally dispatches
+  `cart.reprice` (`trigger: 'lock'`) before it ever checks the gate, and `cart.reprice`'s own
+  totals phase (`lib/reprice.ts#buildRecomputeCartTotalsPhase`) now recomputes
+  `cart.requiresApproval` from fresh terms on EVERY call — hooking the gate's "whenever totals
+  change" requirement into that one, already-universal totals phase (every line write, every
+  dispatch of `cart.reprice` itself, which covers merge/promotions/admin-reprice/lock) also
+  satisfies "recompute again at lock" for free, since lock's forced re-price is itself one of
+  those calls, strictly before the gate check reads `cart.requiresApproval` back off the
+  freshly re-read cart. Alternative considered: a second, lock-local `resolveTerms` call
+  immediately before the gate check, matching the spec's two-sentence phrasing more literally
+  — rejected as a redundant second DB round-trip and a second place the §9a.2 formula would
+  need to stay in sync, for a case the forced re-price already covers by construction.
+- Step 3.1 (test item 9, `customer_groups` absent): decided and tested explicitly — when
+  `customerGroupsService` cannot be resolved via DI (the soft `tryResolveCustomerGroupsService`
+  in the new `cart/lib/approvalGate.ts` catches the throw), `requiresApproval` always computes
+  `false`, never an error and never a gate nobody could check. Same documented-degrade
+  precedent Step 2.10 already set for `tryResolveCustomerPurchaseApprovalService` despite
+  `customer_groups` being a hard `requires` of `cart` — this is purely defensive, unreachable
+  in a real deployment, and costs nothing to keep consistent with that precedent.
+- Step 3.1 (brief's own `min_order_value` scope question): confirmed `min_order_value` is NOT
+  implemented anywhere in `cart` today (grep for `minOrderValue`/`min_order_value` under
+  `cart/` turns up nothing) and did not add it here. Per the revised spec's own §9a.6
+  ("`min_order_value` is checked by checkout, never by the cart — cart exposes only
+  `purpose`"), this is deliberately checkout's concern (Step 5.1, B.5), not a gap this Step
+  should close.
+- Step 3.1 (i18n): added real `cart.errors.cart_requires_approval`/
+  `cart.errors.approval_requires_identified_buyer` keys to all 5 locales (English text
+  duplicated across non-English locales, matching the existing
+  `cart.errors.store_context_unavailable` precedent — no other `cart.errors.*` key is
+  actually localized today either). The command's own thrown `CrudHttpError` message stays
+  `[internal]`-prefixed either way (no public route calls `cart.lock` yet in this worktree,
+  same reasoning Step 2.8 gave for `invalid_lock_ttl_ms`) — the locale keys exist ahead of
+  their first real consumer (checkout, Phase 4/5) per this Step's own explicit instruction,
+  the same precedent Step 2.5/2.7 set for pre-declaring `customer_groups.approval.*`
+  notification i18n ahead of a UI that reads it.
 
 ## External References
 
