@@ -2095,3 +2095,13 @@ commit, credit link, codes/usage, gateway, lineMap, recovery — plus the public
   documented) — built the snapshot fragment programmatically (not by hand-typing JSON) and
   diffed its shape against the existing `cart`/`assisted_selling` snapshot entries, including
   the exact partial-unique-index `expression` shape `cart_lines_unique_line_key` already uses.
+
+## 2026-10-28T03:00:00Z — dispatcher: appended Step 4.4-fix for a real, in-scope gap
+- Step 4.4's executor flagged two real gaps: (1) nothing updates `assisted_selling`'s own
+  thread/proposal rows when a buyer accepts/rejects a proposal, or when it expires — only `cart`
+  reflects these transitions; the rep console (Step 5.3) would show stale thread state without
+  this. (2) Step 3.3's provisional `cart`-side re-author subscriber (built before this module
+  existed, explicitly flagged by its own author for migration) still lives in `cart` instead of
+  `assisted_selling`, where it belongs now that the module's thread/participant bookkeeping
+  exists to support it properly. Both are additive, same-module-pair fixes with clear spec basis
+  (§6.4/§6.6, §8.1) — appended Step 4.4-fix rather than stopping the run.

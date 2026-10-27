@@ -54,6 +54,7 @@
 | 4 | 4.2-fix | checkout: `expire-awaiting-payment` job (C1/§12 gap-fill — async gateway sessions never complete without it) | dispatch:standard | done | pending |
 | 4 | 4.3 | assisted_selling: module scaffold, store settings, `mode: rep\|off` validator, module registration (D-R5-36) | dispatch:standard | done | pending |
 | 4 | 4.4 | assisted_selling: threads/participants/messages + staff author routes wrapping `cart.proposal.create` | dispatch:standard | done | pending |
+| 4 | 4.4-fix | assisted_selling: terminal-state subscriber (buyer accept/reject/expiry → thread/proposal rows) + migrate Step 3.3's provisional re-author subscriber in from `cart` | dispatch:standard | todo | — |
 | 4 | 4.5 | assisted_selling: buyer thread routes (Phase 2.1) + `/thread/events` (Phase 2.2) + retention/erasure (Phase 2.5) | dispatch:standard | todo | — |
 | 5 | 5.1 | checkout: B.5 B2B — PO term, `min_order_value`, on-account eligibility, `request_quote` method (D-R5-20), quote branch (C15–C17) | dispatch:standard | todo | — |
 | 5 | 5.2 | checkout: approval-resume subscriber (C11) + session-route identity binding (D-R5-33) | dispatch:standard | todo | — |
