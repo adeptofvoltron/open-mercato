@@ -1907,3 +1907,15 @@ commit, credit link, codes/usage, gateway, lineMap, recovery — plus the public
   `expire-awaiting-payment` (§12's own separate job — the async-webhook-completion gap),
   quote-outcome `lineMap` (D-R5-26, Step 5.1), B.5's `request_quote` payment method itself
   (Step 5.1), `checkout.sessions.view`/`.manage` admin viewer UI (B.6).
+
+## 2026-10-28T01:30:00Z — dispatcher: appended Step 4.2-fix for a real, in-scope gap
+- Step 4.2's executor flagged that no mechanism in this run completes a session that reaches
+  `awaiting_payment` via an asynchronous gateway (webhook/polling) — the submit command extends
+  the cart lock to the "intent TTL" entering that state (C1) but nothing ever follows up if the
+  gateway never calls back or times out. Finding C1 EXPLICITLY names the owner: "checkout extends
+  the lock on entering `awaiting_payment` to the intent TTL, and `expire-awaiting-payment` (§12)
+  compensates before the lock can lapse." This is NOT the B.6-deferred "stalled-instance monitor"
+  (a workflow concept) — it's C1's own stated mechanism, in scope. Appended Step 4.2-fix to close
+  it before moving on to assisted_selling (Steps 4.3-4.5 don't depend on it, so no reordering
+  needed beyond inserting the row) — a same-module, additive, spec-named fix, not a scope change
+  requiring the owner.

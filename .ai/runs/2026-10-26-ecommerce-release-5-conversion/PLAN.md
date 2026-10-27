@@ -51,6 +51,7 @@
 | 3 | 3.5 | checkout: B.2 cart-backed links — trusted pay-link seeding (D-R5-19) + store/channel/currency check (C9) | dispatch:standard | done | pending |
 | 4 | 4.1 | checkout: B.4 submit sequence part 1 — preconditions, lock, `availability.reserve`, `reserveCredit`, idempotent document creation (C3/C7) | dispatch:standard | done | pending |
 | 4 | 4.2 | checkout: B.4 submit sequence part 2 — commit, credit link, codes/usage, gateway, `lineMap`, recovery table (C5/C6/C18/C24) | dispatch:standard | done | pending |
+| 4 | 4.2-fix | checkout: `expire-awaiting-payment` job (C1/§12 gap-fill — async gateway sessions never complete without it) | dispatch:standard | todo | — |
 | 4 | 4.3 | assisted_selling: module scaffold, store settings, `mode: rep\|off` validator, module registration (D-R5-36) | dispatch:standard | todo | — |
 | 4 | 4.4 | assisted_selling: threads/participants/messages + staff author routes wrapping `cart.proposal.create` | dispatch:standard | todo | — |
 | 4 | 4.5 | assisted_selling: buyer thread routes (Phase 2.1) + `/thread/events` (Phase 2.2) + retention/erasure (Phase 2.5) | dispatch:standard | todo | — |
