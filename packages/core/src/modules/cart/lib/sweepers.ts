@@ -78,7 +78,9 @@ const MAX_PAGES_PER_TICK = 1000
 export type CartSweepScope = { tenantId: string }
 export type CartSweepResult = { transitioned: number }
 
-type CartLifecycleEventId = 'cart.cart.abandoned' | 'cart.cart.expired' | 'cart.cart.purged'
+// Step 3.4 (K15/S15) adds `'cart.proposal.expired'` — additive member, every existing
+// caller of `emitCartLifecycleEvent` below is unaffected.
+type CartLifecycleEventId = 'cart.cart.abandoned' | 'cart.cart.expired' | 'cart.cart.purged' | 'cart.proposal.expired'
 
 // Best-effort, same reasoning as every other background sweep in this codebase (e.g.
 // warranty_claims' `logClaimSweepError`): the DB transition already committed by the time this
@@ -307,6 +309,80 @@ export async function sweepExpiredCarts(
 }
 
 /**
+ * §12 `expire-carts`'s PROPOSAL branch (rev 10 — K15/S15, §7a.3): `kind = 'proposal' AND
+ * status = 'active' AND expiresAt < now()` → `status = 'expired'`, `resolvedAt = now()`,
+ * `cart.proposal.expired` with tenant scope. Runs on the SAME hourly tick as
+ * `sweepExpiredCarts` above (§7a.3's own text: "The existing `expire-carts` sweeper retires
+ * it" — no separate schedule, see `workers/expire.worker.ts`'s call site), but is its own
+ * function and its own `WHERE` rather than a branch inside `sweepExpiredCarts`: a proposal's
+ * status vocabulary (`active -> expired` only; never `abandoned`/`locked` as a FROM state,
+ * §7a.1) and candidate filter (`kind: 'proposal'`, no `$in` status list) are different
+ * enough from the basket branch that folding them into one function's `WHERE` would need a
+ * conditional per clause for no shared logic beyond the page-and-nativeUpdate shape.
+ *
+ * (§7a.1) A proposal is NEVER abandoned by inactivity — `sweepAbandonedCarts`'s own
+ * `kind: 'basket'` filter already excludes every `kind = 'proposal'` row unconditionally,
+ * so that sweep needs no change here; this function is the proposal's ONLY path out of
+ * `active`. (§7a.3) "Not deleted by expiry" — this function only flips `status`/
+ * `resolvedAt`, exactly like the basket branch; `purge-expired-carts` is the only sweep
+ * that ever deletes a row.
+ *
+ * Releases code reservations by `cartId` for parity with the basket branch (K11) — a
+ * proposal holds no codes in Release 5 (S14), so this finds nothing today, but the rule
+ * stays correct if that changes later.
+ */
+export async function sweepExpiredProposals(
+  em: EntityManager,
+  scope: CartSweepScope,
+  codeService: CartCodeServiceLike,
+  now: Date = new Date(),
+): Promise<CartSweepResult> {
+  let transitioned = 0
+
+  for (let page = 0; page < MAX_PAGES_PER_TICK; page += 1) {
+    const candidates = await findWithDecryption(
+      em,
+      Cart,
+      { tenantId: scope.tenantId, kind: 'proposal' as const, status: 'active' as const, expiresAt: { $lt: now } },
+      { limit: SWEEP_PAGE_SIZE, orderBy: { id: 'ASC' } },
+      { tenantId: scope.tenantId },
+    )
+    if (!candidates.length) break
+
+    const ids = candidates.map((cart) => cart.id)
+    const affected = await em.nativeUpdate(
+      Cart,
+      { id: { $in: ids }, tenantId: scope.tenantId, kind: 'proposal', status: 'active' },
+      { status: 'expired', resolvedAt: now, updatedAt: now },
+    )
+    if (affected === 0) break
+
+    // Same race-safe re-select-on-this-call's-own-marker discipline as every other sweep
+    // in this file — see `sweepAbandonedCarts`'s own comment for the full reasoning.
+    const transitionedCarts = await findWithDecryption(
+      em,
+      Cart,
+      { id: { $in: ids }, tenantId: scope.tenantId, kind: 'proposal', status: 'expired', resolvedAt: now },
+      {},
+      { tenantId: scope.tenantId },
+    )
+    for (const cart of transitionedCarts) {
+      await emitCartLifecycleEvent(
+        'cart.proposal.expired',
+        { proposalCartId: cart.id, targetCartId: cart.proposedToCartId ?? null },
+        { tenantId: cart.tenantId, organizationId: cart.organizationId },
+        'cart:expire-proposals',
+      )
+      await releaseCartCodeReservations(em, codeService, cart, 'cart:expire-proposals')
+    }
+    transitioned += affected
+    if (candidates.length < SWEEP_PAGE_SIZE) break
+  }
+
+  return { transitioned }
+}
+
+/**
  * §12 `release-stale-locks` (every 5 min): `status = 'locked' AND lockExpiresAt < now()` →
  * `status = 'active'`, clearing `lockedAt`/`lockExpiresAt`/`checkoutSessionId` — §9's
  * `locked → active` row: "a lock timeout ... clearing locked_at/lock_expires_at". No `kind`
@@ -369,24 +445,39 @@ function purgePageWhere(base: FilterQuery<Cart>, cursor: PurgeCursor): FilterQue
 }
 
 /**
- * §12 `purge-expired-carts` (daily): `kind = 'basket' AND resolvedAt IS NOT NULL AND
- * resolvedAt < now() - 90 days`, excluding any cart `CartMergeLog` still names as its
- * `sourceCartId`/`targetCartId`/`proposalCartId` → hard-delete the `Cart` row.
- * `CartLine`/`CartPromotionApplication`/`CartIdempotencyKey` cascade automatically
+ * §12 `purge-expired-carts` (daily): `resolvedAt IS NOT NULL AND resolvedAt < now() - 90
+ * days`, excluding any cart `CartMergeLog` still names as its `sourceCartId`/
+ * `targetCartId`/`proposalCartId` → hard-delete the `Cart` row. `CartLine`/
+ * `CartPromotionApplication`/`CartIdempotencyKey` cascade automatically
  * (`deleteRule: 'cascade'` on `cart_id`); `CartMergeLog`'s own cart FKs are
  * `deleteRule: 'restrict'`, which is exactly why a still-referenced cart is filtered out up
  * front rather than left to a failing `DELETE`.
+ *
+ * (rev 10 — K15/S15, §16 Q6) `base` carries NO `kind` filter — it covers `kind = 'proposal'`
+ * exactly the same way it already covers `kind = 'basket'`: §12's own text, "Covers
+ * `kind = 'proposal'` as well... rejected and expired proposals purge 90 days after
+ * `resolved_at`; accepted proposals stay while `CartMergeLog.proposal_cart_id` references
+ * them." The exclusion logic right below ALREADY checks `ref.proposalCartId` (it has since
+ * Step 2.11/K11, written ahead of this Step on purpose — see that Step's own NOTIFY.md
+ * entry) — an accepted proposal's `CartMergeLog` row names it via `proposalCartId`, so it
+ * is excluded by the SAME `excludedIds` set a still-referenced basket already was, with no
+ * new exclusion logic needed. A rejected proposal (`status: 'abandoned'`, `resolvedAt` set
+ * by `cart.proposal.reject`) or an expired one (`status: 'expired'`, set by
+ * `sweepExpiredProposals` above) has no `CartMergeLog` row naming it at all, so it purges
+ * on the same 90-day clock a basket would.
  *
  * A two-step fetch-then-filter against `CartMergeLog` rather than a single `NOT EXISTS` query —
  * `CartMergeLog` won't even have rows until Phase 7/merge ships, so this is not worth fighting
  * the ORM's query builder for.
  *
- * (Step 2.11/K11 scope check) This sweep's own WHERE (`kind: 'basket'`, `resolvedAt` past the
- * retention cutoff) carries no `status` filter, so it also reaches `converted`/`merged` rows —
+ * (Step 2.11/K11 scope check) This sweep's own WHERE (`resolvedAt` past the retention
+ * cutoff) carries no `status` filter, so it also reaches `converted`/`merged` rows —
  * neither of which passes through `sweepAbandonedCarts`/`sweepExpiredCarts` first (`cart.
  * markConverted`/`cart.merge` set `resolvedAt` directly). K11 names only `expire`/`mark-
  * abandoned`; this sweep deliberately does NOT call `releaseCartCodeReservations` — see
- * NOTIFY.md for why that is a real, scoped-out gap rather than a verified no-op.
+ * NOTIFY.md for why that is a real, scoped-out gap rather than a verified no-op. A proposal
+ * carries no codes in Release 5 either way (S14), so this gap is moot for the rows this
+ * Step adds to this sweep's reach.
  *
  * (rev 10 — K3, §9/§12) Unlike the code-reservation gap just above, the pending-approval
  * withdrawal below is NOT skipped for this sweep — §12's own text names it explicitly
@@ -395,7 +486,9 @@ function purgePageWhere(base: FilterQuery<Cart>, cursor: PurgeCursor): FilterQue
  * `cart.markConverted`/`cart.merge` resolved directly, bypassing `expire-carts`) gets the
  * same cleanup. Called BEFORE the row is hard-deleted — the `CustomerPurchaseApproval` row
  * lives in `customer_groups`, independent of this cart row, so there is no ordering hazard
- * either way, but withdrawing first keeps the two steps in the order §12's text reads.
+ * either way, but withdrawing first keeps the two steps in the order §12's text reads. A
+ * proposal never has an `approvalId` (§7a's approval gate is a basket-only concept), so this
+ * call is always a no-op for a purged proposal row — harmless, not a new branch.
  */
 export async function purgeExpiredCarts(
   em: EntityManager,
@@ -406,7 +499,6 @@ export async function purgeExpiredCarts(
   const cutoff = new Date(now.getTime() - PURGE_RETENTION_DAYS * DAY_MS)
   const base: FilterQuery<Cart> = {
     tenantId: scope.tenantId,
-    kind: 'basket' as const,
     resolvedAt: { $ne: null, $lt: cutoff },
   }
 

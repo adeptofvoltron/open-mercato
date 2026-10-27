@@ -1,5 +1,5 @@
 import { registerCommand } from '@open-mercato/shared/lib/commands'
-import type { CommandHandler, CommandRuntimeContext } from '@open-mercato/shared/lib/commands'
+import type { CommandBus, CommandHandler, CommandRuntimeContext } from '@open-mercato/shared/lib/commands'
 import { emitCrudSideEffects } from '@open-mercato/shared/lib/commands/helpers'
 import { withAtomicFlush } from '@open-mercato/shared/lib/commands/flush'
 import { badRequest, CrudHttpError, forbidden, notFound } from '@open-mercato/shared/lib/crud/errors'
@@ -29,6 +29,11 @@ import { cartVisibilityKey, evaluateCartVisibility, isVisible } from '../lib/vis
 import type { CartVisibilityLineRef } from '../lib/visibility'
 import type { CartPromotionWarning } from '../lib/promotionContext'
 import { emitCartEvent } from '../events'
+import { isAcceptanceTokenFresh, signAcceptanceToken, verifyAcceptanceToken } from '../lib/acceptanceToken'
+import { buildProposalAcceptancePreview } from '../lib/proposalPreview'
+import type { ProposalAcceptancePreview } from '../lib/proposalPreview'
+import { mergeCartCommand } from './merge'
+import type { CartMergeInput, CartMergeResult } from './merge'
 import {
   applyPriceSnapshot,
   buildCartPricingRowFilterContext,
@@ -46,12 +51,18 @@ import {
 } from './lines'
 import type { CartLineSnapshot } from './lines'
 
-// Step 3.3 (rev 10 §7a — S5/S11/S13/S14/D-R5-14) — the proposal seam's two COMMANDS.
-// `cart.proposal.create` (§7a.2) and `cart.proposal.reject` (§7a.5) are the whole of this
-// file; the HTTP routes under `/api/cart/proposals/*` and the sweeper branches for
-// `kind = 'proposal'` are Step 3.4's own scope (K15/S15), not built here. Acceptance
-// (`cart.merge { strategy: 'manual' }`, §7a.4) is ALSO Step 3.4's scope — it needs the
-// buyer-facing preview/accept dance this Step does not build.
+// Step 3.3 (rev 10 §7a — S5/S11/S13/S14/D-R5-14) — the proposal seam's first two COMMANDS,
+// `cart.proposal.create` (§7a.2) and `cart.proposal.reject` (§7a.5).
+//
+// Step 3.4 adds the third, `cart.proposal.accept` (§7a.4), plus the HTTP routes under
+// `/api/cart/proposals/*` (`lib/currentCartRoute.ts#resolveIdentifiedBasketByToken`,
+// D-R5-13/D-R5-21) and the sweeper branches for `kind = 'proposal'` (`lib/sweepers.ts`,
+// K15/S15) — none of which live in this file. `cart.proposal.accept` is a thin wrapper per
+// §3.1a's own text ("`cart.proposal.accept` delegates to `cart.merge`; it is not a second
+// merge implementation") — the actual per-line acceptance mechanics (visibility re-check,
+// `CartMergeLog`, the mandatory whole-cart re-price) live in `commands/merge.ts`'s own
+// `proposalCartId`/`lines` input variant, reusing the SAME `buildMergeOutcome` helper the
+// ordinary guest-merge path already uses and tests.
 //
 // §7a.5's own text: "The author's side ends a proposal in-process: `assisted_selling`
 // withdraw, supersede and re-author call `cart.proposal.reject`... There is no separate
@@ -556,8 +567,10 @@ function tryResolveCodeService(container: { resolve: <T = unknown>(name: string)
 
 /** §4.1: the author is read off the proposal's own lines (`addedByActorType`/`_id`), never
  * a stored `Cart` column — same lookup `cart.proposal.created`'s payload needs at creation
- * time, re-derived here since `reject` does not have it on hand otherwise. */
-async function resolveProposalAuthor(
+ * time, re-derived here since `reject` does not have it on hand otherwise. Exported (Step
+ * 3.4) — `cart.proposal.accept`'s own `cart.proposal.accepted` event needs the identical
+ * lookup. */
+export async function resolveProposalAuthor(
   em: EntityManager,
   scope: ProposalScope,
   proposalCartId: string,
@@ -674,7 +687,156 @@ const rejectProposalCommand: CommandHandler<CartProposalRejectInput, CartProposa
   },
 }
 
+// ---------------------------------------------------------------------------
+// cart.proposal.accept (§7a.4) — Step 3.4
+// ---------------------------------------------------------------------------
+//
+// §3.1a: "`cart.proposal.accept` delegates to `cart.merge`; it is not a second merge
+// implementation." This command owns exactly the proposal-specific pieces §7a.4 names
+// (resolving target+proposal, verifying the `acceptanceToken`'s freshness against BOTH
+// carts' current `updatedAt`, re-minting a fresh preview+token on a mismatch) and hands the
+// actual line selection off to `cart.merge`'s own `proposalCartId`/`lines` input variant
+// (`commands/merge.ts`), which owns the merge mechanics (visibility re-check, outcome
+// building, `CartMergeLog`, the mandatory whole-cart re-price) exactly as it already does
+// for the ordinary guest-merge path.
+
+export type CartProposalAcceptLineSelection = { proposalLineId: string; accepted: boolean }
+
+export type CartProposalAcceptInput = {
+  proposalCartId: string
+  targetCartId: string
+  tenantId: string
+  organizationId: string
+  /** Minted by `preview` (§7a.4) — "the token binds the target cart's `updatedAt` AND the
+   * proposal cart's `updatedAt`. Either moving invalidates it." */
+  acceptanceToken: string
+  lines: CartProposalAcceptLineSelection[]
+  routeContext: ResolvedCartRouteContext
+}
+
+export type CartProposalAcceptResult = {
+  cart: CartMergeResult['cart']
+  token: CartMergeResult['token']
+  mergeSummary: CartMergeResult['mergeSummary']
+  priceChanges: CartMergeResult['priceChanges']
+  warnings?: CartMergeResult['warnings']
+  acceptedLineCount: number
+}
+
+async function buildFreshAcceptanceChallenge(
+  em: EntityManager,
+  container: { resolve: <T = unknown>(name: string) => T },
+  scope: ProposalScope,
+  target: Cart,
+  proposal: Cart,
+  assortmentScope: ResolvedCartRouteContext['assortmentScope'] | undefined,
+): Promise<{ acceptancePreview: ProposalAcceptancePreview; acceptanceToken: string }> {
+  const acceptancePreview = await buildProposalAcceptancePreview({ em, container, scope, target, proposal, assortmentScope })
+  const acceptanceToken = signAcceptanceToken({
+    proposalCartId: proposal.id,
+    targetCartId: target.id,
+    proposalUpdatedAt: proposal.updatedAt.toISOString(),
+    targetUpdatedAt: target.updatedAt.toISOString(),
+  })
+  return { acceptancePreview, acceptanceToken }
+}
+
+const acceptProposalCommand: CommandHandler<CartProposalAcceptInput, CartProposalAcceptResult> = {
+  id: 'cart.proposal.accept',
+  // Acceptance delegates to `cart.merge`, which already carries its own `isUndoable: true`
+  // / `cart.mergeUndo` entry — this wrapper command adds no undo semantics of its own, and
+  // §7a.7 (D-R5-25) refuses `cart.mergeUndo` for a proposal-sourced merge regardless of
+  // which command initiated it.
+  isUndoable: false,
+  async execute(input, ctx) {
+    const scope: ProposalScope = { tenantId: input.tenantId, organizationId: input.organizationId }
+    const em = (ctx.container.resolve('em') as EntityManager).fork()
+
+    const target = await findOneWithDecryption(
+      em,
+      Cart,
+      { id: input.targetCartId, tenantId: scope.tenantId, organizationId: scope.organizationId, kind: 'basket' as const },
+      {},
+      scope,
+    )
+    if (!target) throw notFound('[internal] cart not found')
+
+    // §7a.4: "the route answers 404 unless that proposal's `proposed_to_cart_id` is the
+    // presented token's basket — the same 404 a nonexistent id gets" (K10).
+    const proposal = await findOneWithDecryption(
+      em,
+      Cart,
+      { id: input.proposalCartId, tenantId: scope.tenantId, organizationId: scope.organizationId, kind: 'proposal' as const, proposedToCartId: target.id },
+      {},
+      scope,
+    )
+    if (!proposal) throw notFound('[internal] proposal cart not found')
+
+    const assortmentScope = shouldEnforceAssortmentScope(target.channel, input.routeContext.assortmentScope)
+      ? input.routeContext.assortmentScope
+      : undefined
+
+    const payload = verifyAcceptanceToken(input.acceptanceToken)
+    if (!payload || !isAcceptanceTokenFresh(payload, proposal, target)) {
+      const fresh = await buildFreshAcceptanceChallenge(em, ctx.container, scope, target, proposal, assortmentScope)
+      throw new CrudHttpError(409, { error: '[internal] proposal_changed', code: 'proposal_changed', ...fresh })
+    }
+
+    const author = await resolveProposalAuthor(em, scope, proposal.id)
+
+    const commandBus = ctx.container.resolve('commandBus') as CommandBus
+    const mergeInput = {
+      targetCartId: target.id,
+      tenantId: scope.tenantId,
+      organizationId: scope.organizationId,
+      proposalCartId: proposal.id,
+      lines: input.lines,
+      routeContext: input.routeContext,
+    } as CartMergeInput
+    const { result: mergeResult } = await commandBus.execute<CartMergeInput, CartMergeResult>(mergeCartCommand.id, {
+      input: mergeInput,
+      ctx,
+    })
+
+    const acceptedLineCount = input.lines.filter((entry) => entry.accepted).length
+
+    // §11: "`.accepted` additionally carries `mergeLogId` and `acceptedLineCount`."
+    await emitCartEvent('cart.proposal.accepted', {
+      proposalCartId: proposal.id,
+      targetCartId: target.id,
+      tenantId: scope.tenantId,
+      organizationId: scope.organizationId,
+      authoredByActorType: author.actorType,
+      authoredByActorId: author.actorId,
+      lineCount: author.lineCount,
+      mergeLogId: mergeResult.mergeSummary.mergeLogId,
+      acceptedLineCount,
+    })
+
+    return {
+      cart: mergeResult.cart,
+      token: mergeResult.token,
+      mergeSummary: mergeResult.mergeSummary,
+      priceChanges: mergeResult.priceChanges,
+      ...(mergeResult.warnings && mergeResult.warnings.length > 0 ? { warnings: mergeResult.warnings } : {}),
+      acceptedLineCount,
+    }
+  },
+  buildLog: async ({ result, input }) => {
+    const { translate } = await resolveTranslations()
+    return {
+      actionLabel: translate('cart.audit.proposal.accept', 'Accept proposal cart'),
+      resourceKind: 'cart.cart',
+      resourceId: result.cart.id,
+      tenantId: input.tenantId,
+      organizationId: input.organizationId,
+      payload: { mergeLogId: result.mergeSummary.mergeLogId, acceptedLineCount: result.acceptedLineCount },
+    }
+  },
+}
+
 registerCommand(createProposalCommand)
 registerCommand(rejectProposalCommand)
+registerCommand(acceptProposalCommand)
 
-export { createProposalCommand, rejectProposalCommand }
+export { createProposalCommand, rejectProposalCommand, acceptProposalCommand }

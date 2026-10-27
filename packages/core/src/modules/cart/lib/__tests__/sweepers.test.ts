@@ -21,6 +21,7 @@ import {
   releaseStaleCartLocks,
   sweepAbandonedCarts,
   sweepExpiredCarts,
+  sweepExpiredProposals,
   type CartCodeServiceLike,
 } from '../sweepers'
 
@@ -604,6 +605,102 @@ describe('sweepExpiredCarts', () => {
   })
 })
 
+// Step 3.4 (K15/S15, §7a.3) — the proposal expiry branch, run on the SAME hourly tick as
+// `sweepExpiredCarts` (see `workers/expire.worker.ts`'s call site) but its OWN function/WHERE.
+describe('sweepExpiredProposals', () => {
+  it('transitions a live proposal past its OWN expires_at to expired, sets resolvedAt, and emits cart.proposal.expired with scope', async () => {
+    const proposal = makeCart({
+      id: 'proposal-expiring-1',
+      kind: 'proposal',
+      proposedToCartId: 'target-1',
+      status: 'active',
+      expiresAt: new Date(NOW.getTime() - 1000),
+    })
+    const em = makeEm([proposal])
+
+    const result = await sweepExpiredProposals(em as never, { tenantId: TENANT }, makeCodeService(), NOW)
+
+    expect(result).toEqual({ transitioned: 1 })
+    expect(proposal.status).toBe('expired')
+    expect(proposal.resolvedAt).toEqual(NOW)
+    expect(emitMock).toHaveBeenCalledWith(
+      'cart.proposal.expired',
+      { proposalCartId: 'proposal-expiring-1', targetCartId: 'target-1' },
+      { persistent: true, tenantId: TENANT, organizationId: ORG },
+    )
+  })
+
+  it('leaves a live proposal before its own expires_at alone', async () => {
+    const proposal = makeCart({
+      id: 'proposal-not-yet-1',
+      kind: 'proposal',
+      proposedToCartId: 'target-1',
+      status: 'active',
+      expiresAt: new Date(NOW.getTime() + 1000),
+    })
+    const em = makeEm([proposal])
+
+    const result = await sweepExpiredProposals(em as never, { tenantId: TENANT }, makeCodeService(), NOW)
+
+    expect(result).toEqual({ transitioned: 0 })
+    expect(proposal.status).toBe('active')
+  })
+
+  it('never touches a basket-kind cart, even one past its own expires_at (kind filter)', async () => {
+    const basket = makeCart({ id: 'basket-1', kind: 'basket', status: 'active', expiresAt: new Date(NOW.getTime() - 1000) })
+    const em = makeEm([basket])
+
+    const result = await sweepExpiredProposals(em as never, { tenantId: TENANT }, makeCodeService(), NOW)
+
+    expect(result).toEqual({ transitioned: 0 })
+    expect(basket.status).toBe('active')
+  })
+
+  it('never touches an already-resolved proposal (merged/abandoned/expired) even past expires_at (status filter)', async () => {
+    const alreadyMerged = makeCart({
+      id: 'proposal-already-merged-1',
+      kind: 'proposal',
+      status: 'merged',
+      expiresAt: new Date(NOW.getTime() - 1000),
+    })
+    const em = makeEm([alreadyMerged])
+
+    const result = await sweepExpiredProposals(em as never, { tenantId: TENANT }, makeCodeService(), NOW)
+
+    expect(result).toEqual({ transitioned: 0 })
+    expect(alreadyMerged.status).toBe('merged')
+  })
+
+  it('releases code reservations by cartId for an expiring proposal (K11 parity — finds nothing in Release 5, S14, but the rule stays correct)', async () => {
+    const proposal = makeCart({ id: 'proposal-codes-1', kind: 'proposal', status: 'active', expiresAt: new Date(NOW.getTime() - 1000) })
+    const applications = [makeCartPromotionApplication({ cartId: 'proposal-codes-1', codeId: 'code-1' })]
+    const em = makeEm([proposal], [], [], applications)
+    const codeService = makeCodeService()
+
+    const result = await sweepExpiredProposals(em as never, { tenantId: TENANT }, codeService, NOW)
+
+    expect(result).toEqual({ transitioned: 1 })
+    expect(codeService.releaseCode).toHaveBeenCalledWith(em, 'code-1', 'proposal-codes-1', { tenantId: TENANT, organizationId: ORG })
+  })
+
+  it('never transitions a proposal under a different tenant', async () => {
+    const otherTenantProposal = makeCart({
+      id: 'proposal-other-tenant-1',
+      tenantId: 'tenant-other',
+      organizationId: 'org-other',
+      kind: 'proposal',
+      status: 'active',
+      expiresAt: new Date(NOW.getTime() - 1000),
+    })
+    const em = makeEm([otherTenantProposal])
+
+    const result = await sweepExpiredProposals(em as never, { tenantId: TENANT }, makeCodeService(), NOW)
+
+    expect(result).toEqual({ transitioned: 0 })
+    expect(otherTenantProposal.status).toBe('active')
+  })
+})
+
 describe('releaseStaleCartLocks', () => {
   it('returns a locked cart past its lock timeout to active and clears the lock columns', async () => {
     const locked = makeCart({
@@ -716,13 +813,60 @@ describe('purgeExpiredCarts', () => {
     )
   })
 
-  it('never purges a proposal-kind cart through this sweep (kind filter)', async () => {
-    const proposal = makeCart({ id: 'proposal-purge-1', kind: 'proposal', status: 'expired', resolvedAt: RESOLVED_91_DAYS_AGO })
-    const em = makeEm([proposal])
+  // Step 3.4 (K15/S15, §16 Q6) — "Covers kind = 'proposal' as well: rejected and expired
+  // proposals purge 90 days after resolved_at." Replaces the pre-Step-3.4 "kind filter"
+  // test above this one, which asserted the OPPOSITE (deliberately deferred posture, now
+  // superseded).
+  it('hard-deletes a rejected proposal (status abandoned) resolved more than 90 days ago, same as a basket', async () => {
+    const rejectedProposal = makeCart({
+      id: 'proposal-purge-1',
+      kind: 'proposal',
+      proposedToCartId: 'some-target',
+      status: 'abandoned',
+      resolvedAt: RESOLVED_91_DAYS_AGO,
+    })
+    const em = makeEm([rejectedProposal])
+
+    const result = await purgeExpiredCarts(em as never, { tenantId: TENANT }, null, NOW)
+
+    expect(result).toEqual({ transitioned: 1 })
+    expect(emitMock).toHaveBeenCalledWith(
+      'cart.cart.purged',
+      { cartId: 'proposal-purge-1', kind: 'proposal', proposedToCartId: 'some-target' },
+      { persistent: true, tenantId: TENANT, organizationId: ORG },
+    )
+  })
+
+  it('hard-deletes an EXPIRED proposal resolved more than 90 days ago, same as a basket', async () => {
+    const expiredProposal = makeCart({
+      id: 'proposal-purge-2',
+      kind: 'proposal',
+      proposedToCartId: 'some-target',
+      status: 'expired',
+      resolvedAt: RESOLVED_91_DAYS_AGO,
+    })
+    const em = makeEm([expiredProposal])
+
+    const result = await purgeExpiredCarts(em as never, { tenantId: TENANT }, null, NOW)
+
+    expect(result).toEqual({ transitioned: 1 })
+  })
+
+  it('keeps an ACCEPTED proposal alive while CartMergeLog.proposalCartId still references it, even past the retention window', async () => {
+    const acceptedProposal = makeCart({
+      id: 'proposal-accepted-1',
+      kind: 'proposal',
+      proposedToCartId: 'target-1',
+      status: 'merged',
+      resolvedAt: RESOLVED_91_DAYS_AGO,
+    })
+    const mergeLogs = [makeMergeLog({ sourceCartId: 'proposal-accepted-1', targetCartId: 'target-1', strategy: 'manual', proposalCartId: 'proposal-accepted-1' })]
+    const em = makeEm([acceptedProposal], mergeLogs)
 
     const result = await purgeExpiredCarts(em as never, { tenantId: TENANT }, null, NOW)
 
     expect(result).toEqual({ transitioned: 0 })
+    expect(emitMock).not.toHaveBeenCalled()
   })
 
   // K3 (§12): "Withdraws a pending approval left on a purged basket (normally already

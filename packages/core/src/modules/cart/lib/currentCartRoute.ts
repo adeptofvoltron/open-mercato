@@ -221,6 +221,61 @@ export function notFoundCartResponse(): NextResponse {
   return NextResponse.json({ error: '[internal] cart not found' }, { status: 404 })
 }
 
+/** The basket identity `resolveIdentifiedBasketByToken` below resolves — just enough of
+ * `Cart` for a `/proposals/*` route to address the target basket and bind identity, never
+ * the full `cart.get` dispatch (`resolveCurrentCart`) a proposal route has no need to pay
+ * for: `GET /proposals`, `preview`, `accept` and `reject` all read/write the PROPOSAL cart's
+ * own content, not the target basket's, so they never need the target re-priced. */
+export type ResolvedBasketIdentity = {
+  id: string
+  updatedAt: Date
+  status: Cart['status']
+  checkoutSessionId: string | null
+}
+
+/**
+ * (Step 3.4, §7a.4/D-R5-13/D-R5-21) Resolves the `kind = 'basket'` cart named by `token`,
+ * enforcing the EXACT SAME identity-binding rule `resolveCurrentCart` enforces for every
+ * `/current/*` route — reused by every buyer `/api/cart/proposals/*` route, per §7a.4's own
+ * text: "bound to the identified buyer... exactly as every `/current/*` route does (§8.4)."
+ * Returns `null` for an unknown token, a cross-tenant token, or an identified basket's token
+ * presented without (or with a mismatched) customer session — the same collapse
+ * `resolveCurrentCart` already performs, so a proposal route can never distinguish "wrong
+ * token" from "right token, wrong session."
+ *
+ * Deliberately duplicates `peekCartCustomerUserId`'s identity-check shape above at this
+ * file's own small scope rather than refactoring `resolveCurrentCart` to share it — same
+ * "near-identical small helper, different caller" precedent this module already set
+ * (`lib/reprice.ts`'s own header comment) — so this addition carries zero risk to the
+ * heavily-tested `/current/*` seam.
+ */
+export async function resolveIdentifiedBasketByToken(
+  container: { resolve: <T = unknown>(name: string) => T },
+  request: Request | null,
+  scope: { tenantId: string; organizationId: string },
+  token: string,
+): Promise<ResolvedBasketIdentity | null> {
+  const em = (container.resolve('em') as EntityManager).fork()
+  const cart = await findOneWithDecryption(
+    em,
+    Cart,
+    { tokenHash: hashCartToken(token), tenantId: scope.tenantId, organizationId: scope.organizationId, kind: 'basket' as const },
+    {},
+    scope,
+  )
+  if (!cart) return null
+  if (cart.customerUserId) {
+    const auth = request ? await getCustomerAuthFromRequest(request) : null
+    if (!auth || auth.sub !== cart.customerUserId) return null
+  }
+  return {
+    id: cart.id,
+    updatedAt: cart.updatedAt,
+    status: cart.status,
+    checkoutSessionId: cart.checkoutSessionId ?? null,
+  }
+}
+
 const logger = createLogger('cart').child({ component: 'api' })
 
 /**

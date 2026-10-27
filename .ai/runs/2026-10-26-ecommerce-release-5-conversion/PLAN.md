@@ -47,7 +47,7 @@
 | 3 | 3.1-fix | ecommerce: fix `mergeStoreSettings` missing `shipping` (TS2322/TS2741, regression from Step 2.13) | inline | done | pending |
 | 3 | 3.2 | cart: `/current/request-approval` route + lifecycle withdrawal wiring (K3/K4/K7, `awaiting_approval_since` K5) | dispatch:standard | done | pending |
 | 3 | 3.3 | cart: §7a proposal seam commands (create/withdraw/supersede/re-author, D-R5-14) | dispatch:standard | done | pending |
-| 3 | 3.4 | cart: §7a proposal routes + sweeper branches (K13–K16/S13–S15) + undo-merge refusal (D-R5-25) | dispatch:standard | todo | — |
+| 3 | 3.4 | cart: §7a proposal routes + sweeper branches (K13–K16/S13–S15) + undo-merge refusal (D-R5-25) | dispatch:standard | done | pending |
 | 3 | 3.5 | checkout: B.2 cart-backed links — trusted pay-link seeding (D-R5-19) + store/channel/currency check (C9) | dispatch:standard | todo | — |
 | 4 | 4.1 | checkout: B.4 submit sequence part 1 — preconditions, lock, `availability.reserve`, `reserveCredit`, idempotent document creation (C3/C7) | dispatch:standard | todo | — |
 | 4 | 4.2 | checkout: B.4 submit sequence part 2 — commit, credit link, codes/usage, gateway, `lineMap`, recovery table (C5/C6/C18/C24) | dispatch:standard | todo | — |
@@ -911,6 +911,93 @@ commit `c92470d8d5`).
   lookup collapsing to `product_unavailable`, and this module's own `CatalogProduct.id` test
   fixtures are plain strings throughout (`'product-1'`). The public `POST /proposals` body
   (Step 3.4) gets its own `.strict()`, `uuid()`-validated schema.
+
+- Step 3.4 (§3.1a: "`cart.proposal.accept` delegates to `cart.merge`; it is not a second
+  merge implementation"): built `cart.proposal.accept` as a real, third registered command
+  in `commands/proposal.ts` (the task brief's own phrasing — "the route delegates to the
+  EXISTING merge command" — read literally would have the ROUTE call `cart.merge` directly
+  with no intermediate command). The spec's own §3.1a command list names `cart.proposal.
+  accept` explicitly, alongside `.create`/`.reject`, as one of the module's registered
+  commands — so "delegates to `cart.merge`" describes what `cart.proposal.accept`'s OWN
+  `execute` does internally (verify the `acceptanceToken`'s freshness, then call
+  `commandBus.execute('cart.merge', ...)`), not a license to skip the wrapper command
+  entirely. `commands/merge.ts` gained a `proposalCartId`/`lines` discriminated-union input
+  variant (`CartMergeManualInput`) handled by a dedicated `executeProposalAcceptance`
+  function — a completely separate code path from the existing §7.1 guest-merge branch,
+  reusing only its small pure helpers (`buildMergeOutcome`, `resolveMaxOrderQuantities`,
+  `filterCustomerLines`) — so the already-tested guest-merge path carries zero behavioural
+  change or regression risk from this Step. Alternative considered: have the ROUTE call
+  `cart.merge` directly with no `cart.proposal.accept` wrapper — rejected as contradicting
+  §3.1a's own command list, and because the acceptanceToken verification (§7a.4's own
+  two-step preview→accept contract) has nowhere sensible to live other than a command of
+  its own (it is not merge mechanics, and a route-layer implementation would duplicate the
+  fresh-preview-rebuild logic `preview` itself already owns).
+- Step 3.4 (§7a.4, "TTL 15 min... single-use"): the `acceptanceToken` is a `signAudienceJwt`/
+  `verifyAudienceJwt`-signed token (`lib/acceptanceToken.ts`), reusing the SAME shared,
+  audience-scoped JWT primitive `customer_accounts` already uses for customer session
+  tokens, rather than inventing a bespoke HMAC scheme (the module's other signed-token
+  precedents — `communication_channels/lib/thread-token.ts` — carry no payload at all, so
+  they are not reusable templates for a token that must BIND two carts' `updatedAt`
+  snapshots). "Single-use" is achieved for free: a successful accept moves BOTH the target's
+  and the proposal's `updatedAt`, so re-presenting the same token for a second accept call
+  fails the ordinary freshness comparison with no separate single-use ledger needed.
+  Alternative considered: a dedicated HMAC token format over a fixed byte layout (mirroring
+  `thread-token.ts`) — rejected as reinventing exactly what `signAudienceJwt` already does
+  for a payload-bearing, expiring, audience-scoped token, for no benefit.
+- Step 3.4 (§7a.4's own un-named "preview" reusable mechanism): built `lib/proposalPreview.ts`
+  as a pure, read-only dry-run — reuses `cart.proposal.create`'s own exported pricing helpers
+  (`buildCartPricingRowFilterContext`, `fetchPriceRowsBatch`, `groupRowsByProduct`,
+  `resolveLinePricing`, all from `commands/lines.ts`) rather than re-implementing a second
+  pricing path. Matches the task brief's own fallback instruction ("if this preview
+  mechanism doesn't exist as a reusable cart function yet, build the minimal version").
+- Step 3.4 (§10's own prose, not a literal field in the route table): `GET /proposals`
+  (list) returns only `status: 'active'` ("live") proposals, newest first — reading the
+  route table's word "Live" as the filter itself, not flavour text. `GET /proposals/:id`
+  (detail) is readable at ANY status, matching TC-CART-PROP-16's explicit "an expired
+  proposal is readable." Alternative considered: list every status too and let the client
+  filter — rejected as contradicting the route table's own word choice ("Live proposals"),
+  which `POST /proposals/:id` (detail) tellingly does NOT repeat.
+- Step 3.4 (§10.2's own K12/X5 posture, scope boundary deliberately NOT closed): did NOT
+  widen the STAFF admin `GET /api/cart/carts`/`GET /api/cart/carts/:id` routes to accept
+  `kind: 'proposal'` (gated by the already-declared `cart.proposals.view` feature), even
+  though §10.2's prose now describes exactly that ("`kind` ... `proposal` accepted and
+  additionally requires `cart.proposals.view`"). Those two routes' own code comments
+  (`api/carts/route.ts`, `api/carts/[id]/route.ts`) explicitly scoped themselves to
+  `kind: 'basket'` only "while the §7a proposal seam is deferred" — a deferral Step 2.10
+  made on purpose, named as ITS OWN gap to close once the seam ships. This Step's task
+  brief named only the buyer-facing `/api/cart/proposals/*` family, the sweeper branches and
+  the undo refusal — not the admin list/detail widening, which is a separate, pre-existing,
+  explicitly-flagged deferral in a DIFFERENT file family. Flagged here and in NOTIFY.md for
+  whichever Step picks it up; `cart.proposals.view` is already declared and unused for
+  exactly this purpose. Alternative considered: widen both admin routes in this Step too,
+  since the ACL feature already exists — rejected as expanding this Step's own file touch
+  list into a surface area (admin `DataTable`/backend page awareness of a second `kind`)
+  the task brief never named, for a gap this run's own Step 2.10 already flagged as a
+  deliberate, revisit-later deferral rather than an oversight.
+- Step 3.4 (no explicit spec rate-limit bucket named for `POST /proposals`): the buyer-facing
+  `GET /proposals` and every `/proposals/:id/*` route carry the SAME `CART_RATE_LIMITS`
+  buckets (`read`/`mutate`) every other token-bound cart route uses. `POST /proposals` (the
+  staff/API-key author route) carries NONE — §15a's rate-limit table (checked) names buckets
+  keyed by cart TOKEN (`create`/`mutate`/`read`), and this route has no cart token to key by
+  at all (§10's own text: "accepts no cart token"); IP-only throttling under one of those
+  buckets would conflate an authenticated, ACL-gated staff/service caller with an anonymous
+  storefront buyer's abuse surface, which is not what any of the three buckets are sized
+  for. Flagged here rather than silently applied — a future Step adding a dedicated
+  author-route budget (if `assisted_selling`'s own rep console turns out to need one) should
+  add a fourth bucket, not reuse these three.
+- Step 3.4 (§8.3's "rotated on merge and on adoption", applied to the proposal-acceptance
+  branch too): `executeProposalAcceptance` rotates the target's token unconditionally, same
+  as the existing guest-merge path — `cart.proposal.accept`'s own result surfaces the
+  rotated token in its response body the same way `/current/merge`'s response does
+  (`buildCartResponseEnvelope`'s own "rotated unconditionally... always present" comment).
+  Alternative considered: skip rotation for acceptance (no login/identity-crossing event
+  occurs) — rejected as an unnecessary divergence from `cart.merge`'s own single, already-
+  tested rotation rule, which the spec's §8.3 text does not carve out an exception for.
+- Step 3.4 (TC-CART-PROP-09's literal text, "a proposal acceptance's merge event carries
+  `kind: 'proposal'`"): `cart.cart.merged`'s `kind` field is read as "the SOURCE's kind" —
+  `'basket'` for the ordinary guest-merge path (unchanged), `'proposal'` for the manual-
+  acceptance branch — rather than some other axis (e.g. the merge's own `strategy`, which a
+  separate field already carries).
 
 ## External References
 

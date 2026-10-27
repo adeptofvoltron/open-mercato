@@ -318,3 +318,59 @@ export type CartAdminListQuery = z.infer<typeof cartAdminListQuerySchema>
  * unrecognized key 400s rather than being silently ignored. */
 export const cartAdminRepriceRequestSchema = z.object({}).strict()
 export type CartAdminRepriceRequest = z.infer<typeof cartAdminRepriceRequestSchema>
+
+// ---------------------------------------------------------------------------
+// Public HTTP request bodies for `/api/cart/proposals/*` (Step 3.4, §7a.2/§7a.4). These are
+// the route's OWN `.strict()`, `uuid()`-validated public shapes — distinct from
+// `cartProposalCreateLinesSchema`/`cartProposalCreateTtlSecondsSchema` above, which validate
+// `cart.proposal.create`'s internal, trusted-caller input (plain-string ids, no public body
+// to 400 on an unrecognized key). Same split `cartLineAddRequestSchema` already keeps against
+// `cartLineAddInputSchema`.
+// ---------------------------------------------------------------------------
+
+/** `POST /proposals` (§10: "a staff `auth.User`, or an AI agent principal... takes the
+ * target as `targetCartId`... accepts no cart token"). */
+export const cartProposalAuthorLineRequestSchema = z
+  .object({
+    productId: uuid(),
+    variantId: clearableUuidSchema,
+    quantity: decimalStringSchema,
+    configuration: jsonRecordSchema.nullable().optional(),
+  })
+  .strict()
+
+export const cartProposalAuthorRequestSchema = z
+  .object({
+    targetCartId: uuid(),
+    lines: z.array(cartProposalAuthorLineRequestSchema).min(1).max(100),
+    ttlSeconds: cartProposalCreateTtlSecondsSchema,
+  })
+  .strict()
+export type CartProposalAuthorRequest = z.infer<typeof cartProposalAuthorRequestSchema>
+
+/** `POST /proposals/:id/preview` — no body fields: the scope and buyer context the dry-run
+ * re-prices against are resolved server-side at the route edge (§6a.1a), never caller-supplied. */
+export const cartProposalPreviewRequestSchema = z.object({}).strict()
+export type CartProposalPreviewRequest = z.infer<typeof cartProposalPreviewRequestSchema>
+
+/** `POST /proposals/:id/accept` (§7a.4: `{ acceptanceToken, lines: [{ proposalLineId,
+ * accepted }] }`). */
+export const cartProposalAcceptLineSelectionSchema = z
+  .object({
+    proposalLineId: uuid(),
+    accepted: z.boolean(),
+  })
+  .strict()
+
+export const cartProposalAcceptRequestSchema = z
+  .object({
+    acceptanceToken: z.string().trim().min(1),
+    lines: z.array(cartProposalAcceptLineSelectionSchema).min(1).max(100),
+  })
+  .strict()
+export type CartProposalAcceptRequest = z.infer<typeof cartProposalAcceptRequestSchema>
+
+/** `POST /proposals/:id/reject` — no body fields (mirrors `cartMergeUndoRequestSchema`'s
+ * empty-but-`.strict()` convention); the proposal to reject is named by the path param. */
+export const cartProposalRejectRequestSchema = z.object({}).strict()
+export type CartProposalRejectRequest = z.infer<typeof cartProposalRejectRequestSchema>

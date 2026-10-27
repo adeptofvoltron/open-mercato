@@ -1,3 +1,5 @@
+process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-jwt-secret-for-cart-proposal-accept-tests'
+
 jest.mock('@open-mercato/shared/lib/i18n/server', () => ({
   resolveTranslations: async () => ({
     translate: (_key: string, fallback?: string) => fallback ?? _key,
@@ -68,12 +70,15 @@ import type { CommandHandler, CommandRuntimeContext } from '@open-mercato/shared
 import { isCrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 import type { ResolvedCartRouteContext } from '../../lib/routeContext'
 import type {
+  CartProposalAcceptInput,
+  CartProposalAcceptResult,
   CartProposalCreateInput,
   CartProposalCreateResult,
   CartProposalRejectInput,
   CartProposalRejectResult,
 } from '../proposal'
 import '../proposal'
+import { signAcceptanceToken } from '../../lib/acceptanceToken'
 
 const TENANT_ID = 'tenant-prop-1'
 const ORG_ID = 'org-prop-1'
@@ -254,6 +259,7 @@ function makeCtx(opts: {
   policyResolutionService?: unknown
   promotionsService?: unknown
   codeService?: unknown
+  commandBus?: unknown
 }): CommandRuntimeContext {
   const dataEngine = makeDataEngine()
   return {
@@ -262,6 +268,10 @@ function makeCtx(opts: {
       resolve: (token: string): any => {
         if (token === 'em') return opts.em
         if (token === 'dataEngine') return dataEngine
+        if (token === 'commandBus') {
+          if (opts.commandBus !== undefined) return opts.commandBus
+          throw new Error('commandBus not registered in this test')
+        }
         if (token === 'rbacService') return opts.rbacService ?? makeRbacService()
         if (token === 'catalogBuyerPricingService') {
           return opts.catalogBuyerPricingService ?? { resolveLinePrice: jest.fn(async () => makeResolvedLinePrice()) }
@@ -713,5 +723,197 @@ describe('cart.proposal.reject', () => {
     )
     expect(liveProposals).toHaveLength(1)
     expect(liveProposals[0].id).toBe('proposal-2')
+  })
+})
+
+describe('cart.proposal.accept', () => {
+  const PROPOSAL_ID = 'proposal-1'
+
+  function makeFreshToken(targetUpdatedAt: Date, proposalUpdatedAt: Date) {
+    return signAcceptanceToken({
+      proposalCartId: PROPOSAL_ID,
+      targetCartId: TARGET_CART_ID,
+      proposalUpdatedAt: proposalUpdatedAt.toISOString(),
+      targetUpdatedAt: targetUpdatedAt.toISOString(),
+    })
+  }
+
+  function makeMergeResultFixture(overrides: Row = {}): Row {
+    return {
+      cart: { id: TARGET_CART_ID, updatedAt: new Date('2026-03-01T02:00:00.000Z') },
+      token: 'rotated-plaintext-token',
+      mergeSummary: { strategy: 'manual', mergeLogId: 'merge-log-1', adopted: false, counts: { merged: 0, summed: 0, capped: 0, declined: 1, rejected: 0 }, lines: [] },
+      priceChanges: [],
+      ...overrides,
+    }
+  }
+
+  function makeCommandBus(execute: jest.Mock) {
+    return { execute }
+  }
+
+  beforeEach(() => {
+    resetFixtures()
+    seededCarts.push(
+      makeCartFixture({
+        id: PROPOSAL_ID,
+        kind: 'proposal',
+        proposedToCartId: TARGET_CART_ID,
+        status: 'active',
+        resolvedAt: null,
+        updatedAt: new Date('2026-03-01T00:00:00.000Z'),
+      }),
+    )
+  })
+
+  it('delegates to cart.merge with the manual input when the acceptanceToken is fresh, and emits cart.proposal.accepted', async () => {
+    const handler = getHandler<CartProposalAcceptInput, CartProposalAcceptResult>('cart.proposal.accept')
+    const em = makeEm()
+    const target = seededCarts.find((row) => row.id === TARGET_CART_ID)!
+    const proposal = seededCarts.find((row) => row.id === PROPOSAL_ID)!
+    const token = makeFreshToken(target.updatedAt, proposal.updatedAt)
+    const mergeResult = makeMergeResultFixture()
+    const execute = jest.fn(async (id: string, options: { input: unknown }) => {
+      expect(id).toBe('cart.merge')
+      expect(options.input).toMatchObject({
+        targetCartId: TARGET_CART_ID,
+        proposalCartId: PROPOSAL_ID,
+        lines: [{ proposalLineId: 'line-1', accepted: true }],
+      })
+      return { result: mergeResult }
+    })
+    const ctx = makeCtx({ em, auth: null, commandBus: makeCommandBus(execute) })
+
+    const result = await handler.execute(
+      {
+        proposalCartId: PROPOSAL_ID,
+        targetCartId: TARGET_CART_ID,
+        tenantId: TENANT_ID,
+        organizationId: ORG_ID,
+        acceptanceToken: token,
+        lines: [{ proposalLineId: 'line-1', accepted: true }],
+        routeContext: makeRouteContext(),
+      },
+      ctx,
+    )
+
+    expect(execute).toHaveBeenCalledTimes(1)
+    expect(result.cart.id).toBe(TARGET_CART_ID)
+    expect(result.token).toBe('rotated-plaintext-token')
+    expect(result.acceptedLineCount).toBe(1)
+    expect(emitCartEventMock).toHaveBeenCalledWith(
+      'cart.proposal.accepted',
+      expect.objectContaining({
+        proposalCartId: PROPOSAL_ID,
+        targetCartId: TARGET_CART_ID,
+        mergeLogId: 'merge-log-1',
+        acceptedLineCount: 1,
+      }),
+    )
+  })
+
+  it('404s when the target cart does not exist', async () => {
+    const handler = getHandler<CartProposalAcceptInput, CartProposalAcceptResult>('cart.proposal.accept')
+    const em = makeEm()
+    const ctx = makeCtx({ em, auth: null })
+
+    const err = await captureError(() =>
+      handler.execute(
+        {
+          proposalCartId: PROPOSAL_ID,
+          targetCartId: 'cart-does-not-exist',
+          tenantId: TENANT_ID,
+          organizationId: ORG_ID,
+          acceptanceToken: 'whatever',
+          lines: [],
+          routeContext: makeRouteContext(),
+        },
+        ctx,
+      ),
+    )
+    expectCrudHttpError(err, 404)
+  })
+
+  it('404s when the proposal id is not addressed to this target (K10 — same body as a nonexistent id)', async () => {
+    seededCarts.push(
+      makeCartFixture({ id: 'other-target', customerUserId: 'other-customer-user' }),
+      makeCartFixture({ id: 'proposal-elsewhere', kind: 'proposal', proposedToCartId: 'other-target', status: 'active' }),
+    )
+    const handler = getHandler<CartProposalAcceptInput, CartProposalAcceptResult>('cart.proposal.accept')
+    const em = makeEm()
+    const ctx = makeCtx({ em, auth: null })
+
+    const err = await captureError(() =>
+      handler.execute(
+        {
+          proposalCartId: 'proposal-elsewhere',
+          targetCartId: TARGET_CART_ID,
+          tenantId: TENANT_ID,
+          organizationId: ORG_ID,
+          acceptanceToken: 'whatever',
+          lines: [],
+          routeContext: makeRouteContext(),
+        },
+        ctx,
+      ),
+    )
+    expectCrudHttpError(err, 404)
+  })
+
+  it('409 proposal_changed with a fresh preview + token when the acceptanceToken is stale (the target moved since preview), and never calls cart.merge', async () => {
+    const handler = getHandler<CartProposalAcceptInput, CartProposalAcceptResult>('cart.proposal.accept')
+    const em = makeEm()
+    const target = seededCarts.find((row) => row.id === TARGET_CART_ID)!
+    const proposal = seededCarts.find((row) => row.id === PROPOSAL_ID)!
+    // Minted against the target's PREVIOUS updatedAt — a fresh token would use the current one.
+    const staleToken = makeFreshToken(new Date(target.updatedAt.getTime() - 60_000), proposal.updatedAt)
+    const execute = jest.fn()
+    const ctx = makeCtx({ em, auth: null, commandBus: makeCommandBus(execute) })
+
+    const err = await captureError(() =>
+      handler.execute(
+        {
+          proposalCartId: PROPOSAL_ID,
+          targetCartId: TARGET_CART_ID,
+          tenantId: TENANT_ID,
+          organizationId: ORG_ID,
+          acceptanceToken: staleToken,
+          lines: [{ proposalLineId: 'line-1', accepted: true }],
+          routeContext: makeRouteContext(),
+        },
+        ctx,
+      ),
+    )
+
+    expectCrudHttpError(err, 409, 'proposal_changed')
+    const body = (err as { body?: Record<string, unknown> }).body
+    expect(body?.acceptancePreview).toBeDefined()
+    expect(typeof body?.acceptanceToken).toBe('string')
+    expect(execute).not.toHaveBeenCalled()
+  })
+
+  it('409 proposal_changed for a malformed/garbage acceptanceToken, never calling cart.merge', async () => {
+    const handler = getHandler<CartProposalAcceptInput, CartProposalAcceptResult>('cart.proposal.accept')
+    const em = makeEm()
+    const execute = jest.fn()
+    const ctx = makeCtx({ em, auth: null, commandBus: makeCommandBus(execute) })
+
+    const err = await captureError(() =>
+      handler.execute(
+        {
+          proposalCartId: PROPOSAL_ID,
+          targetCartId: TARGET_CART_ID,
+          tenantId: TENANT_ID,
+          organizationId: ORG_ID,
+          acceptanceToken: 'not-a-real-token',
+          lines: [{ proposalLineId: 'line-1', accepted: true }],
+          routeContext: makeRouteContext(),
+        },
+        ctx,
+      ),
+    )
+
+    expectCrudHttpError(err, 409, 'proposal_changed')
+    expect(execute).not.toHaveBeenCalled()
   })
 })

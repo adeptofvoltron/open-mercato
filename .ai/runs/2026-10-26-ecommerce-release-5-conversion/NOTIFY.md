@@ -1443,3 +1443,124 @@ schema, matching `cartLineAddRequestSchema`'s existing split.
 pre-existing basket-only command (`cart.get`, `cart.lines.*`, `cart.merge`, `cart.lock`, the
 sweepers) is untouched and still filters `kind: 'basket'` — confirmed by grep and by this
 Step's own `cart.get` regression test.
+
+## 2026-10-27T04:10:00Z — Step 3.4 landed (cart: §7a proposal routes, sweeper branches, undo-merge refusal — K13–K16/S13–S15/D-R5-13/D-R5-21/D-R5-25)
+
+**Scope.** The HTTP route family under `/api/cart/proposals/*` (`GET /proposals`,
+`POST /proposals`, `GET /proposals/:id`, `POST /proposals/:id/preview`,
+`POST /proposals/:id/accept`, `POST /proposals/:id/reject`), the third proposal command
+(`cart.proposal.accept`, §7a.4), `commands/merge.ts`'s new `proposalCartId`/`lines` manual-
+acceptance input variant, the three §12 sweeper branches for `kind = 'proposal'` (K15/S15),
+and the D-R5-25 `409 merge_undo_not_supported_for_proposal` refusal on `/current/undo-merge`.
+
+**`cart.proposal.accept` is a real third command, delegating to `cart.merge`.** §3.1a's own
+command list names `cart.proposal.create · cart.proposal.accept · cart.proposal.reject` as
+the module's three proposal commands — so "the route delegates to the existing merge
+command" (this Step's own brief) means `cart.proposal.accept`'s OWN `execute` verifies the
+two-step §7a.4 `acceptanceToken` contract and then calls `commandBus.execute('cart.merge',
+...)`, not that the HTTP route calls `cart.merge` with no wrapper at all. Full reasoning in
+PLAN.md's own Step 3.4 decision entry.
+
+**The two-step `preview` → `acceptanceToken` → `accept` dance, built per §7a.4's literal
+text (re-read closely, as instructed — this was NOT in the task brief's own bullet list in
+as much detail, which only said "price the proposal's lines... build the minimal version").**
+`POST /proposals/:id/preview` re-prices every proposal line against the TARGET's CURRENT
+buyer context (`lib/proposalPreview.ts#buildProposalAcceptancePreview`, reusing
+`cart.proposal.create`'s own exported pricing helpers from `commands/lines.ts` — creates
+nothing, no `em.persist`/`flush` anywhere in that file) and returns `{ acceptancePreview,
+acceptanceToken }`. The `acceptanceToken` (`lib/acceptanceToken.ts`) is a `signAudienceJwt`/
+`verifyAudienceJwt`-signed token (audience `cart_proposal_acceptance`, reusing the SAME
+shared primitive `customer_accounts` already uses for session JWTs, 15-minute TTL) binding
+BOTH the target's and the proposal's current `updatedAt`. `POST /proposals/:id/accept`
+verifies the token's signature AND freshness (`isAcceptanceTokenFresh`); a stale or
+malformed token gets `409 proposal_changed` carrying a FRESH preview+token built the same
+way, never a bare error. "Single-use" (TC-CART-PROP-11) is a consequence of the freshness
+check alone — a successful accept moves both carts' `updatedAt`, so replaying the same
+token fails the identical comparison a genuinely-stale token would.
+
+**`commands/merge.ts`'s manual-acceptance branch is a fully separate code path, not woven
+into the existing §7.1 guest-merge flow.** `CartMergeInput` is now a discriminated union
+(`CartMergeAutoInput | CartMergeManualInput`); `mergeCartCommand.execute` branches to a new
+`executeProposalAcceptance` function at the very top when `proposalCartId` is present. That
+function reuses the EXISTING `buildMergeOutcome`/`resolveMaxOrderQuantities`/
+`filterCustomerLines` helpers (treating the proposal's SELECTED lines as "source," the
+target's customer-origin lines as "target," the target always as survivor — never
+`strategy: 'replace'`) and the existing mandatory whole-cart reprice dispatch, but has its
+own target/proposal resolution, its own lock/status gates (`423 cart_locked` with the
+session id, `409 cart_not_active` for either cart), its own `declined`-disposition pass for
+every unselected proposal line, and writes `CartMergeLog.proposalCartId` — the ONE field
+D-R5-25's undo refusal keys off. Zero changes to the pre-existing, heavily-tested §7.1
+guest-merge path itself — confirmed by running the full pre-existing `merge.test.ts` suite
+unchanged alongside the new tests.
+
+**D-R5-25's refusal lives in `restoreCartMerge`, checked BEFORE the survivor/absorbed cart
+lookups (which would otherwise 404 for a proposal-sourced merge, since the absorbed row's
+`kind` is `'proposal'` and both lookups filter `kind: 'basket'`).** `cart.mergeUndo`
+(buyer-facing) throws the `409` straight through; the generic command-undo-log `undo`
+handler (the admin "Undo" action) now ALSO swallows this code silently, alongside the
+pre-existing `merge_already_undone`/`cart_not_active` swallows — same "no HTTP consumer to
+show an error to" reasoning those two already established.
+
+**Sweeper branches (K15/S15).** `sweepAbandonedCarts` needed NO change — its own
+`kind: 'basket'` filter already excluded every proposal (confirmed by the pre-existing
+regression test, still green). `sweepExpiredProposals` (new function, `lib/sweepers.ts`)
+runs on the SAME hourly `cart:expire` tick as `sweepExpiredCarts` (no new schedule —
+`workers/expire.worker.ts` now calls both in sequence, separate try/catch per branch):
+`kind = 'proposal' AND status = 'active' AND expires_at < now()` → `expired`, `resolved_at`
+set, `cart.proposal.expired` with scope, code reservations released by `cartId` (finds
+nothing in Release 5, S14, but the rule stays correct). `purgeExpiredCarts`'s `base` filter
+simply DROPPED its `kind: 'basket'` restriction — the `CartMergeLog` exclusion logic already
+checked `ref.proposalCartId` (written ahead of time by Step 2.11/K11, confirmed by reading
+that Step's own NOTIFY.md entry), so widening the base query was the ONLY change needed; an
+accepted proposal stays excluded via the exact same `excludedIds` set a still-referenced
+basket already used.
+
+**Identity binding reused verbatim, not reinvented.** `lib/currentCartRoute.ts` gained
+`resolveIdentifiedBasketByToken` — the SAME `getCustomerAuthFromRequest` session-vs-
+`customerUserId` check `resolveCurrentCart` already enforces for every `/current/*` route,
+duplicated at this file's own small scope (same precedent `lib/reprice.ts`'s own duplication
+note already sets) rather than refactoring the heavily-tested `resolveCurrentCart` to share
+it — zero risk to that existing seam. Every buyer `/proposals/*` route calls it before
+touching anything.
+
+**Decisions flagged in PLAN.md (not repeated here in full):** `cart.proposal.accept` built
+as a real third command, not route-inline merge dispatch; the acceptanceToken's JWT-based
+design; `GET /proposals` filters to `status: 'active'` ("live") while `GET /proposals/:id`
+stays readable at any status; the STAFF admin `/api/cart/carts` list/detail is **NOT**
+widened to `kind: 'proposal'` in this Step (Step 2.10's own pre-existing, explicitly-flagged
+deferral — a separate file family from this Step's `/api/cart/proposals/*` scope; `cart.
+proposals.view` is already declared and sits unused, waiting for whichever Step closes that
+gap); no dedicated rate-limit bucket for the staff-authored `POST /proposals` (no cart token
+to key by; reusing a token-keyed bucket would conflate two different abuse surfaces);
+`cart.cart.merged`'s `kind` field is read as "the source's kind" (`'proposal'` for this
+branch); token rotation on acceptance mirrors the existing unconditional guest-merge
+rotation.
+
+**Files touched:**
+- `commands/proposal.ts` — new `cart.proposal.accept` command; exported `resolveProposalAuthor`.
+- `commands/merge.ts` — `CartMergeInput` is now `CartMergeAutoInput | CartMergeManualInput`;
+  new `executeProposalAcceptance` function; D-R5-25 refusal in `restoreCartMerge`; the
+  generic `undo` handler's swallowed-code list grows by one.
+- `lib/acceptanceToken.ts` (new) — sign/verify/freshness for the §7a.4 acceptanceToken.
+- `lib/proposalPreview.ts` (new) — the dry-run preview builder.
+- `lib/currentCartRoute.ts` — new exported `resolveIdentifiedBasketByToken`.
+- `lib/sweepers.ts` — new `sweepExpiredProposals`; `purgeExpiredCarts`'s `kind` filter widened.
+- `workers/expire.worker.ts` — calls `sweepExpiredProposals` after `sweepExpiredCarts`.
+- `data/validators.ts` — new public `/proposals/*` request-body schemas.
+- `api/proposals/route.ts` (new) — `GET` (list) + `POST` (author).
+- `api/proposals/[id]/route.ts` (new) — `GET` (detail).
+- `api/proposals/[id]/preview/route.ts` (new) — `POST`.
+- `api/proposals/[id]/accept/route.ts` (new) — `POST`.
+- `api/proposals/[id]/reject/route.ts` (new) — `POST`.
+- `api/current/undo-merge/route.ts` — `openApi` error-doc update (new 409 code mentioned).
+- Tests (new/extended): `lib/__tests__/acceptanceToken.test.ts` (new, 9 cases),
+  `lib/__tests__/proposalPreview.test.ts` (new, 5 cases), `commands/__tests__/proposal.test.ts`
+  (+6 cases, `cart.proposal.accept`), `commands/__tests__/merge.test.ts` (+12 cases: manual
+  acceptance branch, D-R5-25 refusal, regression guards), `lib/__tests__/sweepers.test.ts`
+  (+9 cases, replacing the one stale "never purges a proposal" test that this Step's own
+  purge-widening superseded).
+
+**Checks:** `yarn workspace @open-mercato/core typecheck` clean (0 errors), run twice
+(once after a full `tsconfig.tsbuildinfo` wipe to rule out a stale incremental cache). Full
+`src/modules/cart` suite: 30/30 suites, 417/417 tests (38 new), zero regressions — every
+pre-existing guest-merge/undo/sweeper test passes unchanged.

@@ -1268,3 +1268,402 @@ describe('cart.mergeUndo', () => {
     expect(guestCart.status).toBe('merged')
   })
 })
+
+// Step 3.4 (§7a.4, D-R5-13/D-R5-25) — `cart.merge`'s `proposalCartId`/`lines` input variant.
+// `cart.proposal.accept` (`commands/proposal.ts`) is the one real caller; these tests call
+// `cart.merge` directly, same precedent the guest-merge suite above already sets, to prove
+// the mechanics (visibility re-check, outcome building, `CartMergeLog`, mandatory re-price)
+// without re-building `cart.proposal.accept`'s own acceptanceToken/binding machinery here —
+// that machinery is `commands/__tests__/proposal.test.ts`'s own scope.
+describe('cart.merge — §7a.4 proposal acceptance (manual strategy, Step 3.4)', () => {
+  const PROPOSAL_ID = 'proposal-1'
+
+  function makeProposalFixture(overrides: FakeRow = {}): FakeRow {
+    return makeCartFixture({
+      id: PROPOSAL_ID,
+      kind: 'proposal',
+      proposedToCartId: 'cart-target',
+      status: 'active',
+      resolvedAt: null,
+      tokenHash: 'proposal-token-hash-unused',
+      ...overrides,
+    })
+  }
+
+  it('merges exactly the selected lines, records unselected lines as declined (never merged, never deleted), and sets strategy manual + proposalCartId on the merge log', async () => {
+    seededCarts = [makeCartFixture({ id: 'cart-target' }), makeProposalFixture()]
+    seededCartLines = [
+      makeLineFixture({ id: 'proposal-line-1', cartId: PROPOSAL_ID, productId: 'product-1', quantity: '2' }),
+      makeLineFixture({ id: 'proposal-line-2', cartId: PROPOSAL_ID, productId: 'product-2', quantity: '1' }),
+    ]
+    seededProducts.push(makeProductFixture({ id: 'product-2' }))
+
+    const handler = getMergeHandler()
+    const em = makeEm()
+    const ctx = makeCtx({ em })
+
+    const result = await handler.execute(
+      {
+        targetCartId: 'cart-target',
+        tenantId: TENANT_ID,
+        organizationId: ORG_ID,
+        proposalCartId: PROPOSAL_ID,
+        lines: [
+          { proposalLineId: 'proposal-line-1', accepted: true },
+          { proposalLineId: 'proposal-line-2', accepted: false },
+        ],
+        routeContext: makeRouteContext(),
+      } as CartMergeInput,
+      ctx,
+    )
+
+    expect(result.mergeSummary.strategy).toBe('manual')
+    expect(result.mergeSummary.adopted).toBe(false)
+    expect(result.mergeSummary.counts).toMatchObject({ merged: 1, declined: 1 })
+    expect(result.cart.id).toBe('cart-target')
+    expect(typeof result.token).toBe('string')
+
+    const newTargetLine = seededCartLines.find((row) => row.cartId === 'cart-target' && row.productId === 'product-1')
+    expect(newTargetLine).toBeDefined()
+    const declinedLine = seededCartLines.find((row) => row.id === 'proposal-line-2')!
+    expect(declinedLine.cartId).toBe(PROPOSAL_ID)
+    expect(declinedLine.deletedAt).toBeNull()
+
+    expect(seededMergeLogs).toHaveLength(1)
+    expect(seededMergeLogs[0]).toMatchObject({
+      sourceCartId: PROPOSAL_ID,
+      targetCartId: 'cart-target',
+      strategy: 'manual',
+      proposalCartId: PROPOSAL_ID,
+    })
+    const outcome = seededMergeLogs[0].outcome as Array<Record<string, unknown>>
+    expect(outcome).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ sourceLineId: 'proposal-line-1', disposition: 'merged' }),
+        expect.objectContaining({ sourceLineId: 'proposal-line-2', targetLineId: null, disposition: 'declined' }),
+      ]),
+    )
+
+    const proposal = seededCarts.find((row) => row.id === PROPOSAL_ID)!
+    expect(proposal.status).toBe('merged')
+    expect(proposal.mergedIntoCartId).toBe('cart-target')
+    expect(proposal.resolvedAt).not.toBeNull()
+
+    expect(emitCartEventMock).toHaveBeenCalledWith(
+      'cart.cart.merged',
+      expect.objectContaining({
+        sourceCartId: PROPOSAL_ID,
+        targetCartId: 'cart-target',
+        kind: 'proposal',
+        strategy: 'manual',
+        proposalCartId: PROPOSAL_ID,
+      }),
+    )
+  })
+
+  it('refuses a locked target with 423 cart_locked, carrying its checkoutSessionId (TC-CART-PROP-14)', async () => {
+    seededCarts = [
+      makeCartFixture({ id: 'cart-target', status: 'locked', checkoutSessionId: 'session-1' }),
+      makeProposalFixture(),
+    ]
+    seededCartLines = [makeLineFixture({ id: 'proposal-line-1', cartId: PROPOSAL_ID, productId: 'product-1', quantity: '1' })]
+
+    const handler = getMergeHandler()
+    const em = makeEm()
+    const ctx = makeCtx({ em })
+
+    const err = await expectReject(() =>
+      handler.execute(
+        {
+          targetCartId: 'cart-target',
+          tenantId: TENANT_ID,
+          organizationId: ORG_ID,
+          proposalCartId: PROPOSAL_ID,
+          lines: [{ proposalLineId: 'proposal-line-1', accepted: true }],
+          routeContext: makeRouteContext(),
+        } as CartMergeInput,
+        ctx,
+      ),
+    )
+    expect(isCrudHttpError(err)).toBe(true)
+    expect((err as { status: number }).status).toBe(423)
+    expect((err as { body: FakeRow }).body.checkoutSessionId).toBe('session-1')
+  })
+
+  it('refuses a non-active target with 409 cart_not_active', async () => {
+    seededCarts = [makeCartFixture({ id: 'cart-target', status: 'converted' }), makeProposalFixture()]
+    seededCartLines = [makeLineFixture({ id: 'proposal-line-1', cartId: PROPOSAL_ID, productId: 'product-1', quantity: '1' })]
+
+    const handler = getMergeHandler()
+    const em = makeEm()
+    const ctx = makeCtx({ em })
+
+    const err = await expectReject(() =>
+      handler.execute(
+        {
+          targetCartId: 'cart-target',
+          tenantId: TENANT_ID,
+          organizationId: ORG_ID,
+          proposalCartId: PROPOSAL_ID,
+          lines: [{ proposalLineId: 'proposal-line-1', accepted: true }],
+          routeContext: makeRouteContext(),
+        } as CartMergeInput,
+        ctx,
+      ),
+    )
+    expect(isCrudHttpError(err)).toBe(true)
+    expect((err as { status: number; body: FakeRow }).status).toBe(409)
+    expect((err as { body: FakeRow }).body.code).toBe('cart_not_active')
+  })
+
+  it('refuses a non-active (already resolved) proposal with 409 cart_not_active', async () => {
+    seededCarts = [makeCartFixture({ id: 'cart-target' }), makeProposalFixture({ status: 'expired' })]
+    seededCartLines = [makeLineFixture({ id: 'proposal-line-1', cartId: PROPOSAL_ID, productId: 'product-1', quantity: '1' })]
+
+    const handler = getMergeHandler()
+    const em = makeEm()
+    const ctx = makeCtx({ em })
+
+    const err = await expectReject(() =>
+      handler.execute(
+        {
+          targetCartId: 'cart-target',
+          tenantId: TENANT_ID,
+          organizationId: ORG_ID,
+          proposalCartId: PROPOSAL_ID,
+          lines: [{ proposalLineId: 'proposal-line-1', accepted: true }],
+          routeContext: makeRouteContext(),
+        } as CartMergeInput,
+        ctx,
+      ),
+    )
+    expect(isCrudHttpError(err)).toBe(true)
+    expect((err as { status: number; body: FakeRow }).status).toBe(409)
+    expect((err as { body: FakeRow }).body.code).toBe('cart_not_active')
+  })
+
+  it('404s when the proposal id does not belong to this target', async () => {
+    seededCarts = [
+      makeCartFixture({ id: 'cart-target' }),
+      makeCartFixture({ id: 'other-target' }),
+      makeProposalFixture({ proposedToCartId: 'other-target' }),
+    ]
+
+    const handler = getMergeHandler()
+    const em = makeEm()
+    const ctx = makeCtx({ em })
+
+    const err = await expectReject(() =>
+      handler.execute(
+        {
+          targetCartId: 'cart-target',
+          tenantId: TENANT_ID,
+          organizationId: ORG_ID,
+          proposalCartId: PROPOSAL_ID,
+          lines: [],
+          routeContext: makeRouteContext(),
+        } as CartMergeInput,
+        ctx,
+      ),
+    )
+    expect(isCrudHttpError(err)).toBe(true)
+    expect((err as { status: number }).status).toBe(404)
+  })
+
+  it('400s when `lines` references a proposalLineId that does not belong to this proposal', async () => {
+    seededCarts = [makeCartFixture({ id: 'cart-target' }), makeProposalFixture()]
+    seededCartLines = [makeLineFixture({ id: 'proposal-line-1', cartId: PROPOSAL_ID, productId: 'product-1', quantity: '1' })]
+
+    const handler = getMergeHandler()
+    const em = makeEm()
+    const ctx = makeCtx({ em })
+
+    const err = await expectReject(() =>
+      handler.execute(
+        {
+          targetCartId: 'cart-target',
+          tenantId: TENANT_ID,
+          organizationId: ORG_ID,
+          proposalCartId: PROPOSAL_ID,
+          lines: [{ proposalLineId: 'does-not-exist', accepted: true }],
+          routeContext: makeRouteContext(),
+        } as CartMergeInput,
+        ctx,
+      ),
+    )
+    expect(isCrudHttpError(err)).toBe(true)
+    expect((err as { status: number }).status).toBe(400)
+  })
+
+  it('422s with proposal_accept_empty when every line is declined (none accepted), and creates nothing', async () => {
+    seededCarts = [makeCartFixture({ id: 'cart-target' }), makeProposalFixture()]
+    seededCartLines = [makeLineFixture({ id: 'proposal-line-1', cartId: PROPOSAL_ID, productId: 'product-1', quantity: '1' })]
+
+    const handler = getMergeHandler()
+    const em = makeEm()
+    const ctx = makeCtx({ em })
+
+    const err = await expectReject(() =>
+      handler.execute(
+        {
+          targetCartId: 'cart-target',
+          tenantId: TENANT_ID,
+          organizationId: ORG_ID,
+          proposalCartId: PROPOSAL_ID,
+          lines: [{ proposalLineId: 'proposal-line-1', accepted: false }],
+          routeContext: makeRouteContext(),
+        } as CartMergeInput,
+        ctx,
+      ),
+    )
+    expect(isCrudHttpError(err)).toBe(true)
+    expect((err as { status: number; body: FakeRow }).status).toBe(422)
+    expect((err as { body: FakeRow }).body.code).toBe('proposal_accept_empty')
+    expect(seededMergeLogs).toHaveLength(0)
+  })
+
+  it('re-checks visibility against the buyer\'s freshly-resolved scope and records a rejected disposition for a restricted line (TC-CART-PROP-04)', async () => {
+    seededCarts = [makeCartFixture({ id: 'cart-target' }), makeProposalFixture()]
+    seededCartLines = [makeLineFixture({ id: 'proposal-line-1', cartId: PROPOSAL_ID, productId: 'product-1', quantity: '1' })]
+    const scopedService = {
+      loadScopedProducts: jest.fn(async () => new Map([['product-1', { id: 'product-1', categoryIds: ['blocked'], tagIds: [], isActive: true }]])),
+    }
+
+    const handler = getMergeHandler()
+    const em = makeEm()
+    const ctx = makeCtx({ em, catalogScopedProductService: scopedService })
+
+    const result = await handler.execute(
+      {
+        targetCartId: 'cart-target',
+        tenantId: TENANT_ID,
+        organizationId: ORG_ID,
+        proposalCartId: PROPOSAL_ID,
+        lines: [{ proposalLineId: 'proposal-line-1', accepted: true }],
+        routeContext: makeRouteContext({ assortmentScope: [{ categoryIds: ['allowed'], tagIds: [] }] }),
+      } as CartMergeInput,
+      ctx,
+    )
+
+    expect(result.mergeSummary.counts).toMatchObject({ rejected: 1 })
+    expect(seededCartLines.find((row) => row.cartId === 'cart-target')).toBeUndefined()
+  })
+})
+
+/** `commands/__tests__/lines.test.ts`'s own `captureError` convention, duplicated at this
+ * file's small scope: no `jest-extended` matcher is registered, so `.rejects.toSatisfy`
+ * would crash the worker on an unmatched rejection rather than failing the test cleanly. */
+async function expectReject(run: () => Promise<unknown>): Promise<unknown> {
+  try {
+    await run()
+  } catch (err) {
+    return err
+  }
+  throw new Error('expected the promise to reject, but it resolved')
+}
+
+// Step 3.4 (§7a.7, D-R5-25) — `cart.mergeUndo` refuses a proposal-sourced merge outright.
+describe('cart.mergeUndo — D-R5-25 refuses a proposal-sourced merge acceptance', () => {
+  it('refuses with 409 merge_undo_not_supported_for_proposal when the merge log names a proposalCartId, and changes nothing', async () => {
+    seededCarts = [
+      makeCartFixture({ id: 'cart-target', tokenHash: 'target-token-hash' }),
+      makeCartFixture({ id: 'proposal-1', kind: 'proposal', proposedToCartId: 'cart-target', status: 'merged', mergedIntoCartId: 'cart-target', resolvedAt: new Date() }),
+    ]
+    seededCartLines = [makeLineFixture({ id: 'line-target-1', cartId: 'cart-target', productId: 'product-1', quantity: '2' })]
+    seededMergeLogs = [
+      makeMergeLogFixture({
+        id: 'merge-log-proposal-1',
+        sourceCartId: 'proposal-1',
+        targetCartId: 'cart-target',
+        strategy: 'manual',
+        proposalCartId: 'proposal-1',
+        outcome: [{ sourceLineId: 'proposal-line-1', targetLineId: 'line-target-1', disposition: 'merged' }],
+        createdAt: new Date(Date.now() - 1 * 60 * 1000),
+      }),
+    ]
+
+    const handler = getUndoHandler()
+    const em = makeEm()
+    const ctx = makeCtx({ em })
+
+    const err = await expectReject(() =>
+      handler.execute({ cartId: 'cart-target', tenantId: TENANT_ID, organizationId: ORG_ID, routeContext: makeRouteContext() }, ctx),
+    )
+    expect(isCrudHttpError(err)).toBe(true)
+    expect((err as { status: number }).status).toBe(409)
+    expect((err as { body: FakeRow }).body.code).toBe('merge_undo_not_supported_for_proposal')
+
+    // Nothing changed: the target line, the proposal cart and the merge log's own
+    // `undoneAt` are all exactly as they were before this call.
+    const targetLine = seededCartLines.find((row) => row.id === 'line-target-1')!
+    expect(targetLine.quantity).toBe('2')
+    const proposal = seededCarts.find((row) => row.id === 'proposal-1')!
+    expect(proposal.status).toBe('merged')
+    expect(seededMergeLogs[0].undoneAt).toBeUndefined()
+    expect(emitCartEventMock).not.toHaveBeenCalledWith('cart.proposal.acceptance_undone', expect.anything())
+  })
+
+  it('a NON-proposal-sourced undo is completely unaffected (regression guard) — proposalCartId: null still restores normally', async () => {
+    seededCarts = [
+      makeCartFixture({ id: 'cart-target', tokenHash: 'target-token-hash' }),
+      makeCartFixture({ id: 'cart-guest', tokenHash: hashCartToken('guest-plain-token-regression'), status: 'merged', mergedIntoCartId: 'cart-target' }),
+    ]
+    seededCartLines = [makeLineFixture({ id: 'line-target-1', cartId: 'cart-target', productId: 'product-1', quantity: '5' })]
+    seededMergeLogs = [
+      makeMergeLogFixture({
+        id: 'merge-log-ordinary-1',
+        sourceCartId: 'cart-guest',
+        targetCartId: 'cart-target',
+        strategy: 'sum',
+        proposalCartId: null,
+        outcome: [{ sourceLineId: 'line-guest-1', targetLineId: 'line-target-1', disposition: 'summed', previousTargetQuantity: '2' }],
+        createdAt: new Date(Date.now() - 1 * 60 * 1000),
+      }),
+    ]
+
+    const handler = getUndoHandler()
+    const em = makeEm()
+    const ctx = makeCtx({ em })
+
+    const result = await handler.execute(
+      { cartId: 'cart-target', tenantId: TENANT_ID, organizationId: ORG_ID, routeContext: makeRouteContext() },
+      ctx,
+    )
+    expect(result.cart.id).toBe('cart-target')
+    const line = seededCartLines.find((row) => row.id === 'line-target-1')!
+    expect(line.quantity).toBe('2')
+    const guestCart = seededCarts.find((row) => row.id === 'cart-guest')!
+    expect(guestCart.status).toBe('active')
+  })
+
+  it('the generic command-undo-log handler (admin "Undo" action) silently no-ops for a proposal-sourced merge too, rather than erroring', async () => {
+    seededCarts = [
+      makeCartFixture({ id: 'cart-target', tokenHash: 'target-token-hash' }),
+      makeCartFixture({ id: 'proposal-1', kind: 'proposal', proposedToCartId: 'cart-target', status: 'merged', mergedIntoCartId: 'cart-target', resolvedAt: new Date() }),
+    ]
+    seededMergeLogs = [
+      makeMergeLogFixture({
+        id: 'merge-log-proposal-2',
+        sourceCartId: 'proposal-1',
+        targetCartId: 'cart-target',
+        strategy: 'manual',
+        proposalCartId: 'proposal-1',
+        outcome: [],
+        createdAt: new Date(Date.now() - 1 * 60 * 1000),
+      }),
+    ]
+
+    const handler = getMergeHandler()
+    const em = makeEm()
+    const ctx = makeCtx({ em })
+    const logEntry = {
+      commandPayload: { undo: { mergeLogId: 'merge-log-proposal-2' } },
+      tenantId: TENANT_ID,
+      organizationId: ORG_ID,
+    }
+
+    // No throw — the generic undo-log path has no HTTP consumer to show a 409 to, so it
+    // silently no-ops exactly like the already-undone/not-active cases it already swallowed.
+    await expect(handler.undo!({ logEntry, ctx } as any)).resolves.toBeUndefined()
+  })
+})
