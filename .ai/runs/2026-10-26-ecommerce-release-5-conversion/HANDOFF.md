@@ -1,55 +1,54 @@
 # Handoff — 2026-10-26-ecommerce-release-5-conversion
 
-**Last updated:** 2026-10-27T19:40:00Z
+**Last updated:** 2026-10-27T21:00:00Z
 **Branch:** feat/release-5-conversion (fork `adeptofvoltron/open-mercato`)
 **PR:** https://github.com/adeptofvoltron/open-mercato/pull/16 (draft, reused — not opened by this run)
-**Current phase/step:** Phase 1 complete. Phase 2 in progress — Checkpoint 5 passed (Steps 2.1–2.11
-done). Next Step is 2.12.
-**Last commit:** `7443c78d16` — feat(cart): extend abandonment payload and release code reservations on expire/abandon (K9/K11)
+**Current phase/step:** Phase 1 and Phase 2 COMPLETE (Checkpoint 6 passed, all 25 Steps 0.1–2.13
+done). Next Step is 3.1.
+**Last commit:** `607eb93e40` — docs(runs): track payment-method-selection route question for Step 4.1
 
 ## What just happened
-- `availability` track (2.1–2.3) and `customer_groups` approval track (2.4–2.7) are fully done —
-  see `checkpoint-4-checks.md` for detail.
-- `cart` track for this wave (2.8–2.11) landed:
-  - 2.8 `2a6c08325b` idempotent lock extend + `checkoutSessionId` binding on unlock/markConverted (C1)
-  - 2.9 `0ac273199e` **recorded behavior change** (D-R5-21/22, owner-approved): identified baskets
-    now require the matching customer session on every `/current/*` route (closes the X1 token-only
-    re-identification bypass); trusted-path (`pay_link`/`api`/`agent`) carts now seed real
-    `customerIds`/`customerGroupIds`/`priceKindId`/etc. via `resolveForBuyer` instead of placeholder
-    values. UPGRADE_NOTES-ready description logged in `NOTIFY.md` for Step 6.2.
-  - 2.10 `d9663a84bf` `markConverted` order/quote `lineMap` (K8/D-R5-26) + cart's FIRST admin UI
-    this run (DataTable list/detail/reprice, K6). Added a generated `grandTotalGrossAmount` column
-    (hand-authored migration, mirrors `CartLine.configurationHash` precedent — reviewed, sound).
-  - 2.11 `7443c78d16` abandonment payload growth (K9) + code-reservation release on expire/abandon
-    (K11). One documented, non-blocking gap: `purge` can reach converted/merged baskets Step 2.11's
-    mechanism doesn't cover; `promotions`' own TTL sweep backstops it.
-- **Process note:** let 6 Steps (2.6–2.11) land before checkpointing instead of 5 — a pacing slip,
-  no quality impact (every Step individually verified before the next was dispatched). Resuming
-  strict every-5 pacing.
-- Checkpoint 5 passed: forced full `yarn typecheck` (40/40, 0 cached); scoped
-  `customer_groups`+`cart`+`promotions` tests (95/97 suites, 1087/1095 tests — 2 expected
-  Postgres-gated skips). Details in `checkpoint-5-checks.md`.
+- Phase 2 (wave 2, 13 Steps) is fully done:
+  - `availability`: reservation entity + reserve/release/commit + expiry/reconciliation jobs (2.1–2.3)
+  - `customer_groups`: purchase-approval entity + CAS service + portal/staff routes + notifications (2.4–2.7)
+  - `cart`: lock extend/session binding, D-R5-21/22 identity-binding behavior change, markConverted
+    lineMap + first admin UI, abandonment payload + K11 code-release (2.8–2.11)
+  - `checkout`: B.1 session + step machine + security baseline (2.12, first checkout Step this
+    run), B.3 delivery rate quoting + delivery promotions + payment-methods listing (2.13)
+- Checkpoint 6 (closing Phase 2) passed: forced full `yarn typecheck` (40/40, 0 cached); full core
+  retrospective sweep across every Phase-2-touched module (240/243 suites, 2523/2540 tests, 3
+  expected Postgres-gated skips); full `checkout` package suite (47/47, 328/328). Details in
+  `checkpoint-6-checks.md`.
+- **Flagged, not yet acted on:** no dev-server/browser UI smoke pass has run across the whole run
+  so far, despite THREE deferred UI surfaces now accumulated (credit panel/ledger/create/adjust
+  dialogs; cart admin list/detail/reprice; any checkout session UI Phase 3+ needs).
+  `checkpoint-6-checks.md` explicitly commits the NEXT UI-touching Step (or Step 6.1 at the
+  latest) to actually start the dev server and verify at least one path through each surface —
+  this must not be deferred a fourth time.
+- One tracked, non-blocking note carried forward: Step 4.1 must check whether a
+  payment-method-SELECTION route is needed before/alongside submit, since Step 2.13 only built
+  the listing route.
 
 ## Next concrete action
-- Dispatch Step 2.12: `checkout` B.1 — session entity + step machine + token hash + the C14
-  security minimum (rate limits, session encryption, payload redaction, cross-tenant check). This
-  is the FIRST `checkout` Step in this run — `checkout` today ships Phase A (pay links) only, no
-  session/step-machine code exists yet. Read the checkout analysis's C1–C26 findings and the
-  revised checkout spec closely before dispatching.
+- Dispatch Step 3.1: `cart` approval gate (K1–K5) — `requiresApproval` computation from fresh
+  terms, `cart.lock` refusal (`409 cart_requires_approval`), `purpose: 'quote'` skip (D-R5-23),
+  guest fail-closed (D-R5-12/29). This builds directly on Step 2.5's approval service and Step
+  2.9's cart identity-binding work. **Remember the Step 2.5 tracked gap:** `resolveTerms` still
+  does not resolve `termsCurrencyCode` — this Step needs it (K1's currency-match rule) and must
+  fix `resolveTerms` to add it if still missing, rather than re-deriving the value another way.
 
 ## Blockers / open questions
 - none
 
 ## Environment caveats
-- Dev runtime runnable: unknown (not yet started). First real dev-server/browser smoke pass still
-  deferred — now most likely triggered by Step 2.12/2.13's checkout session UI, or Phase 3.
-- Browser / UI checks: not yet attempted, including for Step 2.10's new cart admin pages.
+- Dev runtime runnable: unknown (not yet started) — see the UI-verification commitment above.
+- Browser / UI checks: not yet attempted, across any phase.
 - Database/migration state: clean. Migrations so far: `customer_groups` (1.5, 1.12, 2.4),
-  `promotions` (1.9), `availability` (2.1), `cart` (2.10, hand-authored generated column — reviewed
-  sound). `yarn db:migrate` has not been run.
-- The availability-reserve and approval-decide concurrency mechanisms (Steps 2.2, 2.5) remain
-  mutation-tested by their own executors but not independently re-verified at checkpoints (no live
-  Postgres here) — accepted risk, consistent posture since Step 1.6.
+  `promotions` (1.9), `availability` (2.1), `cart` (2.10), `checkout` (2.12). `yarn db:migrate`
+  has not been run.
+- Concurrency mechanisms mutation-tested by their own executors but not independently
+  re-verified at checkpoints (no live Postgres here): Steps 1.6 (credit), 2.2 (availability
+  reserve), 2.5 (approval decide) — accepted risk, unchanged posture.
 
 ## Worktree
 - Path: `/Users/bernard/workspace/open-mercato/.ai/tmp/release-5-conversion-impl`

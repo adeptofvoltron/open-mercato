@@ -1097,3 +1097,16 @@ payment methods listing)
   submit itself accepts the chosen payment method as a direct input, no separate selection route
   is needed; if the spec's step machine expects the method to be SET on the session before submit
   is called, Step 4.1 must add that route itself before building the submit sequence on top of it.
+
+## 2026-10-27T21:00:00Z — checkpoint 6 (Steps 2.12–2.13, closes Phase 2)
+- Range: `09e6d489bb`..`aac84cb6ad`. Summary: checkout session entity + step machine + B.1
+  security baseline (first checkout Step this run, C10's requires-unchanged guarantee verified by
+  a dedicated Phase-A-non-regression test); delivery rate quoting + delivery promotions + payment
+  methods listing.
+- Checks: forced full typecheck (40/40, 0 cached) pass; full core retrospective sweep across every
+  Phase-2-touched module (240/243 suites, 2523/2540 tests, 3 expected Postgres-gated skips); full
+  checkout package suite (47/47 suites, 328/328 tests).
+- Decisions/problems: none blocking. Flagged explicitly: no dev-server/browser UI pass has run yet
+  across the entire run (3 UI surfaces accumulated). Committing the next UI-touching Step, or
+  Step 6.1 at the latest, to actually do this.
+- Phase 2 is complete. All 13 Steps landed; no rescues needed this phase.
