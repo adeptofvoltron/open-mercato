@@ -6,7 +6,7 @@ import { findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 import { createLogger } from '@open-mercato/shared/lib/logger'
 import type { CartService } from '@open-mercato/core/modules/cart/lib/cartService'
 import { CheckoutSession } from '../data/entities'
-import { compensate, completeQuoteOutcome, continueOrderOutcome } from '../commands/submit'
+import { compensate, compensateByCancellingOrder, completeQuoteOutcome, continueOrderOutcome } from '../commands/submit'
 import { writeSessionEvent } from '../lib/sessionEvents'
 import { emitCheckoutEvent } from '../events'
 import { tryResolve } from '../lib/tryResolve'
@@ -147,12 +147,15 @@ export async function recoverOneStuckSubmit(
         return
       }
       // §12.1's own final row: "attempt older than the payment TTL without an intent ->
-      // Compensate per §7.3 and fail with submit_recovery_failed."
+      // Compensate per §7.3 and fail with submit_recovery_failed." An order already
+      // exists at this point (checked above), so compensation means CANCELLING it —
+      // `compensateByCancellingOrder` is the same primitive the live submit path uses,
+      // which also unlocks the cart and marks the session failed; everything else
+      // (stock/credit/promotion release) follows from the order cancellation through the
+      // existing `sales.order.cancelled` subscribers, never a parallel release here.
       logger.error('[internal] recover-stuck-submits: giving up on an old stuck attempt, compensating', { err, sessionId: session.id, progress })
-      await safeUnlockCart(container, session, scope)
-      await em.nativeUpdate(CheckoutSession, { id: session.id, ...scope }, { status: 'failed', failureCode: 'submit_recovery_failed', updatedAt: new Date() })
+      await compensateByCancellingOrder(container, em, session, scope, session.salesOrderId, 'submit_recovery_failed')
       await writeSessionEvent(em, { ...scope, sessionId: session.id, kind: 'recovery', actor: 'system', payload: { action: 'gave_up', fromProgress: progress } })
-      await emitCheckoutEvent('checkout.session.failed', { sessionId: session.id, tenantId: scope.tenantId, organizationId: scope.organizationId, cartId: session.cartId ?? null, attempt: session.submitAttempt, failureCode: 'submit_recovery_failed' }).catch(() => undefined)
       return
     }
   }

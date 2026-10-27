@@ -26,6 +26,7 @@ jest.mock('../../events', () => ({
 }))
 
 const mockCompensate = jest.fn(async () => undefined)
+const mockCompensateByCancellingOrder = jest.fn(async () => undefined)
 const mockContinueOrderOutcome = jest.fn(async () => ({
   session: {},
   attempt: 1,
@@ -36,6 +37,7 @@ const mockContinueOrderOutcome = jest.fn(async () => ({
 }))
 jest.mock('../../commands/submit', () => ({
   compensate: (...args: unknown[]) => mockCompensate(...args),
+  compensateByCancellingOrder: (...args: unknown[]) => mockCompensateByCancellingOrder(...args),
   continueOrderOutcome: (...args: unknown[]) => mockContinueOrderOutcome(...args),
 }))
 
@@ -201,12 +203,18 @@ describe('checkout recover-stuck-submits worker', () => {
       mockContext,
     )
 
-    expect(mockEm.nativeUpdate).toHaveBeenCalledWith(
-      CheckoutSession,
-      { id: session.id, tenantId: TENANT_ID, organizationId: ORG_ID },
-      expect.objectContaining({ status: 'failed', failureCode: 'submit_recovery_failed' }),
+    // The order already exists at this point (`salesOrderId` is set), so giving up must
+    // CANCEL it — via the same `compensateByCancellingOrder` primitive the live submit
+    // path uses — never just mark the session failed with the order left dangling
+    // (unconfirmed, stock/credit/promotions never released).
+    expect(mockCompensateByCancellingOrder).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      session,
+      { tenantId: TENANT_ID, organizationId: ORG_ID },
+      'order-1',
+      'submit_recovery_failed',
     )
-    expect(mockEmitCheckoutEvent).toHaveBeenCalledWith('checkout.session.failed', expect.objectContaining({ failureCode: 'submit_recovery_failed' }))
   })
 
   it('a resume failure within the give-up window is logged and left for the next tick, not compensated', async () => {

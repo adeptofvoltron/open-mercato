@@ -723,7 +723,13 @@ describe('checkout.session.submit (B.4, steps 6-8 of §7.2/C19 — Step 4.2)', (
   it('a gateway failure compensates by CANCELLING the order and the session ends failed', async () => {
     const h = buildHarness({ createPaymentSessionResult: { transaction: { id: 'gw-1', unifiedStatus: 'failed', expiresAt: null }, session: { sessionId: 'gw-session-1', status: 'failed' } } })
 
-    await expect(getHandler().execute(BASE_INPUT, h.ctx)).rejects.toMatchObject({ status: 402 })
+    // Must be `payment_failed`, never `credit_refused` — that code is reserved for the
+    // DISTINCT on-account credit-reservation refusal at step 4 (G1/G2), a different
+    // failure mode an API consumer needs to tell apart from a declined gateway payment.
+    await expect(getHandler().execute(BASE_INPUT, h.ctx)).rejects.toMatchObject({
+      status: 402,
+      body: expect.objectContaining({ code: 'payment_failed' }),
+    })
 
     expect(h.commandBusExecute).toHaveBeenCalledWith('sales.orders.update', expect.objectContaining({
       input: expect.objectContaining({ statusEntryId: 'status-canceled' }),

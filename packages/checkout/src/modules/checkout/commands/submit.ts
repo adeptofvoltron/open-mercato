@@ -1389,7 +1389,7 @@ export async function continueOrderOutcome(
     await compensateByCancellingOrder(container, em, session, scope, orderId, 'payment_failed')
     await writeSessionEvent(em, { ...scope, sessionId: session.id, kind: 'payment_result', actor: 'system', payload: { orderId, outcome: 'failed' } })
     await emitCheckoutEvent('checkout.payment.failed', { sessionId: session.id, tenantId: scope.tenantId, organizationId: scope.organizationId, orderId, transactionId: transaction.id, failureCode: 'payment_failed' }).catch(() => undefined)
-    throw new CrudHttpError(402, { error: '[internal] the payment was not successful', code: 'credit_refused' })
+    throw new CrudHttpError(402, { error: '[internal] the payment was not successful', code: 'payment_failed' })
   }
 
   // Still pending/processing — the gateway hands the buyer off to complete payment

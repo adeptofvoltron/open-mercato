@@ -2720,3 +2720,40 @@ of every item in the handed-off inventory:
   once for a guest cart token and once for an identified buyer, exercising the D-R5-13/21
   identity-binding refusal paths (a mismatched/foreign token gets the uniform 404) alongside the
   happy path.
+
+## 2026-10-28T07:50:00Z — Step 6.1-fix (two bugs found by the orphaned research threads' trailing echoes)
+- While reviewing the checkout C26 research echo (reporting a side finding, not in the original
+  Step 6.1 inventory), two genuine bugs surfaced and were fixed directly by the dispatcher
+  (small, well-understood, surgical — no sub-agent dispatch needed):
+  1. `checkout/commands/submit.ts:1392` — a SYNCHRONOUS gateway payment failure (mappedStatus
+     'failed'/'cancelled'/'expired') correctly compensated by cancelling the order and emitting
+     `checkout.payment.failed` with `failureCode: 'payment_failed'`, but then threw its HTTP
+     error with `code: 'credit_refused'` — the WRONG code, already used distinctly (line 611)
+     for the actual on-account credit-reservation refusal. An API consumer checking the error
+     code could not tell "the gateway declined the payment" apart from "credit was refused",
+     two failure modes needing different buyer-facing handling. Fixed: `code: 'payment_failed'`,
+     matching the already-emitted event's own `failureCode`. Added a regression assertion to the
+     existing `submit.test.ts` "a gateway failure compensates..." test.
+  2. `checkout/workers/recover-stuck-submits.worker.ts` — the order-outcome give-up branch
+     (reached when `continueOrderOutcome` keeps failing past `RECOVERY_GIVE_UP_MS`) only
+     unlocked the cart and marked the session `failed`; it never cancelled the order that, by
+     this point, DOES exist (`session.salesOrderId` is checked and present before entering this
+     code path). The code's OWN comment even said "Compensate per §7.3" but never did — stock,
+     credit and promotion releases only fire via `sales.order.cancelled` subscribers, so a
+     dangling uncancelled order meant none of them ever ran. Fixed: the branch now calls
+     `compensateByCancellingOrder` (the exact primitive the live submit path and
+     `expire-awaiting-payment` already use for this), which cancels the order, unlocks the cart,
+     marks the session failed, and emits the signal event — removing the duplicate hand-rolled
+     version of the same steps. The QUOTE-outcome give-up branch (same file, a few lines up) was
+     checked and does NOT have this bug — a quote's stock was already released at document
+     creation and no credit was ever reserved for it, so there is genuinely nothing further to
+     compensate there; left unchanged. Updated the existing "gives up and compensates..." test in
+     `recover-stuck-submits.worker.test.ts` to assert `compensateByCancellingOrder` is called
+     with the order id and `submit_recovery_failed`, and added the missing mock for it (the test
+     file's `jest.mock('../../commands/submit', ...)` factory was already missing a mock for
+     `completeQuoteOutcome` too — a PRE-EXISTING gap, noted but not fixed here since it's outside
+     this fix's scope: the quote-outcome give-up/resume branch has zero test coverage currently,
+     a candidate for a future Step).
+- Checks: scoped `yarn workspace @open-mercato/checkout typecheck` clean; targeted
+  `submit`+`recover-stuck-submits` test files 4/4 suites, 72/72 tests; full `checkout` package
+  suite 55/55 suites, 462/462 tests, zero regressions.
