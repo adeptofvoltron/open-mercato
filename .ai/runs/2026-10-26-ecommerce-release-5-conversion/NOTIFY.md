@@ -2008,3 +2008,90 @@ commit, credit link, codes/usage, gateway, lineMap, recovery — plus the public
   (Step 4.4), buyer routes + retention/erasure (Step 4.5), the rep console (Step 5.3),
   attribution (Step 5.4) — nothing in this Step's module reads or writes `cart`/`ecommerce` at
   all yet.
+
+## 2026-10-27T07:05:17Z — executor: Step 4.4 landed, thread/participant/message/proposal entities + staff author routes
+
+- Entities (`data/entities.ts`, §5.1-§5.4): `AssistedSellingThread` (partial unique
+  `(tenant_id, buyer_cart_id)` where `status = 'open'`), `AssistedSellingParticipant`
+  (encrypted `display_name`; partial unique `(thread_id, actor_type, actor_id)` where
+  `deleted_at is null`), `AssistedSellingMessage` (encrypted `body`; nullable Phase-3
+  `ai_input_flagged_at`/`ai_read_by_turn_id` columns per S10), `AssistedSellingProposal`
+  (encrypted `rejection_reason`; the metadata row pointing at the `cart.Cart` with
+  `kind: 'proposal'`, NOT a line/price duplicate — see PLAN.md's decision entry resolving the
+  brief's own flagged S23/S1 tension). `encryption.ts` declares the three fields — entity ids
+  are `assisted_selling:assisted_selling_message`/`_participant`/`_proposal` (the REAL
+  generator output, confirmed against `packages/core/generated/entities.ids.generated.ts`
+  after `yarn generate`), not the literal `assisted_selling:message` etc. strings §5.7's prose
+  shows — a mismatch here would have encrypted nothing. `events.ts` declares exactly the six
+  events this Step's own commands emit (`thread.opened`, `participant.joined`,
+  `message.posted`, `proposal.published`/`.withdrawn`/`.superseded`) — the §6.6 terminal-state
+  events (`.accepted`/`.rejected`/`.expired`) and `.attribution.degraded` stay undeclared; see
+  the gap this Step's own decisions entry documents. `acl.ts`/`setup.ts` add `threads.view`,
+  `threads.participate`, `proposals.author` (`employee` gets the first two; `proposals.author`
+  stays admin-or-hand-granted, matching §6.9's least-privilege line). `index.ts` promotes `cart`
+  to a hard `requires` (`apps/mercato/src/modules.ts` comment updated to match).
+- Commands (`commands/threads.ts`, `commands/proposals.ts`): `assisted_selling.thread.open`
+  (S9-scoped cart read via two new additive `cartService` methods, §6.1's "creates the thread,
+  adds the rep as a participant and posts an opening message"), `assisted_selling.proposal.
+  author`/`.withdraw`/`.reauthor`. `author`/`.reauthor` share one `performAuthorProposal`
+  helper running §6.3's full sequence (live-mode check, `resolveForBuyer` fail-closed,
+  `cart.proposal.create` by command id, local persist, `.proposal.published`); `.withdraw`/
+  `.reauthor` both call `cart.proposal.reject` in the same action per §6.4, never only the
+  local row. Every feature check goes through `requireAssistedSellingFeatures`
+  (`rbacService.userHasAllFeatures`, S21) — authoring/reauthor require BOTH
+  `assisted_selling.proposals.author` and `cart.proposals.author`, matching §6.1's
+  two-feature-by-design rule.
+- `cart` module changes (additive, 443/443 pre-existing cart tests stayed green after both):
+  `lib/cartService.ts` gained `getForOrganizations` (a `kind: 'basket'` cart scoped to a LIST
+  of `organizationIds`, S9 — no existing read supported a multi-org list without a direct
+  `Cart` import) and `getProposalCartLines` (a `kind: 'proposal'` cart's own lines, for
+  `/proposals/:id/reauthor`). `commands/proposal.ts`'s `CartProposalCreateInput.routeContext`
+  narrowed from the full `ResolvedCartRouteContext` to `Pick<…, 'assortmentScope'>` — the one
+  field the command actually reads; the full type could never have been constructed by this
+  Step's non-HTTP trusted caller in the first place. Both are additive/widening; see PLAN.md's
+  decision entries for the full reasoning.
+- Routes: `POST /api/assisted_selling/threads` (open), `GET /api/assisted_selling/threads`
+  (list), `POST /api/assisted_selling/threads/:id/proposals` (author), `POST /api/
+  assisted_selling/proposals/:id/withdraw`, `POST /api/assisted_selling/proposals/:id/
+  reauthor` — route prefix matches S4 exactly (underscore, no `/storefront` segment on these
+  staff paths).
+- S23 idempotency resolution (documented in full in PLAN.md's decisions): the unique key lives
+  on `AssistedSellingProposal.idempotency_key` (`(tenant_id, thread_id, idempotency_key)`),
+  checked BEFORE the mode check and before any `cart` call, exactly as §6.3 specifies. The
+  concurrent-race branch (two first-calls, one key) is handled by letting both reach
+  `cart.proposal.create` (each its own transaction), then having the LOSER of the local unique
+  insert explicitly compensate — calling `cart.proposal.reject` on the proposal cart it just
+  orphaned — before answering as a replay of the winner's row. This is the closest achievable
+  simulation of §6.3's literal "the other's transaction... rolls back" wording given that two
+  separately-dispatched commands cannot share one database transaction.
+- Known, deliberately scoped-out gaps (both flagged in PLAN.md's decisions, not silently
+  dropped): (1) Step 3.3's provisional `cart.cart.merged` re-author/supersede subscriber is
+  UNCHANGED — the real migration into this module needs its own bookkeeping updates
+  (`superseded_by_proposal_id`, `live_proposal_count`, `.proposal.superseded`) and is sized for
+  its own Step. (2) The §6.6 terminal-state subscriber (`cart.proposal.accepted/.rejected/
+  .expired` → local `AssistedSellingProposal.status`) and the §5.1 thread-identity subscribers
+  (`cart.cart.merged`/`.adopted`) are NOT built — no Step in PLAN.md's Phase 4/5 names them
+  explicitly; a buyer's own accept/reject/expiry of a proposal currently updates only `cart`'s
+  side. Recommend the run insert a dedicated Step for both before Phase 4/5 is called complete.
+- Tests (`packages/core`, `yarn jest src/modules/assisted_selling` style — command-level jest,
+  matching this codebase's own convention of no dedicated route-level tests for `cart`'s
+  sibling proposal routes either): `commands/__tests__/threads.test.ts` (8 cases — S9
+  cross-organization refusal, wildcard ACL grant, missing-feature refusal, cross-tenant
+  refusal, cart-not-active, mode-off, thread-already-open race), `commands/__tests__/
+  proposals.test.ts` (13 cases — note-as-encrypted-message-body with no `note` field reaching
+  `cart.proposal.create`'s own input, idempotency replay/mismatch, wildcard ACL, withdraw/
+  reauthor including the `proposal_already_accepted` D-R5-25 refusal), `__tests__/
+  encryption.test.ts` (2 cases — the exact entity-id regression this Step's own header comment
+  documents). 35/35 new tests pass.
+- Checks (local mode, every `tsconfig.tsbuildinfo` wiped repo-wide first): `yarn generate`
+  clean (confirmed the real entity-id strings via the regenerated
+  `entities.ids.generated.ts`). `yarn typecheck` — 40/40 package tasks green (`@open-mercato/
+  core` and `@open-mercato/app` both cache-miss-executed clean). `eslint` on every
+  changed/new file clean (exit 0). `yarn jest src/modules/assisted_selling` — 35/35. `yarn
+  jest src/modules/cart` (packages/core) — 443/443, zero regressions from the `cartService`/
+  `routeContext` type changes. Hand-authored
+  `migrations/Migration20261027150000_assisted_selling.ts` + a hand-built
+  `.snapshot-open-mercato.json` update (same stale-local-Postgres risk Step 4.3/2.10 already
+  documented) — built the snapshot fragment programmatically (not by hand-typing JSON) and
+  diffed its shape against the existing `cart`/`assisted_selling` snapshot entries, including
+  the exact partial-unique-index `expression` shape `cart_lines_unique_line_key` already uses.

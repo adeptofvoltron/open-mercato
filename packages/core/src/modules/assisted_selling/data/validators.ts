@@ -33,3 +33,76 @@ export const assistedSellingStoreSettingsSaveSchema = scopedSchema
   .extend({ storeId: uuid() })
   .strict()
 export type AssistedSellingStoreSettingsSaveInput = z.infer<typeof assistedSellingStoreSettingsSaveSchema>
+
+// ---------------------------------------------------------------------------
+// Step 4.4 — staff thread/proposal request bodies (§6.1, §6.3, §6.4). `.strict()` throughout
+// per §6.3's own "a request that still sends [a disallowed] field is a 400, not a silently
+// ignored value" discipline.
+// ---------------------------------------------------------------------------
+
+const clearableUuid = () => z.preprocess((value) => (value === '' ? null : value), uuid().nullable().optional())
+const decimalString = () => z.string().regex(/^-?\d+(\.\d+)?$/, 'Must be a decimal string')
+const jsonRecord = () => z.record(z.string(), z.unknown())
+// §6.3: "note? ... plain text, ≤ 2000 chars".
+const optionalNote = () => z.string().trim().max(2000).optional()
+
+/** `POST /threads` (§6.1). Opens a conversation about a basket by cart id. `message` is this
+ * Step's own additive, minimal shape for §6.1's "posts an opening message" — the spec names
+ * the behaviour but not a literal body field, so an optional, bounded free-text field (empty
+ * when omitted, same "empty when none was given" convention §6.3 step 7 applies to the
+ * authoring `note`) is the smallest faithful reading. See NOTIFY.md's Step 4.4 entry. */
+export const assistedSellingThreadOpenRequestSchema = z
+  .object({
+    cartId: uuid(),
+    message: optionalNote(),
+  })
+  .strict()
+export type AssistedSellingThreadOpenRequest = z.infer<typeof assistedSellingThreadOpenRequestSchema>
+
+export const assistedSellingProposalAuthorLineSchema = z
+  .object({
+    productId: uuid(),
+    variantId: clearableUuid(),
+    quantity: decimalString(),
+    configuration: jsonRecord().nullable().optional(),
+  })
+  .strict()
+export type AssistedSellingProposalAuthorLine = z.infer<typeof assistedSellingProposalAuthorLineSchema>
+
+export const ASSISTED_SELLING_IDEMPOTENCY_KEY_MIN_LENGTH = 8
+export const ASSISTED_SELLING_IDEMPOTENCY_KEY_MAX_LENGTH = 128
+
+const idempotencyKeySchema = z
+  .string()
+  .min(ASSISTED_SELLING_IDEMPOTENCY_KEY_MIN_LENGTH)
+  .max(ASSISTED_SELLING_IDEMPOTENCY_KEY_MAX_LENGTH)
+
+/** `POST /threads/:id/proposals` (§6.3). `lines` is capped at 100 here (mirrors `cart`'s own
+ * `cartProposalCreateLinesSchema` 1..100 cap) — the store's own `max_proposal_lines` (§5.6,
+ * default 50) is the tighter, store-configurable bound enforced at the command layer. */
+export const assistedSellingProposalAuthorRequestSchema = z
+  .object({
+    lines: z.array(assistedSellingProposalAuthorLineSchema).min(1).max(100),
+    note: optionalNote(),
+    idempotencyKey: idempotencyKeySchema,
+  })
+  .strict()
+export type AssistedSellingProposalAuthorRequest = z.infer<typeof assistedSellingProposalAuthorRequestSchema>
+
+/** `POST /proposals/:id/withdraw` (§6.4). `updatedAt` is the body-carried optimistic-lock
+ * value; the standard header form is accepted too (`commands/shared.ts`). */
+export const assistedSellingProposalWithdrawRequestSchema = z
+  .object({
+    updatedAt: z.string().optional(),
+  })
+  .strict()
+export type AssistedSellingProposalWithdrawRequest = z.infer<typeof assistedSellingProposalWithdrawRequestSchema>
+
+/** `POST /proposals/:id/reauthor` (§6.4). */
+export const assistedSellingProposalReauthorRequestSchema = z
+  .object({
+    idempotencyKey: idempotencyKeySchema,
+    note: optionalNote(),
+  })
+  .strict()
+export type AssistedSellingProposalReauthorRequest = z.infer<typeof assistedSellingProposalReauthorRequestSchema>

@@ -1,5 +1,6 @@
 import type { EntityManager } from '@mikro-orm/postgresql'
 import type { CommandBus, CommandRuntimeContext } from '@open-mercato/shared/lib/commands'
+import { findOneWithDecryption, findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 import { lockCartCommand, markConvertedCommand, unlockCartCommand } from '../commands/lock'
 import type {
   CartLockInput,
@@ -9,6 +10,8 @@ import type {
   CartUnlockInput,
   CartUnlockResult,
 } from '../commands/lock'
+import { toCartSummary, type CartSummary } from '../commands/cart'
+import { Cart, CartLine } from '../data/entities'
 import { isCartStoreContextUnavailableError, resolveCartRouteContext } from './routeContext'
 import { getCartSalesSnapshot, type CartSalesSnapshot, type GetCartSalesSnapshotInput } from './toSalesSnapshots'
 
@@ -41,6 +44,41 @@ export type CartServiceContainer = {
  */
 export type CartServiceLockInput = CartLockInput & { request?: Request | null }
 
+/**
+ * Step 4.4 (`assisted_selling`, S9/§6.1). `POST /threads` resolves the target basket "through
+ * `cart`'s admin detail read — the same read `GET /api/cart/carts/:id` serves (K6), scoped to
+ * the caller's `organizationIds`" (§6.1's own text) — a LIST, not the single `organizationId`
+ * `cart.get` (the only other by-id read) accepts. No existing primitive supports a multi-org
+ * scoped-by-list read without a direct `Cart` entity import, which root AGENTS.md forbids for a
+ * cross-module caller. `organizationIds: null` means unrestricted (mirrors
+ * `cart/lib/adminCartScope.ts#organizationIdsFromCartScope`'s own "null = unrestricted" contract,
+ * reused by name in `assisted_selling`'s own copy of that helper).
+ */
+export type CartServiceGetForOrganizationsInput = {
+  tenantId: string
+  organizationIds: string[] | null
+  cartId: string
+}
+
+/**
+ * Step 4.4. `POST /proposals/:id/reauthor` (§6.4) re-authors "from the old one's lines" — a
+ * `kind: 'proposal'` cart's own `CartLine` rows, read back into `cart.proposal.create`'s own
+ * `CartProposalCreateLineInput` shape. No existing read exposes a proposal cart's lines to an
+ * external caller either, for the identical "no direct ORM relationship across modules" reason.
+ */
+export type CartServiceGetProposalCartLinesInput = {
+  tenantId: string
+  organizationId: string
+  proposalCartId: string
+}
+
+export type CartServiceProposalCartLine = {
+  productId: string
+  variantId: string | null
+  quantity: string
+  configuration: Record<string, unknown> | null
+}
+
 export type CartService = {
   lock(input: CartServiceLockInput): Promise<CartLockResult>
   unlock(input: CartUnlockInput): Promise<CartUnlockResult>
@@ -48,6 +86,13 @@ export type CartService = {
   /** (C7, `.ai/specs/2026-08-14-cart-module.md` §3.1a/§9.1 rev 10) The only source checkout
    * uses to build its quote — see `lib/toSalesSnapshots.ts`'s own header comment. */
   getSalesSnapshot(input: GetCartSalesSnapshotInput): Promise<CartSalesSnapshot>
+  /** Step 4.4 (S9). A `kind: 'basket'` cart scoped to a LIST of organization ids, `null`
+   * list restriction (`organizationIds: null`) means unrestricted — never a direct `Cart`
+   * entity import outside this module. */
+  getForOrganizations(input: CartServiceGetForOrganizationsInput): Promise<CartSummary | null>
+  /** Step 4.4 (§6.4). A `kind: 'proposal'` cart's own lines, mapped to
+   * `cart.proposal.create`'s own line-input shape. */
+  getProposalCartLines(input: CartServiceGetProposalCartLinesInput): Promise<CartServiceProposalCartLine[]>
 }
 
 type CartServiceAuthContext = CommandRuntimeContext['auth']
@@ -131,5 +176,39 @@ export class CartServiceImpl implements CartService {
       { input, ctx },
     )
     return result
+  }
+
+  async getForOrganizations(input: CartServiceGetForOrganizationsInput): Promise<CartSummary | null> {
+    const em = (this.container.resolve('em') as EntityManager).fork()
+    const scope = { tenantId: input.tenantId }
+    const where: Record<string, unknown> = {
+      id: input.cartId,
+      tenantId: input.tenantId,
+      kind: 'basket' as const,
+    }
+    if (Array.isArray(input.organizationIds)) {
+      if (input.organizationIds.length === 0) return null
+      where.organizationId = { $in: input.organizationIds }
+    }
+    const cart = (await findOneWithDecryption(em, Cart, where as Parameters<typeof findOneWithDecryption>[2], {}, scope)) as Cart | null
+    return cart ? toCartSummary(cart) : null
+  }
+
+  async getProposalCartLines(input: CartServiceGetProposalCartLinesInput): Promise<CartServiceProposalCartLine[]> {
+    const em = (this.container.resolve('em') as EntityManager).fork()
+    const scope = { tenantId: input.tenantId, organizationId: input.organizationId }
+    const lines = (await findWithDecryption(
+      em,
+      CartLine,
+      { cartId: input.proposalCartId, deletedAt: null, tenantId: input.tenantId, organizationId: input.organizationId },
+      { orderBy: { lineNumber: 'ASC' } },
+      scope,
+    )) as CartLine[]
+    return lines.map((line) => ({
+      productId: line.productId,
+      variantId: line.variantId ?? null,
+      quantity: line.quantity,
+      configuration: line.configuration ?? null,
+    }))
   }
 }

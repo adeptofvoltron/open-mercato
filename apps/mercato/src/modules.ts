@@ -103,9 +103,9 @@ export const enabledModules: ModuleEntry[] = [
   // totals, token-bound public access. Requires catalog, sales and customer_groups.
   { id: 'cart', from: '@open-mercato/core' },
   // Staff- and AI-authored priced proposals on a buyer's basket, accepted as a cart
-  // merge (.ai/specs/2026-09-22-assisted-selling.md, D-R5-11/D-R5-36). Phase 1 scaffold +
-  // store settings only so far — no hard `requires` yet; `cart`'s proposal seam and
-  // `ecommerce`'s `storeContextService.resolveForBuyer` are resolved with `tryResolve`.
+  // merge (.ai/specs/2026-09-22-assisted-selling.md, D-R5-11/D-R5-36). Step 4.4: `cart` is now
+  // a hard `requires` (thread/proposal commands wrap `cart.proposal.create`/`.reject`);
+  // `ecommerce`'s `storeContextService.resolveForBuyer` stays a soft `tryResolve` peer.
   { id: 'assisted_selling', from: '@open-mercato/core' },
   { id: 'api_keys', from: '@open-mercato/core' },
   { id: 'devices', from: '@open-mercato/core' },

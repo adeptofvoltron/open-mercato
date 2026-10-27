@@ -1,9 +1,13 @@
 {
   "assisted_selling.errors.conflict": "This record was changed by someone else. Reload and try again.",
   "assisted_selling.errors.invalidInput": "Invalid input",
+  "assisted_selling.errors.invalid_proposal_id": "Invalid proposal id",
   "assisted_selling.errors.invalid_store_id": "Invalid store id",
+  "assisted_selling.errors.invalid_thread_id": "Invalid thread id",
+  "assisted_selling.errors.list_failed": "Failed to list selling conversations.",
   "assisted_selling.errors.load_failed": "Failed to load assisted-selling settings.",
   "assisted_selling.errors.organization_required": "Organization context is required",
   "assisted_selling.errors.save_failed": "Failed to save assisted-selling settings",
-  "assisted_selling.errors.unauthorized": "Unauthorized"
+  "assisted_selling.errors.unauthorized": "Unauthorized",
+  "assisted_selling.errors.unexpected": "Unexpected error"
 }

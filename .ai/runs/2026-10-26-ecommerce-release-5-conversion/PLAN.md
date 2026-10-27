@@ -53,7 +53,7 @@
 | 4 | 4.2 | checkout: B.4 submit sequence part 2 — commit, credit link, codes/usage, gateway, `lineMap`, recovery table (C5/C6/C18/C24) | dispatch:standard | done | pending |
 | 4 | 4.2-fix | checkout: `expire-awaiting-payment` job (C1/§12 gap-fill — async gateway sessions never complete without it) | dispatch:standard | done | pending |
 | 4 | 4.3 | assisted_selling: module scaffold, store settings, `mode: rep\|off` validator, module registration (D-R5-36) | dispatch:standard | done | pending |
-| 4 | 4.4 | assisted_selling: threads/participants/messages + staff author routes wrapping `cart.proposal.create` | dispatch:standard | todo | — |
+| 4 | 4.4 | assisted_selling: threads/participants/messages + staff author routes wrapping `cart.proposal.create` | dispatch:standard | done | pending |
 | 4 | 4.5 | assisted_selling: buyer thread routes (Phase 2.1) + `/thread/events` (Phase 2.2) + retention/erasure (Phase 2.5) | dispatch:standard | todo | — |
 | 5 | 5.1 | checkout: B.5 B2B — PO term, `min_order_value`, on-account eligibility, `request_quote` method (D-R5-20), quote branch (C15–C17) | dispatch:standard | todo | — |
 | 5 | 5.2 | checkout: approval-resume subscriber (C11) + session-route identity binding (D-R5-33) | dispatch:standard | todo | — |
@@ -1358,6 +1358,108 @@ commit `c92470d8d5`).
   selling.ts` (one `create table` + one `unique` constraint, matching `data/entities.ts`
   column-for-column) and its `.snapshot-open-mercato.json` entry directly, rather than risk an
   unrelated-drift diff the "coding-agent exception" would then require manually pruning.
+
+- Step 4.4 (S23, the brief's own flagged ambiguity): confirmed there IS a separate
+  `AssistedSellingProposal` entity, not a contradiction of S1's "a proposal is a cart role, not
+  a new entity family" design principle. §5.4/§3.4 of the revised spec resolve this explicitly:
+  the principle means a proposal does not duplicate the cart's lines/prices/totals in a second
+  entity family — it IS realized as a real `cart.Cart` row (`kind: 'proposal'`). What this Step
+  adds on top is a small METADATA row (`AssistedSellingProposal`, no lines, no prices, no
+  totals) carrying `proposal_cart_id` plus the facts `cart` cannot hold (thread, author,
+  idempotency key). The idempotency unique key therefore lives exactly where S23's analysis-era
+  wording said: `AssistedSellingProposal.idempotency_key`, unique `(tenant_id, thread_id,
+  idempotency_key)`. Also added a NOT-in-the-spec-table, additive `response_snapshot jsonb`
+  column on the same entity — §6.3's "a replay with the same digest returns the ORIGINAL 201
+  body" requires the original `rejectedLines` on a replay, and that is request-time-only data
+  with nowhere else to live (mirrors `cart`'s own `CartIdempotencyKey.responseBody`, applied to
+  this module's thread-scoped key instead of a separate ledger table, the same class of
+  judgment call Step 2.7's two nullable timestamp columns made for its own idempotency need).
+- Step 4.4 (cross-module read, no existing primitive): `POST /threads`/`GET /threads` need a
+  `kind: 'basket'` cart read scoped to a LIST of the caller's `organizationIds` (S9) — the only
+  existing by-id read, `cart.get`, takes a single `organizationId`, and the ADMIN route's own
+  equivalent read (`GET /api/cart/carts/:id`) lives inside `cart` itself with a direct `Cart`
+  entity import, which a cross-module caller may not do. Added two additive methods to `cart`'s
+  existing `cartService` facade (`cart/lib/cartService.ts`, `cart/di.ts`'s already-registered DI
+  service): `getForOrganizations` (the basket read, organizationIds-list-scoped) and
+  `getProposalCartLines` (a `kind: 'proposal'` cart's own lines, needed by `/proposals/:id/
+  reauthor`, §6.4, "from the old one's lines"). Resolved from `assisted_selling` through a
+  duck-typed `AssistedSellingCartServiceLike` interface (`lib/cartAccess.ts`), never a static
+  import of `cart/lib/cartService.ts`'s own types — that file is module-private per the SAME
+  reasoning `cart/lib/adminCartScope.ts`'s own header comment already gives for not importing a
+  sibling module's `lib/` helper directly. Alternative considered: have this module read `Cart`/
+  `CartLine` rows directly — rejected as the exact cross-module ORM-relationship violation root
+  AGENTS.md forbids.
+- Step 4.4 (`cart.proposal.create`'s own `routeContext` field, a Step 3.3 typing gap): narrowed
+  `CartProposalCreateInput.routeContext` from the full, HTTP-route-edge-only branded
+  `ResolvedCartRouteContext` (`cart/lib/routeContext.ts`, buildable only by
+  `resolveCartRouteContext(request, …)`) to `CartProposalRouteContext = Pick<
+  ResolvedCartRouteContext, 'assortmentScope'>` — the ONE field `createProposalCommand.execute`
+  actually reads off it. Step 3.3's own field comment already named `resolveForBuyer` as this
+  field's real, intended caller ("resolved server-side by the trusted caller
+  (`storeContextService.resolveForBuyer`)"), but typed it as the wrong shape — a trusted,
+  non-HTTP caller like this module can never literally construct a `ResolvedCartRouteContext`
+  (it has no request, no `channel: 'storefront'` literal, no `currencyCode`/`locale`/
+  `salesChannelId` to supply). Purely additive/widening: any future caller passing a full
+  `ResolvedCartRouteContext` still satisfies the narrower structural type unchanged (confirmed —
+  the full cart test suite, 443 tests, stayed green after this edit). Alternative considered:
+  build a fake `ResolvedCartRouteContext` with invented values (e.g. `channel: 'storefront'` on
+  a non-storefront cart) just to satisfy the literal type — rejected as a lie with no runtime
+  effect today (the field is unread) but a real one the day something reads it.
+- Step 4.4 (POST /threads's body shape, not given literally by the spec): added one additive,
+  optional field, `message?: string` (≤2000 chars) — §6.1's own text says opening a thread
+  "creates the thread, adds the rep as a participant and posts an opening message" but never
+  shows a literal request body for this route the way §6.3 does for authoring. Treated as the
+  smallest faithful reading: an optional note, empty when omitted, mirroring §6.3 step 7's own
+  "empty when none was given" convention for the authoring `note`. Alternative considered: no
+  body field at all, with a fixed system string as the opening message — rejected as removing
+  the rep's own ability to say anything in the message §6.1 says gets posted.
+- Step 4.4 (Step 3.3's provisional `cart.cart.merged` re-author/supersede subscriber,
+  `cart/lib/proposalRetarget.ts` + `cart/subscribers/cart-merged-proposal-retarget.ts`): LEFT
+  UNCHANGED. That file's own header comment already names the authoritative home as
+  `assisted_selling` once it exists, and flags itself provisional pending review "once this
+  Step ships the REAL module" — but closing that gap properly means the retarget mechanism
+  ALSO updating this module's own bookkeeping on re-author (the old `AssistedSellingProposal`'s
+  `superseded_by_proposal_id`, the thread's `live_proposal_count`, emitting `.proposal.
+  superseded`) exactly as `commands/proposals.ts#reauthorProposalCommand` now does for the
+  staff-initiated path — i.e. a real migration of a cross-cutting lifecycle subscriber, not a
+  small edit, and a login-merge trigger is neither a "staff author route" nor a "buyer thread
+  route" (this Step's and Step 4.5's own explicit scope boundaries). Moving it now risked this
+  Step outgrowing one commit for a mechanism nothing in THIS Step's own test list names.
+  Consequence, made explicit rather than silently inherited: a proposal retargeted by a login
+  merge today still only updates `cart`'s own rows (the provisional mechanism's documented
+  scope) — the `assisted_selling` thread/proposal rows for that conversation are NOT updated
+  (no `superseded_by_proposal_id`, no `live_proposal_count` adjustment, no `.superseded`
+  event) until a future Step migrates the mechanism into this module for real. Flagged in
+  NOTIFY.md as a gap needing its own Step (or Step 4.5/5.x absorbing it) before Release 5 can
+  call the login-merge retarget path complete end to end. Alternative considered: delete the
+  cart-side mechanism now rather than leave two half-complete systems — rejected because D-R5-14
+  (re-author-on-merge) has a REAL caller today (`cart.cart.merged`) and removing it would
+  regress a already-shipped guarantee for zero gain this Step's own scope can offer instead.
+- Step 4.4 (the §6.6 terminal-state subscriber and the §5.1 `cart.cart.merged`/`.adopted`
+  thread-identity subscribers — spec Phase 1 items 6-7, NOT built this Step): the task brief's
+  own Implementation bullet list named only entities + staff author routes (`POST /threads`,
+  `GET /threads`, `POST .../proposals`, withdraw, re-author) — it never named the subscriber
+  that writes `accepted`/`rejected`/`expired` onto the local `AssistedSellingProposal` row from
+  `cart.proposal.*`, nor the thread re-pointing subscribers. Checked PLAN.md's own Phase 4/5 rows
+  for where these land: Step 4.5 is explicitly scoped to "buyer thread routes + /thread/events +
+  retention/erasure" and does not name them either; no other row does. This is a genuine PLAN.md
+  coverage gap, not a deferral this Step is entitled to resolve unilaterally (building subscriber
+  logic plus its own bookkeeping would have pushed this commit well past "staff author routes").
+  Consequence: a buyer's own accept/reject, or the `expire-carts` sweeper's own expiry, of a
+  proposal cart currently updates ONLY `cart`'s own `Cart.status` — the local
+  `AssistedSellingProposal.status` stays `published` forever, `live_proposal_count` never
+  decrements for THOSE transitions (it does decrement correctly for this Step's own withdraw/
+  reauthor-supersede paths, which call `cart.proposal.reject` directly), and the rep console
+  (Step 5.3) would have nothing live to react to. Flagged in NOTIFY.md as a follow-up Step the
+  run's own loop should insert before Phase 4/5 is considered functionally complete — likely
+  alongside whichever Step finally migrates the Step 3.3 retarget mechanism (same subscriber
+  family, same "assisted_selling learns of cart decisions" shape).
+- Step 4.4 (ACL grants, §6.9 vs. what this Step actually ships): declared exactly three new
+  features (`threads.view`, `threads.participate`, `proposals.author`) and granted `employee`
+  only the first two — `messages.post` stays undeclared (no route in this Step gates on it;
+  §6.1's own `POST /threads/:id/messages` is not part of this Step's scope either) and
+  `attributions.view` stays Step 5.4's own scope. Same "defer a feature id until the entity/
+  route it gates exists" precedent Step 1.7 and Step 4.3 both already set.
 
 ## External References
 

@@ -143,6 +143,22 @@ export type CartProposalCreateLineInput = {
   configuration?: Record<string, unknown> | null
 }
 
+/**
+ * Step 4.4 (`assisted_selling`, §6.3 step 2): the ONE field of `ResolvedCartRouteContext` this
+ * command actually reads (`input.routeContext?.assortmentScope`, below) — `target.channel` is
+ * read off the TARGET `Cart` itself, never off this input. Narrowed from the full branded
+ * `ResolvedCartRouteContext` (Step 3.3's own original typing) to the shape its real trusted
+ * caller, `storeContextService.resolveForBuyer` (SPEC-029 §6.3), actually produces:
+ * `ResolveForBuyerResult` has no `channel`/`currencyCode`(required)/`locale`/`salesChannelId`
+ * fields shaped like the HTTP-route-edge-only `ResolvedCartRouteContext` (`cart/lib/
+ * routeContext.ts`, built exclusively by `resolveCartRouteContext(request, …)`), so a trusted,
+ * non-HTTP caller could never literally construct one. Backward compatible: any existing
+ * caller that already builds a full `ResolvedCartRouteContext` (there are none yet — `commands/
+ * proposal.ts`'s own header comment and `api/proposals/route.ts` both omit `routeContext`
+ * entirely) still satisfies this narrower structural type unchanged.
+ */
+export type CartProposalRouteContext = Pick<ResolvedCartRouteContext, 'assortmentScope'>
+
 export type CartProposalCreateInput = {
   targetCartId: string
   lines: CartProposalCreateLineInput[]
@@ -152,7 +168,7 @@ export type CartProposalCreateInput = {
   /** The TARGET buyer's scope, resolved server-side by the trusted caller
    * (`storeContextService.resolveForBuyer`) — required when the target cart's channel is
    * `storefront` (§7a.2). Never constructed from request input (§6a.1a's branding rule). */
-  routeContext?: ResolvedCartRouteContext
+  routeContext?: CartProposalRouteContext
 }
 
 export type CartProposalRejectedLine = {
