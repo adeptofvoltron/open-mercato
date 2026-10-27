@@ -2872,3 +2872,112 @@ of every item in the handed-off inventory:
 - Step 6.4 done. Moving to the completion checklist: om-auto-review-pr-style review pass with
   autofix, then UI QA with screenshots for the new admin screens, then PR #16 description update,
   draft->ready, final handoff, notify.
+
+## 2026-10-28T09:30:00Z — pre-ready review pass (7 priority-area audit)
+
+Dispatched 7 parallel deep-dive reviews against `fork/develop...HEAD`, one per the PR's own
+acceptance-gate priority areas, each reading the actual lock/CAS/guard code and actual test
+assertions rather than trusting that a test file exists. Disposition of each:
+
+1. **Concurrency (availability + credit reservations) — CLEAN.** Verified no raw
+   `em.getConnection().execute(...)` participates in any check-then-write path in
+   `availability/lib/reservationCommands.ts` or `wms/lib/wmsReservationService.ts` — every
+   lock is `findWithDecryption(..., { lockMode: LockMode.PESSIMISTIC_WRITE })`, confirming the
+   earlier-documented oversell fix holds. `reservationCommands.concurrency.pg.test.ts` (real
+   Postgres, N=20, asserts exactly 1 winner) and `customerCreditService.concurrency.pg.test.ts`
+   (real Postgres, N=20 against a $300/$100 limit, asserts exactly 3 winners and a ledger sum
+   equal to 3×100) both hold under real concurrency. Idempotent retry confirmed via the
+   `@Unique(['tenantId','idempotencyKey'])` constraint on `CustomerCreditLedgerEntry`.
+
+2. **Security (D-R5-21/22 session binding: cart/checkout-session/thread) — CLEAN.** Every
+   `/api/cart/current/*`, `/api/checkout/sessions/current/*` and `assisted_selling`
+   `storefront/thread/*` route funnels through a shared `resolveCurrentCart` /
+   `resolveCurrentSession` / `resolveIdentifiedBuyerBasket` helper that peeks
+   `customerUserId` before any PII read and requires the caller's own auth subject to match
+   it, else a uniform 404. `resolveForBuyer` is only ever called with a trusted-source buyer
+   id (session, RBAC-gated channel actor, or the resource's own stored identity), never raw
+   request input. Regression suites (`currentCartRoute.identity-binding.test.ts`,
+   `currentSessionRoute.identity-binding.test.ts`) pass.
+
+3. **Money correctness (cart/order/quote totals, resolveForBuyer) — CLEAN.** Cart and
+   order/quote totals are produced by the SAME `salesCalculationService.calculateDocumentTotals`
+   call, not two independent re-pricings, and `checkout/commands/submit.ts` additionally
+   recomputes and compares totals key-by-key with a sub-cent epsilon before submit, rejecting
+   with `500 totals_mismatch` on any drift rather than silently accepting a new number.
+   `resolveForBuyer` re-derives customer group/price kind/tax mode/assortment fresh from the
+   buyer's own identity via the same service calls the buyer's own session path uses.
+
+4. **Approval gate (threshold on every channel, double-decision conflict) — CLEAN for carts
+   and double-decision; ONE FLAGGED GAP for quotes, not fixed.** `cart.lock`'s gate has no
+   channel branch — storefront/pay_link/api/agent carts all pass through the identical check,
+   and `decideApproval` is a CAS (`nativeUpdate ... WHERE status='pending' AND <slot>='pending'`)
+   proven race-safe at N=20 real-Postgres concurrency. However, `purpose: 'quote'` locks skip
+   the gate by design (D-R5-23, an explicit, owner-signed-off Release-5 scope deferral — "approval
+   of a quote belongs to quote acceptance, outside Release 5"), and the pre-existing, public,
+   unauthenticated `packages/core/src/modules/sales/api/quotes/accept/route.ts:34,138` converts
+   an accepted quote straight to a `SalesOrder` with **no** reference anywhere to
+   `customerPurchaseApprovalService`. Net effect: an over-threshold purchase CAN reach a
+   finalized order with zero approval check, via request-quote → accept. This matches the
+   spec's own documented, owner-approved deferral to a future release, so it is **not** treated
+   as an oversight and **not fixed** here — flagging because it technically contradicts the
+   review brief's "no channel exempt" framing and is worth a maintainer's explicit go/no-go
+   before this ships, not because the implementation diverges from its own spec.
+
+5. **Visibility (buyer-hidden product reaching submit / proposal_create) — CLEAN.**
+   `checkout/commands/submit.ts` calls `cartService.lock()` (which forces a fresh
+   `cart.reprice` + `buildWholeCartRevisibilityPhase` re-check against the buyer's live
+   assortment scope) before ever reading lines into the order/quote document, for both the
+   order and the `request_quote` branches; a newly-hidden line 409s `cart_has_unavailable_lines`
+   before any document is built. `assisted_selling`'s `proposals.ts#performAuthorProposal`
+   resolves the TARGET buyer's own scope (never the authoring rep's) and routes hidden lines
+   into `rejectedLines`, 422ing `proposal_empty` if every line is rejected. Bulk-add, proposal
+   accept and cart merge all re-run the same shared `evaluateCartVisibility` primitive.
+
+6. **Checkout submit compensation (killed-process rollback) — CLEAN mechanism, ONE BUG FOUND
+   AND FIXED.** The mechanism is a hybrid saga: each submit step commits independently, backed
+   by two cron-scheduled reconciliation workers (`recover-stuck-submits.worker.ts` every 1 min,
+   `expire-awaiting-payment.worker.ts` every 5 min) that resume via the SAME idempotent
+   `compensate`/`continueOrderOutcome`/`completeQuoteOutcome` functions the live path uses,
+   keyed off `stockReservationKey`/`creditReservationKey` stored on the session row.
+   Availability and credit reservations both tag `sourceType: 'checkout', sourceId: session.id`
+   so they're traceable even with no order ever created; availability additionally has an
+   independent TTL self-expiry backstop (credit does not, but is still a closed loop via the
+   session-level recovery worker alone — noted as an asymmetry, not a gap). **Bug found:**
+   `promotions/lib/code-service.ts#useCode` (around line 386) was NOT idempotent on retry — no
+   check for an existing `CodeUsage` before re-running eligibility and incrementing `code.used`.
+   Because `continueOrderOutcome` resumes from scratch on every recovery-worker retry, a crash
+   between a successful `useCode` and session completion caused the retry to either
+   double-consume a code with remaining uses, or — for an exhausted/single-use code — fail
+   eligibility on the second call and **wrongly cancel an otherwise-already-redeemed, valid
+   order** (`compensateByCancellingOrder` with `code: 'promotion_unavailable'`). **Fixed**: added
+   an idempotency check at the top of `useCode` that looks up a prior, non-reverted `CodeUsage`
+   for the exact `(codeId, cartId, orderId)` tuple and short-circuits with `{ ok: true }` before
+   any lock, re-eval or counter increment; made the `CodeUsage` creation set `revertedAt: null`
+   explicitly so the lookup is unambiguous. Added 2 regression tests to
+   `code-service.test.ts` (retry-is-idempotent; a reverted usage does NOT block re-use). Verified
+   `yarn workspace @open-mercato/core test -- src/modules/promotions/lib/__tests__/code-service.test.ts`
+   (43/43), `yarn workspace @open-mercato/core typecheck` (clean), and
+   `yarn workspace @open-mercato/checkout test -- src/modules/checkout/commands/__tests__/submit.test.ts`
+   (39/39, zero regressions).
+
+7. **Tenant/organization scoping + optimistic locking on every new route/entity — CLEAN.**
+   Every hand-rolled new route derives `tenantId` from `auth.tenantId` and resolves
+   `organizationIds` via the shared `resolveOrganizationScopeForRequest` helper, applied before
+   any decrypted read; unknown-org lookups uniformly 404 (no existence leak).
+   `makeCrudRoute`-based entities enforce scoping generically via `orgField`/`tenantField`.
+   Every new user-editable entity (`CustomerCreditAccount`, `CustomerPurchaseApproval`,
+   `assisted_selling` store settings) carries `updatedAt` and enforces
+   `enforceCommandOptimisticLock`; `AvailabilityReservation`/`CodeUsage` are correctly exempt
+   (no admin edit form exists for either). No BC violation found in the 2 modified pre-existing
+   routes (purely additive changes).
+
+- **Other finding, non-blocking, not fixed:** `compensate()` on a `totals_mismatch`/quote-branch
+  failure releases stock/credit and unlocks the cart but does not delete/cancel the already-
+  created `SalesQuote` row (unlike the order branch's `compensateByCancellingOrder`) — an
+  orphaned-record hygiene issue (the quote's own totals are still correct), not a money-
+  correctness bug. Flagging for a future cleanup pass, not fixing here (out of this review's
+  fix-only-confirmed-blockers/majors scope).
+- **Fix commit:** promotions `useCode` idempotency, see git log for the SHA.
+- Verdict: approve-worthy once the quote-acceptance approval-gate deferral (item 4) gets an
+  explicit maintainer go/no-go — everything else in the 7 priority areas is clean or already
+  fixed.

@@ -382,8 +382,32 @@ export class PromotionCodeService {
    * locked too, since that is the row whose `active` flag carries the mutable "is this
    * voucher still usable" state. Never serializable isolation — `withAtomicFlush` ignores
    * `isolationLevel` on an ambient transaction and no retry helper exists for it anyway.
+   *
+   * Idempotent on retry (C14 hardening): checkout's `recover-stuck-submits` worker
+   * resumes a crashed submit by re-calling `continueOrderOutcome` from scratch, which
+   * re-invokes this method with the SAME `(codeId, cartId, orderId)` for a use that may
+   * already have committed in a prior, crashed attempt. Without a guard, a retry would
+   * either double-consume a code with remaining global uses, or — for an exhausted/
+   * single-use code — fail eligibility on the SECOND call and wrongly cancel an otherwise
+   * already-redeemed, valid order (the exact C14 compensation-correctness failure this
+   * hardening pass exists to close). A pre-existing, non-reverted `CodeUsage` for this
+   * exact `(codeId, cartId, orderId)` tuple proves the use already landed durably in an
+   * earlier, committed transaction — that case short-circuits before any lock, re-eval or
+   * counter increment, returning the same `{ ok: true }` the original call returned.
    */
   async useCode(em: EntityManager, input: UseCodeInput, scope: PromotionsCodeScope): Promise<CodeUseResult> {
+    const priorUsage = await em.findOne(CodeUsage, {
+      codeId: input.codeId,
+      cartId: input.cartId,
+      orderId: input.orderId ?? null,
+      tenantId: scope.tenantId,
+      organizationId: scope.organizationId,
+      revertedAt: null,
+    })
+    if (priorUsage) {
+      return { ok: true }
+    }
+
     let code!: Code
     let generatedCode: GeneratedCode | null = null
 
@@ -450,6 +474,9 @@ export class PromotionCodeService {
             customerId: input.customerId,
             organizationId: scope.organizationId,
             tenantId: scope.tenantId,
+            // Explicit (not left `undefined`): the idempotency lookup at the top of this
+            // method matches on `revertedAt: null` to find a prior, still-valid use.
+            revertedAt: null,
           })
           em.persist(usage)
         },

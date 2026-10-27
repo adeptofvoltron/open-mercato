@@ -826,6 +826,54 @@ describe('PromotionCodeService.useCode', () => {
       CODE_INVALID_REASON,
     )
   })
+
+  it('is idempotent on retry for the same (codeId, cartId, orderId) — checkout\'s recover-stuck-submits resumes continueOrderOutcome from scratch after a crash and must not double-consume a single-use code or wrongly fail/cancel an order whose code use already committed (C14 hardening)', async () => {
+    const { em, tables } = createFakeEm()
+    const code = seedCode(tables, { code: 'USEDONCE', usage: 'single', used: 0 })
+    seedReservation(tables, { codeId: code.id, cartId: 'cart-1', customerId: 'cust-1' })
+    const service = new PromotionCodeService(fakeContainer())
+    const input = {
+      codeId: code.id,
+      codeString: 'USEDONCE',
+      cartId: 'cart-1',
+      orderId: 'order-1',
+      customerId: 'cust-1',
+      type: 'static' as const,
+    }
+
+    const first = await service.useCode(em as unknown as import('@mikro-orm/postgresql').EntityManager, input, SCOPE)
+    expect(first).toEqual({ ok: true })
+    expect(code.used).toBe(1)
+    expect(code.active).toBe(false)
+    expect(tables.get(CodeUsage)).toHaveLength(1)
+
+    // A simulated process-kill-and-resume retry with the IDENTICAL input: must short-
+    // circuit on the already-recorded CodeUsage rather than re-evaluate eligibility
+    // (which would now see an exhausted, inactive code and wrongly fail) or
+    // double-increment `used`.
+    const retry = await service.useCode(em as unknown as import('@mikro-orm/postgresql').EntityManager, input, SCOPE)
+    expect(retry).toEqual({ ok: true })
+    expect(code.used).toBe(1)
+    expect(tables.get(CodeUsage)).toHaveLength(1)
+  })
+
+  it('does not treat a reverted use as a prior use — a cart/order whose use was reverted can use the code again', async () => {
+    const { em, tables } = createFakeEm()
+    const code = seedCode(tables, { code: 'MULTI5', usage: 'multiple', usageAmount: 5, used: 1 })
+    seedCodeUsage(tables, { codeId: code.id, cartId: 'cart-1', orderId: 'order-1', customerId: 'cust-1', revertedAt: new Date() })
+    seedReservation(tables, { codeId: code.id, cartId: 'cart-1', customerId: 'cust-1' })
+    const service = new PromotionCodeService(fakeContainer())
+
+    const result = await service.useCode(
+      em as unknown as import('@mikro-orm/postgresql').EntityManager,
+      { codeId: code.id, codeString: 'MULTI5', cartId: 'cart-1', orderId: 'order-1', customerId: 'cust-1', type: 'static' },
+      SCOPE,
+    )
+
+    expect(result).toEqual({ ok: true })
+    expect(code.used).toBe(2)
+    expect(tables.get(CodeUsage)).toHaveLength(2)
+  })
 })
 
 describe('PromotionCodeService.releaseCode', () => {
