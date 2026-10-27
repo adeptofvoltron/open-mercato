@@ -729,6 +729,23 @@
           "enumItems": [],
           "mappedType": "decimal"
         },
+        "unit_price_override": {
+          "name": "unit_price_override",
+          "type": "jsonb",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "json"
+        },
         "uom_snapshot": {
           "name": "uom_snapshot",
           "type": "jsonb",

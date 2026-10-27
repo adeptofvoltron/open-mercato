@@ -170,10 +170,23 @@ async function resolveTrustedCartBuyerIdentity(
 // `cart` has no `i18n/` catalog at all yet (checked — Step 4.1 never added one, and no route
 // exists until Step 4.7). Revisit once that catalog exists and a route maps this command's
 // errors to an HTTP response a buyer or integration operator actually reads.
+// Release 5, Step 3.5 (D-R5-19, cart §6a.4 rev 10, R22). `buildTrustedCommandContext`'s
+// `systemActor` branch carries no `auth` at all (checkout's pay-link cart seeding has no
+// end-user actor to attribute to), so it cannot pass an RBAC feature check the normal way.
+// It is accepted for `channel: 'pay_link'` ONLY — checkout's own Phase A link checks
+// (active, not expired, usage limit, password) already gated reaching this call, so no
+// further feature grant is meaningful here. Every other channel still requires a real,
+// RBAC-granted `cart.channel.*` feature; a `systemActor` context is rejected for them
+// exactly like an unauthenticated caller would be (R22's own test: "a system context
+// cannot create any other channel").
 async function requireChannelFeature(
   ctx: CommandRuntimeContext,
   channel: Exclude<CartChannel, 'storefront'>,
 ): Promise<void> {
+  if (ctx.systemActor === true) {
+    if (channel === 'pay_link') return
+    throw forbidden(`[internal] A trusted system context cannot create a "${channel}" cart`)
+  }
   const requiredFeature = CART_CHANNEL_FEATURES[channel]
   const auth = ctx.auth
   if (!auth?.sub || !auth.tenantId) {
@@ -194,8 +207,15 @@ async function requireChannelFeature(
   }
 }
 
-function resolveAuthenticatedScope(ctx: CommandRuntimeContext): { tenantId: string; organizationId: string } {
-  const tenantId = ctx.auth?.tenantId ?? null
+// Release 5, Step 3.5 (D-R5-19). `trustedTenantId` is the trusted path's only source of
+// tenant scope when `ctx.auth` is null (a `systemActor` context, e.g. checkout's pay-link
+// seeding) — an authenticated caller's `ctx.auth.tenantId` always wins when present, so
+// this parameter is never consulted for a real HTTP principal.
+function resolveAuthenticatedScope(
+  ctx: CommandRuntimeContext,
+  trustedTenantId?: string | null,
+): { tenantId: string; organizationId: string } {
+  const tenantId = ctx.auth?.tenantId ?? (ctx.systemActor === true ? trustedTenantId ?? null : null)
   const organizationId = ctx.selectedOrganizationId ?? ctx.auth?.orgId ?? null
   if (!tenantId || !organizationId) {
     throw badRequest('[internal] Tenant and organization scope are required to create a cart')
@@ -280,7 +300,7 @@ const createCartCommand: CommandHandler<CartCreateCommandInput, CartCreateResult
         )
       }
       await requireChannelFeature(ctx, parsed.channel)
-      const { tenantId, organizationId } = resolveAuthenticatedScope(ctx)
+      const { tenantId, organizationId } = resolveAuthenticatedScope(ctx, parsed.tenantId ?? null)
       const storeId = parsed.storeId ?? null
       const trustedCustomerId = parsed.customerId ?? null
       const trustedCustomerUserId = parsed.customerUserId ?? null

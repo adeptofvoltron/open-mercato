@@ -48,7 +48,7 @@
 | 3 | 3.2 | cart: `/current/request-approval` route + lifecycle withdrawal wiring (K3/K4/K7, `awaiting_approval_since` K5) | dispatch:standard | done | pending |
 | 3 | 3.3 | cart: §7a proposal seam commands (create/withdraw/supersede/re-author, D-R5-14) | dispatch:standard | done | pending |
 | 3 | 3.4 | cart: §7a proposal routes + sweeper branches (K13–K16/S13–S15) + undo-merge refusal (D-R5-25) | dispatch:standard | done | pending |
-| 3 | 3.5 | checkout: B.2 cart-backed links — trusted pay-link seeding (D-R5-19) + store/channel/currency check (C9) | dispatch:standard | todo | — |
+| 3 | 3.5 | checkout: B.2 cart-backed links — trusted pay-link seeding (D-R5-19) + store/channel/currency check (C9) | dispatch:standard | done | pending |
 | 4 | 4.1 | checkout: B.4 submit sequence part 1 — preconditions, lock, `availability.reserve`, `reserveCredit`, idempotent document creation (C3/C7) | dispatch:standard | todo | — |
 | 4 | 4.2 | checkout: B.4 submit sequence part 2 — commit, credit link, codes/usage, gateway, `lineMap`, recovery table (C5/C6/C18/C24) | dispatch:standard | todo | — |
 | 4 | 4.3 | assisted_selling: module scaffold, store settings, `mode: rep\|off` validator, module registration (D-R5-36) | dispatch:standard | todo | — |
@@ -998,6 +998,47 @@ commit `c92470d8d5`).
   `'basket'` for the ordinary guest-merge path (unchanged), `'proposal'` for the manual-
   acceptance branch — rather than some other axis (e.g. the merge's own `strategy`, which a
   separate field already carries).
+- Step 3.5 (checkout §4.3 vs. the Implementation list's own framing): the spec's `.ai/specs/
+  2026-03-19-checkout-simple-checkout.md` §4.3 names a brand-new `CheckoutLinkCartTemplate`
+  (`checkout_link_cart_templates`) entity — it did not exist in code at all before this Step,
+  despite the task brief's own Read-first list implying `CheckoutLink`/`CheckoutLinkTemplate`
+  already carried "the template's line definitions, including `unit_price_override`." Built
+  the entity now (additive migration), scoped to exactly what seeding needs: `product_id` is
+  REQUIRED (not the spec's nullable "catalog reference, or freeform for non-catalog item"),
+  since `cart.lines.add` has no freeform/non-catalog line path today — a freeform template
+  line is a documented follow-up gap, not built here. No admin route writes these rows yet
+  either (no CrudForm sub-resource editor) — tests create fixture rows directly. `{ source:
+  'link' }` is reachable only for `checkoutType: 'simple_checkout'` links (§3.2's entry-mode
+  table); a `checkoutType: 'pay_link'` link still 404s at `checkout.session.create` and keeps
+  its entire Phase A path (`/pay/[slug]`, `/submit`) completely untouched end to end (C10).
+  Alternative considered: branch purely on `cart` module availability inside the EXISTING
+  `/pay/[slug]` routes instead of a new `source: 'link'` session-create path — rejected: Phase
+  A's own route contract (no `session_id`, no cart) is frozen by §3.2's "Phase A pay links
+  keep their existing path end to end... removes nothing from it," and the spec's own §9.0
+  route table names `{ source: 'link', slug }` at `POST /sessions` as B.2's actual entry point.
+- Step 3.5 (`cart` contract, D-R5-19, pre-approved Ask First): closing the cart-side gap the
+  checkout spec's §4.3/cart §6a.4 "rev 10" text already describes but the shipped `cart` code
+  (through Step 3.4) did not yet implement — `requireChannelFeature`'s `systemActor` bypass for
+  `channel: 'pay_link'` ONLY (R22), `cart.create`'s `tenantId` trusted-fallback input field (no
+  `ctx.auth` exists for a system actor), and `CartLine.unitPriceOverride` + `cart.lines.add`'s
+  override bypass of catalog price resolution (gated identically: `systemActor` + `channel ===
+  'pay_link'` only). Kept deliberately minimal — no reprice-engine rewrite beyond the one-line
+  exclusion `lib/reprice.ts#buildCartLineRepricePhases` already uses for gift lines (same
+  "never silently overwrite a deliberately non-catalog price" reasoning). `basis: 'gross'` is
+  assumed for every checkout-link override (Phase A's own pricing modes are all gross-oriented,
+  `fixedPriceIncludesTax`'s own default) — `CheckoutLinkCartTemplate.unitPriceOverride` has no
+  `basis` column of its own, unlike `CartLine.unitPriceOverride`'s `{ amount, basis }` shape.
+- Step 3.5 (C9 at creation — most comparisons are tautological by construction): the session
+  about to be persisted COPIES the cart's own channel/currency/tenant/organization, so three of
+  the four C9 comparisons can never actually fire at creation (they only start doing real work
+  at Step 4.1's submit, after a cart could have drifted since the session was opened). The one
+  comparison with real teeth now is the store check — `storeContextService.resolve(request,
+  { fresh: true })` against `cart.storeId` for a non-null-store (storefront) cart, newly
+  enforced here and NOT enforced at creation before this Step (Step 2.12's own flagged gap).
+  Confirmed via the full `source: 'cart'` regression suite that this is additive, not breaking:
+  one pre-existing test needed a `storeContextService` mock added (a storefront cart with a
+  real store now genuinely requires one, matching §3.4's own documented behavior), every other
+  pre-existing test already uses a `store_id: null` cart peer and is completely unaffected.
 
 ## External References
 

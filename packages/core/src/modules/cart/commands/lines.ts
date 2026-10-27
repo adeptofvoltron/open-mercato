@@ -6,7 +6,7 @@ import { emitCrudSideEffects } from '@open-mercato/shared/lib/commands/helpers'
 import { withAtomicFlush } from '@open-mercato/shared/lib/commands/flush'
 import { extractUndoPayload } from '@open-mercato/shared/lib/commands/undo'
 import { ensureSameScope } from '@open-mercato/shared/lib/commands/scope'
-import { badRequest, conflict, CrudHttpError, notFound } from '@open-mercato/shared/lib/crud/errors'
+import { badRequest, conflict, CrudHttpError, forbidden, notFound } from '@open-mercato/shared/lib/crud/errors'
 import type { CrudEventsConfig, CrudIndexerConfig } from '@open-mercato/shared/lib/crud/types'
 import type { DataEngine } from '@open-mercato/shared/lib/data/engine'
 import { findOneWithDecryption, findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
@@ -351,6 +351,36 @@ export async function resolveLinePricing(
     tenantId: cart.tenantId,
     organizationId: cart.organizationId,
   })
+}
+
+// Release 5, Step 3.5 (D-R5-19, cart §6a.4 rev 10). A synthetic `ResolvedLinePrice` for a
+// trusted pay-link line carrying a merchant `unit_price_override` — never resolved from
+// `catalogBuyerPricingService`/a `CatalogProductPrice` row (`priceRow: null`, so
+// `applyPriceSnapshot` also leaves `priceRowId`/`priceKindId`/`priceTierMinQuantity` null).
+// Only one of `amountNet`/`amountGross` is populated, matching the override's own single
+// `basis` — the other stays `null`, exactly like a catalog-resolved row that only priced
+// one basis.
+function buildOverrideResolvedPrice(override: { amount: string; basis: 'net' | 'gross' }): ResolvedLinePrice {
+  const amount = Number(override.amount)
+  return {
+    amountNet: override.basis === 'net' ? amount : null,
+    amountGross: override.basis === 'gross' ? amount : null,
+    taxRatePercent: null,
+    priceRow: null,
+    currentTier: null,
+  } as ResolvedLinePrice
+}
+
+// Release 5, Step 3.5 — gates `unitPriceOverride` to the one caller allowed to set it: the
+// trusted pay-link seeding path (`buildTrustedCommandContext`'s `systemActor` branch,
+// cart §6a.4/R22) adding a line to the `pay_link` cart it just created. Any other caller
+// supplying the field — a programming error, since no public schema ever exposes it — is
+// rejected rather than silently honored or silently dropped.
+function assertUnitPriceOverrideAllowed(ctx: CommandRuntimeContext, cart: Cart): void {
+  const allowed = ctx.systemActor === true && cart.channel === 'pay_link'
+  if (!allowed) {
+    throw forbidden('[internal] unitPriceOverride may only be set by the trusted pay-link seeding path')
+  }
 }
 
 export function applyPriceSnapshot(line: CartLine, resolved: ResolvedLinePrice, pricedAt: Date): void {
@@ -887,6 +917,9 @@ export type CartLinesAddInput = CartLineAuthInput & {
   metadata?: Record<string, unknown> | null
   addedByActorType?: CartLineActorType
   addedByActorId?: string | null
+  /** Release 5, Step 3.5 (D-R5-19) — trusted pay-link seeding only; see
+   * `assertUnitPriceOverrideAllowed`. Never part of a public `.strict()` HTTP schema. */
+  unitPriceOverride?: { amount: string; basis: 'net' | 'gross' } | null
 }
 
 export type CartLinesAddOutcome =
@@ -908,6 +941,10 @@ const addLineCommand: CommandHandler<CartLinesAddInput, CartLinesAddOutcome> = {
     const cart = await loadMutableCart(em, scope, input.cartId, { requireActive: true })
     assertStorefrontHasRouteContext(cart, input)
     const assortmentScope = resolveEnforcedScope(cart, rawScope)
+
+    // Release 5, Step 3.5 (D-R5-19) — checked before any other work so a disallowed
+    // override never reaches a price-row fetch or a persisted line.
+    if (input.unitPriceOverride != null) assertUnitPriceOverrideAllowed(ctx, cart)
 
     const requestedQuantity = toQuantityNumber(input.quantity)
     if (!(requestedQuantity > 0)) throw badRequest('[internal] quantity must be greater than zero')
@@ -976,8 +1013,12 @@ const addLineCommand: CommandHandler<CartLinesAddInput, CartLinesAddOutcome> = {
           }
           if (sumCheck.status === 'accepted_clamped') warnings.push('quantity_capped')
 
-          const resolved = await resolveLinePricing(em, ctx.container, cart, rows, sumCheck.quantity, now)
-          if (!resolved.priceRow) {
+          // Release 5, Step 3.5 (D-R5-19) — a merchant override bypasses catalog
+          // resolution entirely, so an unpriceable product never blocks it.
+          const resolved = input.unitPriceOverride != null
+            ? buildOverrideResolvedPrice(input.unitPriceOverride)
+            : await resolveLinePricing(em, ctx.container, cart, rows, sumCheck.quantity, now)
+          if (!resolved.priceRow && input.unitPriceOverride == null) {
             outcome = { status: 'rejected', reason: 'product_not_priceable' }
             return
           }
@@ -1001,8 +1042,11 @@ const addLineCommand: CommandHandler<CartLinesAddInput, CartLinesAddOutcome> = {
           return
         }
 
-        const resolved = await resolveLinePricing(em, ctx.container, cart, rows, acceptedQuantity, now)
-        if (!resolved.priceRow) {
+        // Release 5, Step 3.5 (D-R5-19) — same override bypass as the merge branch above.
+        const resolved = input.unitPriceOverride != null
+          ? buildOverrideResolvedPrice(input.unitPriceOverride)
+          : await resolveLinePricing(em, ctx.container, cart, rows, acceptedQuantity, now)
+        if (!resolved.priceRow && input.unitPriceOverride == null) {
           outcome = { status: 'rejected', reason: 'product_not_priceable' }
           return
         }
@@ -1022,6 +1066,7 @@ const addLineCommand: CommandHandler<CartLinesAddInput, CartLinesAddOutcome> = {
           optionValues: fields.optionValues,
           quantity: String(acceptedQuantity),
           origin: 'customer' as const,
+          unitPriceOverride: input.unitPriceOverride ?? null,
           promotionId: null,
           discountTotalNet: null,
           flagState: null,

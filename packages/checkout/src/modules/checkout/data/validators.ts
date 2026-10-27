@@ -293,12 +293,20 @@ export type UpdateLinkInput = z.infer<typeof updateLinkSchema>
 export type CreateTransactionInput = z.infer<typeof transactionCreateSchema>
 export type UpdateTransactionStatusInput = z.infer<typeof transactionUpdateStatusSchema>
 
-// Release 5, Step 2.12 (B.1, §9.0). Only `{ source: 'cart' }` is accepted today —
-// `{ source: 'link' }` (B.2, merchant-initiated simple-checkout links) lands in Step 3.5;
-// sending it now fails validation with a `400`, not a silent no-op.
-export const checkoutSessionCreateSchema = z.object({
-  source: z.literal('cart'),
-})
+// Release 5, Step 2.12 (B.1) / Step 3.5 (B.2, §9.0). `{ source: 'cart' }` is the
+// buyer-initiated path (X-Cart-Token). `{ source: 'link' }` is merchant-initiated
+// (D-R5-19): a bare `slug` of a `checkoutType: 'simple_checkout'` `CheckoutLink` — a
+// `checkoutType: 'pay_link'` link never reaches `checkout.session.create` at all (Phase A
+// keeps its own cart-less path, C10).
+export const checkoutSessionCreateSchema = z.discriminatedUnion('source', [
+  z.object({
+    source: z.literal('cart'),
+  }),
+  z.object({
+    source: z.literal('link'),
+    slug: requiredTrimmedString('checkout.validation.common.required'),
+  }),
+])
 
 // §9's route table: `PATCH /sessions/current` — "Contact, addresses, consent, terms
 // acceptance". Step/delivery/payment fields (§5.2, B.3) are not part of this Step's

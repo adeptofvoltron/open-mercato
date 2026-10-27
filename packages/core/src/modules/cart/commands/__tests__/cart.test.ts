@@ -415,6 +415,112 @@ describe('cart.create', () => {
     expect(em.flush).not.toHaveBeenCalled()
   })
 
+  // Release 5, Step 3.5 (D-R5-19, cart §6a.4 rev 10, R22) — the trusted `systemActor`
+  // context checkout's pay-link cart seeding builds via `buildTrustedCommandContext` has no
+  // `auth` at all, so it cannot pass the normal RBAC feature check. It is accepted for
+  // `channel: 'pay_link'` ONLY; every other channel still requires a real feature grant.
+  describe('trusted systemActor path — D-R5-19/R22', () => {
+    function makeSystemCtx(opts: { em: unknown; dataEngine: unknown }) {
+      return { ...makeCtx({ em: opts.em, dataEngine: opts.dataEngine }), systemActor: true }
+    }
+
+    it('creates a pay_link cart with no auth and no RBAC check, using the input tenantId fallback', async () => {
+      const handler = commandRegistry.get<CartCreateCommandInput, CartCreateResult>('cart.create')
+      const { em, getCreated } = makeEm()
+      const dataEngine = makeDataEngine()
+      const ctx = { ...makeSystemCtx({ em, dataEngine }), selectedOrganizationId: ORG_ID }
+
+      const result = await handler!.execute(
+        {
+          channel: 'pay_link',
+          storeId: null,
+          salesChannelId: null,
+          currencyCode: 'USD',
+          locale: 'en',
+          taxMode: 'gross',
+          customerId: null,
+          customerUserId: null,
+          email: null,
+          tenantId: TENANT_ID,
+        },
+        ctx,
+      )
+
+      expect(result.channel).toBe('pay_link')
+      expect(result.tenantId).toBe(TENANT_ID)
+      expect(result.organizationId).toBe(ORG_ID)
+      expect(getCreated()!.channel).toBe('pay_link')
+      expect(em.flush).toHaveBeenCalledTimes(1)
+    })
+
+    it.each(['pos', 'agent', 'api'] as const)(
+      'rejects a systemActor context creating a "%s" cart and persists nothing',
+      async (channel) => {
+        const handler = commandRegistry.get<CartCreateCommandInput, CartCreateResult>('cart.create')
+        const { em, getCreated } = makeEm()
+        const dataEngine = makeDataEngine()
+        const ctx = { ...makeSystemCtx({ em, dataEngine }), selectedOrganizationId: ORG_ID }
+
+        let captured: unknown
+        try {
+          await handler!.execute(
+            {
+              channel,
+              storeId: null,
+              salesChannelId: null,
+              currencyCode: 'USD',
+              locale: 'en',
+              taxMode: 'gross',
+              customerId: null,
+              customerUserId: null,
+              email: null,
+              tenantId: TENANT_ID,
+            },
+            ctx,
+          )
+        } catch (err) {
+          captured = err
+        }
+
+        expect(isCrudHttpError(captured)).toBe(true)
+        expect((captured as { status: number }).status).toBe(403)
+        expect(getCreated()).toBeNull()
+        expect(em.persist).not.toHaveBeenCalled()
+      },
+    )
+
+    it('without a tenantId fallback and no auth, rejects with 400 rather than crashing', async () => {
+      const handler = commandRegistry.get<CartCreateCommandInput, CartCreateResult>('cart.create')
+      const { em } = makeEm()
+      const dataEngine = makeDataEngine()
+      const ctx = { ...makeSystemCtx({ em, dataEngine }), selectedOrganizationId: ORG_ID }
+
+      let captured: unknown
+      try {
+        await handler!.execute(
+          {
+            channel: 'pay_link',
+            storeId: null,
+            salesChannelId: null,
+            currencyCode: 'USD',
+            locale: 'en',
+            taxMode: 'gross',
+            customerId: null,
+            customerUserId: null,
+            email: null,
+            tenantId: null,
+          },
+          ctx,
+        )
+      } catch (err) {
+        captured = err
+      }
+
+      expect(isCrudHttpError(captured)).toBe(true)
+      expect((captured as { status: number }).status).toBe(400)
+    })
+  })
+
   // Step 2.9 (§6a.4/D-R5-22) — the trusted-path buyer-identity fill. Before this step a
   // trusted `pos`/`pay_link`/`agent`/`api` cart created for a known customer stored
   // `customerIds = [customerId]`, `customerGroupIds = []`, `priceKindId = null` straight

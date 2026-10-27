@@ -299,6 +299,7 @@ export class CartLine {
     | 'uomSnapshot'
     | 'unitPriceNet'
     | 'unitPriceGross'
+    | 'unitPriceOverride'
     | 'taxRate'
     | 'priceKindId'
     | 'priceRowId'
@@ -363,6 +364,17 @@ export class CartLine {
 
   @Property({ name: 'unit_price_gross', type: 'numeric', precision: 16, scale: 4, nullable: true })
   unitPriceGross?: string | null
+
+  // Release 5, Step 3.5 (D-R5-19, cart §6a.4 rev 10). Written ONLY by the trusted pay-link
+  // seeding path (`commands/lines.ts#addLineCommand`, gated on `ctx.systemActor === true`
+  // and `cart.channel === 'pay_link'`), from the checkout link template's own
+  // `unit_price_override`. When set, `lib/reprice.ts#buildCartLineRepricePhases` excludes
+  // the line from catalog re-pricing — the same "never silently overwrite a deliberately
+  // non-catalog price" exclusion already applied to gift (`origin: 'promotion'`) lines —
+  // so the line keeps the merchant's fixed price regardless of buyer identity. No public
+  // body can set it; this field is never part of a `.strict()` HTTP schema.
+  @Property({ name: 'unit_price_override', type: 'jsonb', nullable: true })
+  unitPriceOverride?: { amount: string; basis: 'net' | 'gross' } | null
 
   @Property({ name: 'tax_rate', type: 'numeric', precision: 7, scale: 4, nullable: true })
   taxRate?: string | null

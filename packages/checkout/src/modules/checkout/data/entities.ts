@@ -238,6 +238,93 @@ export class CheckoutLink extends CheckoutLinkTemplate {
   isLocked: boolean = false
 }
 
+// Release 5, Step 3.5 (checkout §4.3, D-R5-19). Merchant-defined lines that seed a cart on
+// first visit, for a `checkoutType: 'simple_checkout'` link ONLY — a Phase A
+// `checkoutType: 'pay_link'` link never reads this table and keeps its existing,
+// cart-less path end to end (C10, no regression).
+//
+// Scope cut (not in this Step's own Implementation list): no admin route writes these
+// rows yet — a later Step adds the `CrudForm` sub-resource editor (§4.3's own "edited
+// inside the link's CrudForm and saved with it, guarded by the parent's `updatedAt`").
+// `product_id` is REQUIRED here (not the spec's nullable "catalog reference, or freeform
+// for non-catalog items") because `cart.lines.add` has no freeform/non-catalog line path
+// today; a freeform template line is a documented follow-up gap, not built in this Step.
+@Entity({ tableName: 'checkout_link_cart_templates' })
+@Index({ properties: ['organizationId', 'tenantId', 'deletedAt'] })
+@Index({ properties: ['linkId', 'sortOrder'] })
+export class CheckoutLinkCartTemplate {
+  [OptionalProps]?:
+    | 'variantId'
+    | 'description'
+    | 'sku'
+    | 'quantity'
+    | 'unitPriceOverride'
+    | 'imageUrl'
+    | 'isQuantityEditable'
+    | 'sortOrder'
+    | 'createdAt'
+    | 'updatedAt'
+    | 'deletedAt'
+
+  @PrimaryKey({ type: 'uuid', defaultRaw: 'gen_random_uuid()' })
+  id!: string
+
+  @Property({ name: 'organization_id', type: 'uuid' })
+  organizationId!: string
+
+  @Property({ name: 'tenant_id', type: 'uuid' })
+  tenantId!: string
+
+  /** `checkout.CheckoutLink.id` (FK-id, no ORM relation — this module's own table). */
+  @Property({ name: 'link_id', type: 'uuid' })
+  linkId!: string
+
+  /** `catalog.CatalogProduct.id` (FK-id, cross-module — no ORM relation). */
+  @Property({ name: 'product_id', type: 'uuid' })
+  productId!: string
+
+  @Property({ name: 'variant_id', type: 'uuid', nullable: true })
+  variantId?: string | null
+
+  @Property({ type: 'text' })
+  name!: string
+
+  @Property({ type: 'text', nullable: true })
+  description?: string | null
+
+  @Property({ type: 'text', nullable: true })
+  sku?: string | null
+
+  @Property({ type: 'integer', default: 1 })
+  quantity: number = 1
+
+  /** Null -> resolve from catalog for the buyer (D-R5-19); set -> the merchant's fixed
+   * price, applied verbatim regardless of buyer identity. */
+  @Property({ name: 'unit_price_override', type: 'numeric', precision: 12, scale: 2, nullable: true })
+  unitPriceOverride?: string | null
+
+  @Property({ name: 'currency_code', type: 'text' })
+  currencyCode!: string
+
+  @Property({ name: 'image_url', type: 'text', nullable: true })
+  imageUrl?: string | null
+
+  @Property({ name: 'is_quantity_editable', type: 'boolean', default: false })
+  isQuantityEditable: boolean = false
+
+  @Property({ name: 'sort_order', type: 'integer', default: 0 })
+  sortOrder: number = 0
+
+  @Property({ name: 'created_at', type: Date, onCreate: () => new Date() })
+  createdAt: Date = new Date()
+
+  @Property({ name: 'updated_at', type: Date, onUpdate: () => new Date() })
+  updatedAt: Date = new Date()
+
+  @Property({ name: 'deleted_at', type: Date, nullable: true })
+  deletedAt?: Date | null
+}
+
 @Entity({ tableName: 'checkout_transactions' })
 @Index({ properties: ['organizationId', 'tenantId', 'linkId', 'status'] })
 @Index({ properties: ['organizationId', 'tenantId', 'createdAt'] })
@@ -574,4 +661,11 @@ export class CheckoutSessionEvent {
   createdAt: Date = new Date()
 }
 
-export default [CheckoutLinkTemplate, CheckoutLink, CheckoutTransaction, CheckoutSession, CheckoutSessionEvent]
+export default [
+  CheckoutLinkTemplate,
+  CheckoutLink,
+  CheckoutLinkCartTemplate,
+  CheckoutTransaction,
+  CheckoutSession,
+  CheckoutSessionEvent,
+]

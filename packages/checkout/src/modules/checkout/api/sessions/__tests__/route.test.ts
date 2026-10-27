@@ -90,11 +90,24 @@ describe('POST /api/checkout/sessions', () => {
     expect(mockCommandExecute).not.toHaveBeenCalled()
   })
 
-  it('rejects an unsupported source (B.2 link creation is not built yet) with 400, not a silent no-op', async () => {
-    const response = await POST(makeRequest({ source: 'link', slug: 'donate' }, { 'X-Cart-Token': 'cart-token-1' }))
+  it('rejects a malformed body (neither a cart token nor a link slug) with 400, not a silent no-op', async () => {
+    const response = await POST(makeRequest({ source: 'link' }))
 
     expect(response.status).toBe(400)
     expect(mockCommandExecute).not.toHaveBeenCalled()
+  })
+
+  // Release 5, Step 3.5 (B.2, D-R5-19) — `{ source: 'link', slug }` now dispatches to the
+  // command exactly like `{ source: 'cart' }` does; no `X-Cart-Token` header is read or
+  // required for this source.
+  it('dispatches { source: "link", slug } to the command with the slug, no cart token required', async () => {
+    const response = await POST(makeRequest({ source: 'link', slug: 'donate' }))
+
+    expect(response.status).toBe(201)
+    expect(mockCommandExecute).toHaveBeenCalledWith(
+      'checkout.session.create',
+      expect.objectContaining({ input: expect.objectContaining({ source: 'link', slug: 'donate' }) }),
+    )
   })
 
   it('maps the command 503 (C10/D-R5-18) straight through, never a 500', async () => {

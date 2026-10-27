@@ -1,5 +1,5 @@
 import type { EntityManager } from '@mikro-orm/postgresql'
-import type { CommandHandler, CommandRuntimeContext } from '@open-mercato/shared/lib/commands'
+import type { CommandBus, CommandHandler, CommandRuntimeContext } from '@open-mercato/shared/lib/commands'
 import { registerCommand } from '@open-mercato/shared/lib/commands'
 import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 import { enforceCommandOptimisticLockWithGuards } from '@open-mercato/shared/lib/crud/optimistic-lock-command'
@@ -7,9 +7,14 @@ import { findOneWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 // `checkout` and `customer_accounts` are both `packages/core` modules — see
 // `lib/currentSessionRoute.ts`'s header note for the same precedent.
 import { getCustomerAuthFromRequest } from '@open-mercato/core/modules/customer_accounts/lib/customerAuth'
-import { CheckoutSession } from '../data/entities'
+import { CheckoutLink, CheckoutSession } from '../data/entities'
 import type { CheckoutSessionUpdateInput } from '../data/validators'
 import { lookupCartPeerByToken } from '../lib/cartPeer'
+import {
+  assertCartMatchesCheckoutScope,
+  resolveRequestStoreIdForConsistencyCheck,
+} from '../lib/cartSessionConsistency'
+import { seedCartFromCheckoutLink } from '../lib/payLinkCartSeed'
 import { generateCheckoutSessionToken } from '../lib/sessionToken'
 import { assertValidCheckoutSessionTransition } from '../lib/session-status-machine'
 import { writeSessionEvent } from '../lib/sessionEvents'
@@ -94,21 +99,35 @@ async function supersedeOpenSessionsForCart(
   }
 }
 
-export type CheckoutSessionCreateCommandInput = {
-  source: 'cart'
-  cartToken: string
-  request?: Request | null
-}
+export type CheckoutSessionCreateCommandInput =
+  | { source: 'cart'; cartToken: string; request?: Request | null }
+  // Release 5, Step 3.5 (B.2, D-R5-19): merchant-initiated, a bare link slug. Only a
+  // `checkoutType: 'simple_checkout'` link reaches this branch — a `checkoutType:
+  // 'pay_link'` link 404s here (Phase A keeps its own cart-less path end to end, C10).
+  | { source: 'link'; slug: string; request?: Request | null }
 
 export type CheckoutSessionCreateResult = {
   token: string
   session: CheckoutSession
 }
 
+/** Common shape both `source` branches resolve into before the shared session-persist
+ * tail below — a cart peer read for `'cart'`, a freshly-seeded cart for `'link'`. */
+type ResolvedSessionCart = {
+  id: string
+  tenantId: string
+  organizationId: string
+  storeId: string | null
+  channel: string
+  currencyCode: string
+  locale: string
+  customerId: string | null
+  customerUserId: string | null
+}
+
 /**
- * `POST /api/checkout/sessions` { source: 'cart' } (§9.0, B.1). `{ source: 'link' }`
- * (merchant-initiated simple-checkout links, B.2) is Step 3.5's own scope — rejected by
- * the route's own zod validator before this command is ever reached.
+ * `POST /api/checkout/sessions` — `{ source: 'cart' }` (§9.0, B.1) or `{ source: 'link' }`
+ * (merchant-initiated simple-checkout links, B.2, Step 3.5).
  */
 const createSessionCommand: CommandHandler<CheckoutSessionCreateCommandInput, CheckoutSessionCreateResult> = {
   id: 'checkout.session.create',
@@ -117,27 +136,86 @@ const createSessionCommand: CommandHandler<CheckoutSessionCreateCommandInput, Ch
     assertCartPeerAvailable(ctx)
     const em = ctx.container.resolve('em') as EntityManager
 
-    // Scope-free, FK-id + snapshot read (`lib/cartPeer.ts`) — a bare cart token is the
-    // only credential a guest buyer holds (§9.0), so there is no tenant/organization to
-    // filter by until AFTER this resolves. The found row's own scope becomes the new
-    // session's ground truth.
-    const cart = await lookupCartPeerByToken(em, input.cartToken)
-    if (!cart || cart.kind !== 'basket') {
-      throw new CrudHttpError(404, { error: '[internal] cart not found' })
-    }
-    if (cart.status !== 'active') {
-      throw new CrudHttpError(409, { error: '[internal] cart is not active', code: 'cart_not_active' })
-    }
+    let cart: ResolvedSessionCart
+    let linkId: string | null = null
 
-    // D-R5-21-style identity binding, applied at session CREATION too — §9.0's own text:
-    // "When the cart has customer_user_id, the request must also carry the matching
-    // customer session ... otherwise 404 with the unknown-cart body (D-R5-21)."
-    if (cart.customerUserId) {
-      const auth = input.request ? await getCustomerAuthFromRequest(input.request) : null
-      if (!auth || auth.sub !== cart.customerUserId) {
+    if (input.source === 'cart') {
+      // Scope-free, FK-id + snapshot read (`lib/cartPeer.ts`) — a bare cart token is the
+      // only credential a guest buyer holds (§9.0), so there is no tenant/organization to
+      // filter by until AFTER this resolves. The found row's own scope becomes the new
+      // session's ground truth.
+      const found = await lookupCartPeerByToken(em, input.cartToken)
+      if (!found || found.kind !== 'basket') {
         throw new CrudHttpError(404, { error: '[internal] cart not found' })
       }
+      if (found.status !== 'active') {
+        throw new CrudHttpError(409, { error: '[internal] cart is not active', code: 'cart_not_active' })
+      }
+
+      // D-R5-21-style identity binding, applied at session CREATION too — §9.0's own text:
+      // "When the cart has customer_user_id, the request must also carry the matching
+      // customer session ... otherwise 404 with the unknown-cart body (D-R5-21)."
+      if (found.customerUserId) {
+        const auth = input.request ? await getCustomerAuthFromRequest(input.request) : null
+        if (!auth || auth.sub !== found.customerUserId) {
+          throw new CrudHttpError(404, { error: '[internal] cart not found' })
+        }
+      }
+      cart = found
+    } else {
+      const link = await findOneWithDecryption(em, CheckoutLink, { slug: input.slug, deletedAt: null })
+      // A `checkoutType: 'pay_link'` link (Phase A) never passes through `CheckoutSession`
+      // at all (§3.2) — the identical not-found body a nonexistent slug gets, so this
+      // branch discloses nothing about which case is true.
+      if (!link || link.checkoutType !== 'simple_checkout') {
+        throw new CrudHttpError(404, { error: '[internal] checkout link not found' })
+      }
+      const commandBus = ctx.container.resolve('commandBus') as CommandBus
+      const seeded = await seedCartFromCheckoutLink({
+        em,
+        container: ctx.container,
+        commandBus,
+        link,
+        request: input.request,
+      })
+      linkId = link.id
+      cart = {
+        id: seeded.cartId,
+        tenantId: seeded.tenantId,
+        organizationId: seeded.organizationId,
+        storeId: seeded.storeId,
+        channel: seeded.channel,
+        currencyCode: seeded.currencyCode,
+        locale: seeded.locale,
+        customerId: seeded.customerId,
+        customerUserId: seeded.customerUserId,
+      }
     }
+
+    // C9 (D-R5-19, X13). The session about to be persisted copies the cart's own
+    // channel/currency/tenant/organization VERBATIM, so those four comparisons are
+    // tautological by construction on this path — the one check with real teeth here is
+    // the store comparison, against a FRESH request-resolved store (a storefront cart
+    // token presented on the wrong store's host). Running the full, reusable guard here
+    // (not a narrowed one) means Step 4.1's submit-time call exercises the IDENTICAL
+    // function, never a second implementation of the same four comparisons.
+    const resolvedStoreId = await resolveRequestStoreIdForConsistencyCheck(ctx.container, cart.storeId, input.request)
+    assertCartMatchesCheckoutScope({
+      cart: {
+        storeId: cart.storeId,
+        channel: cart.channel,
+        currencyCode: cart.currencyCode,
+        tenantId: cart.tenantId,
+        organizationId: cart.organizationId,
+      },
+      session: {
+        channel: cart.channel,
+        currencyCode: cart.currencyCode,
+        tenantId: cart.tenantId,
+        organizationId: cart.organizationId,
+      },
+      resolvedStoreId,
+    })
 
     await supersedeOpenSessionsForCart(em, {
       tenantId: cart.tenantId,
@@ -153,6 +231,7 @@ const createSessionCommand: CommandHandler<CheckoutSessionCreateCommandInput, Ch
       tokenHash,
       cartId: cart.id,
       storeId: cart.storeId,
+      linkId,
       channel: cart.channel as CheckoutSession['channel'],
       status: 'open',
       step: 'contact',

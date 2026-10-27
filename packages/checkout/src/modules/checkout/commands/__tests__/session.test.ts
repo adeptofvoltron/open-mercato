@@ -114,7 +114,15 @@ function makeFakeEm() {
   return em
 }
 
-function makeCtx(em: unknown, opts: { cartServiceAvailable?: boolean } = {}): CommandRuntimeContext {
+function makeCtx(
+  em: unknown,
+  opts: {
+    cartServiceAvailable?: boolean
+    storeContextService?: unknown
+    commandBus?: unknown
+    request?: Request
+  } = {},
+): CommandRuntimeContext {
   const cartServiceAvailable = opts.cartServiceAvailable ?? true
   return {
     container: {
@@ -124,6 +132,14 @@ function makeCtx(em: unknown, opts: { cartServiceAvailable?: boolean } = {}): Co
           if (!cartServiceAvailable) throw new Error('cartService is not registered')
           return {}
         }
+        if (token === 'storeContextService') {
+          if (opts.storeContextService !== undefined) return opts.storeContextService
+          throw new Error('storeContextService is not registered')
+        }
+        if (token === 'commandBus') {
+          if (opts.commandBus !== undefined) return opts.commandBus
+          throw new Error('commandBus is not registered')
+        }
         throw new Error(`Unexpected DI token: ${token}`)
       },
       register: jest.fn(),
@@ -132,7 +148,7 @@ function makeCtx(em: unknown, opts: { cartServiceAvailable?: boolean } = {}): Co
     selectedOrganizationId: null,
     organizationScope: null,
     organizationIds: null,
-    request: undefined as any,
+    request: opts.request as any,
   }
 }
 
@@ -210,8 +226,15 @@ describe('checkout.session.create (B.1)', () => {
   it('copies the cart scope and identity onto the new session', async () => {
     cartPeerRow = makeCartPeerRow({ customer_id: 'customer-1', customer_user_id: null, store_id: 'store-1' })
     const em = makeFakeEm()
-    const ctx = makeCtx(em)
-    const input: CheckoutSessionCreateCommandInput = { source: 'cart', cartToken: CART_TOKEN }
+    // Release 5, Step 3.5 (C9) — a non-null `cart.storeId` now requires a resolvable
+    // store context; the resolved store matches the cart's own, so this stays a pass.
+    const resolve = jest.fn(async () => ({ store: { id: 'store-1' } }))
+    const ctx = makeCtx(em, { storeContextService: { resolve } })
+    const input: CheckoutSessionCreateCommandInput = {
+      source: 'cart',
+      cartToken: CART_TOKEN,
+      request: new Request('https://merchant.example'),
+    }
 
     const result = await createSessionCommand.execute(input, ctx)
 

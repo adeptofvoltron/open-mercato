@@ -223,6 +223,44 @@ describe('buildCartLineRepricePhases', () => {
     expect(giftLine.unitPriceNet).toBe('0')
   })
 
+  // Release 5, Step 3.5 (D-R5-19) — a trusted pay-link line carrying `unitPriceOverride`
+  // is excluded EAGERLY, the identical reasoning as the gift-line exclusion above: running
+  // it through catalog resolution would silently overwrite the merchant's fixed price with
+  // the real catalog price on the very next re-price trigger (a buyer login, a currency
+  // change, staleness).
+  it('excludes a unitPriceOverride line from re-pricing, same as a gift line', async () => {
+    const cart = makeCart()
+    const pricableLine = makeLine({ id: 'line-1' })
+    const overrideLine = makeLine({
+      id: 'line-2',
+      unitPriceOverride: { amount: '49.00', basis: 'gross' },
+      unitPriceNet: null,
+      unitPriceGross: '49',
+      priceRowId: null,
+    })
+    const container = makeContainer({})
+
+    const changes: CartPriceChange[] = []
+    const touched: CartLine[] = []
+    const phases = buildCartLineRepricePhases(
+      em,
+      container,
+      cart,
+      [pricableLine, overrideLine],
+      'stale_snapshot',
+      new Date('2026-02-01T00:00:00.000Z'),
+      changes,
+      touched,
+    )
+
+    expect(phases).toHaveLength(1)
+    for (const phase of phases) await phase()
+
+    expect(touched).toEqual([pricableLine])
+    expect(overrideLine.unitPriceGross).toBe('49')
+    expect(overrideLine.priceRowId).toBeNull()
+  })
+
   // QA F14 — `fetchLinePriceRows`'s `targetClause` is `{ $or: [{ product: productId }, {
   // variant: variantId }] }`, and every variant's price row ALSO carries the parent
   // `product_id` (not just `variant_id`), so the `{ product: productId }` arm returns every

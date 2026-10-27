@@ -80,7 +80,7 @@ export async function POST(req: Request) {
     if (rateLimited) return rateLimited
 
     const rawBody = (await readJsonSafe<Record<string, unknown>>(req, {})) ?? {}
-    let parsed: { source: 'cart' }
+    let parsed: z.infer<typeof checkoutSessionCreateSchema>
     try {
       parsed = checkoutSessionCreateSchema.parse(rawBody)
     } catch (err) {
@@ -90,12 +90,18 @@ export async function POST(req: Request) {
       throw err
     }
 
-    const cartToken = readCartTokenHeader(req)
-    if (!cartToken) {
-      return NextResponse.json(
-        { error: `[internal] ${CART_TOKEN_HEADER} header is required`, code: 'cart_not_found' },
-        { status: 404 },
-      )
+    let input: CheckoutSessionCreateCommandInput
+    if (parsed.source === 'cart') {
+      const cartToken = readCartTokenHeader(req)
+      if (!cartToken) {
+        return NextResponse.json(
+          { error: `[internal] ${CART_TOKEN_HEADER} header is required`, code: 'cart_not_found' },
+          { status: 404 },
+        )
+      }
+      input = { source: 'cart', cartToken, request: req }
+    } else {
+      input = { source: 'link', slug: parsed.slug, request: req }
     }
 
     const commandBus = container.resolve('commandBus') as CommandBus
@@ -107,7 +113,6 @@ export async function POST(req: Request) {
       organizationIds: null,
       request: req,
     }
-    const input: CheckoutSessionCreateCommandInput = { source: parsed.source, cartToken, request: req }
     const { result } = await commandBus.execute<CheckoutSessionCreateCommandInput, CheckoutSessionCreateResult>(
       createSessionCommand.id,
       { input, ctx },

@@ -1576,3 +1576,122 @@ pre-existing guest-merge/undo/sweeper test passes unchanged.
 - Decisions/problems: the Checkpoint 6 vs. post-3.1 typecheck discrepancy remains unexplained
   (logged, not papered over); mitigated going forward by wiping tsbuildinfo before every forced
   checkpoint typecheck. `cart`'s Phase 3 scope (approval gate + proposal seam) is now complete.
+
+## 2026-10-27T22:00:00Z — Step 3.5 (checkout B.2: cart-backed links — trusted pay-link cart
+seeding D-R5-19 + store/channel/currency mismatch check C9)
+- Third `checkout`-module Step, building on Step 2.12's `CheckoutSession`/step-machine
+  baseline and Step 2.13's delivery/payment listing. Read Step 2.12's own flagged gap
+  closely ("C9 is NOT enforced at session CREATE ... Step 3.5 or a dedicated gap-fill must
+  add the storeContextService.resolve(request, { fresh: true }) + cart_store_mismatch
+  check") and Step 2.9's trusted-path identity fill (`cart/commands/cart.ts`'s
+  `resolveTrustedCartBuyerIdentity`) — this Step's pay-link seeding reuses that exact
+  mechanism for buyer identity, and Step 1.1's `buildTrustedCommandContext` for the audit.
+- **Genuine gap found during implementation, not anticipated by the task brief:** the
+  checkout spec's §4.3 names a brand-new entity, `CheckoutLinkCartTemplate`
+  (`checkout_link_cart_templates`) — "merchant-defined lines that seed a cart on first
+  visit" — which did not exist in code at all (confirmed: zero hits for
+  `unit_price_override`/`CheckoutLinkCartTemplate` anywhere outside the spec/analysis
+  docs). The task brief's own Read-first list implied `CheckoutLink`/`CheckoutLinkTemplate`
+  already carried "the template's line definitions, including whether a line has
+  `unit_price_override`" — they do not; Phase A's `CheckoutLinkTemplate` only ever had
+  `pricingMode` (fixed/custom_amount/price_list), never a lines concept. Built the entity
+  now (additive migration + snapshot), scoped tightly to what seeding needs — see PLAN.md
+  "Decisions taken without the owner" for the full reasoning (product_id required, no
+  freeform line, no admin write route yet).
+- **A second genuine gap, on the `cart` side (D-R5-19, Ask First already approved):** the
+  checkout/cart specs' own "rev 10" text describes a `systemActor` bypass in
+  `cart.create`'s `requireChannelFeature` (accepted for `channel: 'pay_link'` ONLY, R22)
+  and a `CartLine.unitPriceOverride` field — neither existed in the shipped `cart` code
+  through Step 3.4. Closed both, minimally: `requireChannelFeature` now short-circuits for
+  `ctx.systemActor === true && channel === 'pay_link'`, rejecting every other channel the
+  identical way an unauthenticated caller would (new `it.each` test: pos/agent/api all
+  403). `cart.create`'s authenticated-path schema gained an optional `tenantId` field,
+  honored ONLY when `ctx.systemActor` is true (there is no `ctx.auth` to derive tenant
+  scope from otherwise) — `resolveAuthenticatedScope` falls back to it. `CartLine` gained
+  `unitPriceOverride: { amount, basis } | null` (additive migration), and
+  `cart.lines.add` accepts it as an input field gated by the identical `systemActor` +
+  `pay_link` check (`assertUnitPriceOverrideAllowed`) — when present, it bypasses catalog
+  price-row resolution entirely via a synthetic `ResolvedLinePrice` fed through the
+  EXISTING `applyPriceSnapshot` (no duplicated pricing logic). `lib/reprice.ts`'s
+  `buildCartLineRepricePhases` excludes an override line from re-pricing with the exact
+  same one-line pattern already used to exclude gift (`origin: 'promotion'`) lines — "never
+  silently overwrite a deliberately non-catalog price."
+- **Pay-link cart seeding (`lib/payLinkCartSeed.ts`), wired into `checkout.session.create`
+  for `{ source: 'link', slug }`:** only a `checkoutType: 'simple_checkout'` link reaches
+  this branch — a `checkoutType: 'pay_link'` link 404s at this command (identical body to
+  an unknown slug), leaving Phase A's `/pay/[slug]` + `/submit` completely untouched and
+  unaware this code exists. Phase A's own availability checks (active, usage limit,
+  password cookie) are reproduced here, at session-creation time. On success: builds a
+  trusted, request-less context via `buildTrustedCommandContext({ actorType: 'system',
+  reason: 'checkout:pay_link_seed:<linkId>' })` from the LINK's own tenant/organization
+  (never request input); when a customer session is present AND its tenant/organization
+  equal the link's, resolves the buyer's real identity via `storeContextService
+  .resolveForBuyer({ tenantId, organizationId, customerUserId })` with no store (D-R5-13/
+  D-R5-22) and passes it to `cart.create`; calls `cart.create` (channel `pay_link`) then
+  `cart.lines.add` once per template line — both over the REAL command bus, never a direct
+  entity write. A template line's `unitPriceOverride` (merchant-fixed) is passed through
+  as `{ amount, basis: 'gross' }` (judgment call — Phase A's pricing is gross-oriented, and
+  the template entity has no `basis` column of its own); a line with none is omitted,
+  pricing the buyer at their own catalog rate.
+- **C9 (`lib/cartSessionConsistency.ts`), ONE reusable guard wired at session creation for
+  BOTH `source` branches, left ready for Step 4.1 to call again at submit without
+  duplicating the comparisons:** `assertCartMatchesCheckoutScope` (pure — tenant/
+  organization, channel, currency always compared; the store compared only when
+  `cart.storeId` is non-null, X13) plus `resolveRequestStoreIdForConsistencyCheck` (resolves
+  "the store from the request" via soft `storeContextService.resolve(request, { fresh:
+  true })`, `503 checkout_sessions_unavailable` — not `409` — when a non-null-store cart has
+  no resolvable store context at all, matching §3.4's own documented behavior for an absent
+  `ecommerce`). At creation, three of the four comparisons are tautological by construction
+  (the session copies the cart's own fields verbatim) — the store check is the one with
+  real teeth, and it is NEWLY enforced here (Step 2.12's own flagged gap, closed). The link
+  path's cart always has `storeId: null`, so it never even attempts a store resolution —
+  verified by a test with NO `storeContextService` registered at all (would hard-throw if
+  ever consulted).
+- **Regression check (one pre-existing test needed an update, not a design change):**
+  `commands/__tests__/session.test.ts`'s "copies the cart scope and identity onto the new
+  session" test used a `store_id: 'store-1'` cart peer with no `storeContextService` mocked
+  — correctly caught by the new store-resolution requirement. Added a matching
+  `storeContextService.resolve` mock returning `store.id: 'store-1'` (a real match, so the
+  test's own assertions are otherwise unchanged) and a `request` on the input. Every OTHER
+  pre-existing test in that file uses the default `store_id: null` cart peer and needed no
+  change at all. `api/sessions/__tests__/route.test.ts`'s "rejects an unsupported source"
+  test (encoding "B.2 is not built yet") was replaced with a "dispatches { source: 'link',
+  slug } to the command" test plus a narrower 400-on-malformed-body test.
+- **Re-verified, not assumed: the Phase-A-only pay-link flow is completely unaffected.**
+  `index.ts` was not touched (no new `requires`) — the existing
+  `__tests__/phase-a-non-regression.test.ts` (C10's own static-contract guard from Step
+  2.12) ran as part of the full suite below and passed unchanged; no file under
+  `api/pay/**` was touched; `checkout.session.create`'s `source: 'link'` branch is reachable
+  only for `checkoutType: 'simple_checkout'`, which no admin surface can create yet (no
+  write route for `CheckoutLinkCartTemplate` either) — so no LIVE `checkoutType: 'pay_link'`
+  link's behavior changes in any way.
+- Files: `packages/checkout/src/modules/checkout/data/entities.ts` (+`CheckoutLinkCartTemplate`),
+  `data/validators.ts` (+`{ source: 'link', slug }` on `checkoutSessionCreateSchema`,
+  discriminated union), `migrations/Migration20261027220000.ts` + `.snapshot-open-mercato
+  .json`, `commands/session.ts` (`source: 'link'` branch, C9 wiring for both branches),
+  `lib/payLinkCartSeed.ts` (new), `lib/cartSessionConsistency.ts` (new),
+  `api/sessions/route.ts` (link slug dispatch). Cross-module: `packages/core/src/modules/
+  cart/commands/cart.ts` (`requireChannelFeature` systemActor bypass,
+  `resolveAuthenticatedScope` trusted tenantId fallback), `cart/data/validators.ts`
+  (+`tenantId` on `cartCreateInputSchema`), `cart/data/entities.ts`
+  (+`CartLine.unitPriceOverride`), `cart/commands/lines.ts` (override bypass +
+  `assertUnitPriceOverrideAllowed`), `cart/lib/reprice.ts` (override-line exclusion),
+  `cart/migrations/Migration20261027210000_cart.ts` + `.snapshot-open-mercato.json`. Tests
+  added: `checkout/commands/__tests__/session.link-seed.test.ts` (12 cases — seeding,
+  override pricing, buyer identity, cross-tenant guest fallback, X13 store skip, link-not-
+  found/not-simple-checkout/not-active/usage-limit/password/no-template-lines), `checkout/
+  lib/__tests__/cartSessionConsistency.test.ts` (12 cases — the full C9 matrix plus
+  availability-vs-mismatch degradation), plus extensions to `cart/commands/__tests__/
+  cart.test.ts` (+4), `cart/commands/__tests__/lines.test.ts` (+4), `cart/lib/__tests__/
+  reprice.test.ts` (+1), `checkout/commands/__tests__/session.test.ts` (+1, the storeId
+  regression fix), `checkout/api/sessions/__tests__/route.test.ts` (updated for the new
+  `source: 'link'` dispatch).
+- Checks (local mode, from repo root): `yarn generate` — clean. `yarn workspace
+  @open-mercato/core run typecheck` — clean, exit 0. `yarn workspace @open-mercato/checkout
+  run typecheck` — clean, exit 0. `yarn jest src/modules/cart` (from `packages/core`) —
+  30/30 suites, 427/427 tests, ZERO regressions on Step 2.9's own 30/423 baseline. `yarn
+  workspace @open-mercato/checkout test` — 49/49 suites, 353/353 tests, ZERO regressions on
+  Step 2.13's own 47/328 baseline (re-verified explicitly, including the C10 Phase-A-boot
+  non-regression test). `eslint` clean (0 errors; 1 pre-existing anonymous-default-export
+  style warning on `checkout/data/entities.ts`, unrelated to this Step's own additions) on
+  every changed/new file.

@@ -106,6 +106,13 @@ export const cartCreateInputSchema = z.object({
   customerId: clearableUuidSchema,
   customerUserId: clearableUuidSchema,
   email: clearableStringSchema(320),
+  // Release 5, Step 3.5 (D-R5-19, cart §6a.4 rev 10). Honored ONLY for a trusted
+  // `systemActor` call (e.g. checkout's pay-link cart seeding) — there is no `ctx.auth` to
+  // derive tenant scope from in that case. An authenticated caller's `ctx.auth.tenantId`
+  // stays the source of truth regardless of what this field carries. Not `clearableUuidSchema`
+  // deliberately: `ctx.auth.tenantId` itself is an unvalidated string everywhere else this
+  // module reads it, so this trusted-only fallback holds the same shape, not a stricter one.
+  tenantId: z.preprocess(emptyStringToNull, z.string().trim().min(1).nullable().optional()),
 })
 
 export type CartCreateInput = z.infer<typeof cartCreateInputSchema>

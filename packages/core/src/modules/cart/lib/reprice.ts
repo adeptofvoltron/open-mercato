@@ -214,7 +214,13 @@ export function buildCartLineRepricePhases(
   // safe, since no phase ordered before this one in `cart.reprice`'s sequence ever creates a
   // gift line (`buildPromotionsEffectsPhase` always runs AFTER these phases). `flagState`
   // is NOT filtered here, eagerly — see the per-line check inside the mapped closure below.
-  const eligibleLines = lines.filter((line) => line.origin !== 'promotion')
+  //
+  // Release 5, Step 3.5 (D-R5-19) — a line carrying `unitPriceOverride` (the trusted
+  // pay-link seeding path's merchant-fixed price, `commands/lines.ts#addLineCommand`) is
+  // excluded for the identical reason a gift line is: running it through catalog
+  // resolution would silently overwrite the merchant's fixed price with whatever the
+  // underlying product's real catalog price happens to be on the next re-price trigger.
+  const eligibleLines = lines.filter((line) => line.origin !== 'promotion' && line.unitPriceOverride == null)
 
   return eligibleLines.map((line) => async () => {
     // Step 7.4 — §6a.2: checked again HERE, at this line's own EXECUTION time, rather than
