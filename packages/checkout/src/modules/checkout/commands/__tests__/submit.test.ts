@@ -52,6 +52,7 @@ import { commandRegistry } from '@open-mercato/shared/lib/commands/registry'
 import type { CommandRuntimeContext } from '@open-mercato/shared/lib/commands'
 import { CheckoutSession } from '../../data/entities'
 import type { CheckoutSessionSubmitCommandInput, CheckoutSessionSubmitStageResult } from '../submit'
+import approvalApprovedSubscriber from '../../subscribers/approval-approved'
 
 const mockFindOneWithDecryption = jest.fn()
 jest.mock('@open-mercato/shared/lib/encryption/find', () => ({
@@ -309,6 +310,14 @@ function buildHarness(opts: {
 
   const em: FakeRow = {
     fork: () => em,
+    // Step 5.2's own resume subscriber reads `CheckoutSession` rows via `em.find` (never
+    // `nativeUpdate`'s `findOne`) — additive so the REAL subscriber handler can run against
+    // this SAME `seededSessions` array in the cross-module "resubmit re-hits cart.lock's
+    // gate" test below, not a second, parallel fake.
+    find: jest.fn(async (entity: unknown, where: Record<string, unknown>) => {
+      if (entity === CheckoutSession) return seededSessions.filter((row) => matchesWhere(row, where))
+      return []
+    }),
     nativeUpdate: jest.fn(async (entity: unknown, where: Record<string, unknown>, set: FakeRow) => {
       if (entity === CheckoutSession) {
         const matched = seededSessions.filter((row) => matchesWhere(row, where))
@@ -868,5 +877,76 @@ describe('checkout.session.submit (B.5, §8/C15-C17, D-R5-20/23/26/28 — Step 5
       status: 422,
       body: expect.objectContaining({ code: 'purchase_order_number_required' }),
     })
+  })
+})
+
+// Release 5, Step 5.2 (C11, §8.2 steps 1/3/5) — glue test proving the approval-resume
+// path end to end across TWO real pieces (submit's own `open`-only precondition AND the
+// REAL `approval-approved` resume subscriber), not the subscriber in isolation: a session
+// parked in `awaiting_approval` cannot reach `cart.lock` at all; the subscriber is the
+// ONLY thing that reopens that door; and once reopened, the re-check of the approved
+// amount is `cart.lock`'s own gate (K2, Step 3.1, tested in `cart`'s own suite) — this
+// Step only has to prove checkout surfaces that gate's verdict unchanged on a resubmit.
+describe('approval resume -> resubmit (Step 5.2, C11/§8.2)', () => {
+  // `checkout.session.submit` is already registered by the SUITE ABOVE's own `beforeAll`
+  // (module imports are cached — a second `commandRegistry.clear?.()` here would empty the
+  // registry without a fresh import ever re-running `registerCommand`, since `'../submit'`
+  // is already in Node's module cache). No clear-and-reimport needed in this file twice.
+  beforeEach(() => {
+    jest.clearAllMocks()
+  })
+
+  it('refuses a resubmit while the session is still awaiting_approval (409 session_not_open — the gate is shut)', async () => {
+    const h = buildHarness({ session: makeSession({ status: 'awaiting_approval' }) })
+
+    await expect(getHandler().execute(BASE_INPUT, h.ctx)).rejects.toMatchObject({
+      status: 409,
+      body: expect.objectContaining({ code: 'session_not_open' }),
+    })
+    expect(h.cartService.lock).not.toHaveBeenCalled()
+  })
+
+  it('the REAL approval-approved subscriber reopens the session, and a resubmit reaches cart.lock again', async () => {
+    const h = buildHarness({ session: makeSession({ status: 'awaiting_approval' }) })
+    expect(h.seededSessions[0].status).toBe('awaiting_approval')
+
+    await approvalApprovedSubscriber(
+      { subjectType: 'cart', subjectId: CART_ID, approvalId: 'approval-1', tenantId: TENANT_ID, organizationId: ORG_ID },
+      { resolve: (name: string) => (name === 'em' ? h.ctx.container.resolve('em') : undefined) },
+    )
+    expect(h.seededSessions[0].status).toBe('open')
+
+    await getHandler().execute(BASE_INPUT, h.ctx)
+    expect(h.cartService.lock).toHaveBeenCalledWith(expect.objectContaining({ cartId: CART_ID, checkoutSessionId: SESSION_ID, purpose: 'order' }))
+  })
+
+  it('re-approval on a price rise: cart.lock re-refuses with 409 cart_requires_approval, surfaced unchanged', async () => {
+    const h = buildHarness({ session: makeSession({ status: 'awaiting_approval' }) })
+
+    await approvalApprovedSubscriber(
+      { subjectType: 'cart', subjectId: CART_ID, approvalId: 'approval-1', tenantId: TENANT_ID, organizationId: ORG_ID },
+      { resolve: (name: string) => (name === 'em' ? h.ctx.container.resolve('em') : undefined) },
+    )
+    expect(h.seededSessions[0].status).toBe('open')
+
+    // The cart re-priced above the just-approved amount since the resume — `cart.lock`
+    // (K2, Step 3.1) is the ONLY place this re-check happens; this mock stands in for that
+    // already-tested gate so this Step can assert checkout's own propagation, not re-derive
+    // cart's threshold logic.
+    h.cartService.lock.mockRejectedValueOnce(
+      Object.assign(new Error('[internal] cart_requires_approval'), {
+        status: 409,
+        body: { error: '[internal] cart_requires_approval', code: 'cart_requires_approval' },
+      }),
+    )
+
+    await expect(getHandler().execute(BASE_INPUT, h.ctx)).rejects.toMatchObject({
+      status: 409,
+      body: expect.objectContaining({ code: 'cart_requires_approval' }),
+    })
+    expect(h.cartService.lock).toHaveBeenCalledWith(expect.objectContaining({ cartId: CART_ID, checkoutSessionId: SESSION_ID, purpose: 'order' }))
+    // The session is left `submitting` on this failure path (same as every other
+    // lock-time refusal) — not silently reverted, matching `compensate`'s own documented
+    // "leaked reservation... needs a human" posture for anything past the CAS.
   })
 })

@@ -2363,3 +2363,66 @@ on-account/request_quote payment methods, quote branch — C15-C17/D-R5-20/23/26
   `quote_completed`); `workers/recover-stuck-submits.worker.ts` (+quote-outcome resume
   branch).
 - Opens Phase 5.
+
+## 2026-10-28T06:00:00Z — Step 5.2 landed (checkout approval-resume subscriber C11 +
+session-route identity binding audit D-R5-33, opens the final Phase 5 pair)
+
+- **`POST /sessions/current/request-approval` (`commands/approval.ts`, new).** A thin
+  adapter, as §8.2 step 1 itself frames it: it never creates an approval or stores an
+  approval id, it delegates to `cart.approval.request` (Step 3.2) via the command bus with
+  a plain object input (no compile-time `cart` import, the SAME cross-module shape `lib/
+  payLinkCartSeed.ts` already established), then CASes the session `open -> awaiting_
+  approval` (same-state no-op tolerated for a double-submitted button) behind the standard
+  optimistic-lock guard (`enforceCommandOptimisticLockWithGuards`, matching `selectDelivery
+  Command`'s own precedent, not `submit`'s CAS-by-idempotency-key exception). Confirmed by
+  reading `cart/commands/approval.ts` directly: `cart.approval.request`'s own `loadMutable
+  Cart` already throws `423 cart_locked` for a locked cart (K5), so this command never calls
+  `cart.unlock` itself — by construction (submit's own precondition 7 runs BEFORE `cart.
+  lock`), there is nothing to unlock when this route is reached. Any cart-side refusal (`409
+  approval_requires_identified_buyer`, `409 approval_not_required`, `503 approval_service_
+  unavailable`) propagates unchanged.
+- **Approval-resume subscriber family (C11, §8.2 step 3) — four new subscriber files sharing
+  `lib/approvalResumeSubscriber.ts`.** Mirrors `cart/lib/approvalDecidedSubscriber.ts`'s own
+  one-event-id-per-file shape. Finds the live `awaiting_approval` session for the event's
+  cart/tenant/organization (checkout stores no approval id on the session at all, §8.2's own
+  opening line, so this IS the spec's sole mechanism, not a shortcut) and CASes it: `approved
+  -> open` (`quoted_totals` cleared) + `checkout.session.approval_approved`; `rejected ->
+  failed` (`failure_code: 'approval_rejected'`) + `checkout.session.approval_rejected`;
+  `expired`/`withdrawn -> open` (quoted_totals left as-is — nothing about the cart changed)
+  + `checkout.session.approval_rejected` carrying the real outcome in the payload. See
+  PLAN.md's "Decisions taken without the owner" for the three-way-vs-two-way correction
+  against the task brief's own paraphrase. The CAS `WHERE status = 'awaiting_approval'`
+  (plus the `em.find` prefilter on the same status) makes an at-least-once redelivery safe —
+  a session already resumed simply matches zero rows on either the find or the nativeUpdate.
+- **D-R5-33 audit: no compliance gap found.** Every `/api/checkout/sessions/current/*` route
+  this worktree actually ships (`route.ts`, `delivery`, `delivery-options`, `payment-
+  methods`, `submit`) already calls `lib/currentSessionRoute.ts#resolveCurrentSession` —
+  verified by direct read of each file, not by trusting prior NOTIFY claims. `cancel`/`step`/
+  `payment` are named by §9's route table but were explicitly deferred by Steps 2.12/2.13
+  (confirmed in their own NOTIFY entries) and do not exist in this worktree at all — nothing
+  to audit there. The new `request-approval` route follows the SAME helper.
+- **Test "not just the subscriber in isolation" (C11's own test-priority item): a glue test
+  in `submit.test.ts`'s own harness** proves three things with the REAL `approval-approved`
+  subscriber handler and the REAL `checkout.session.submit` command, not two separate unit
+  tests: (1) a session parked in `awaiting_approval` cannot reach `cart.lock` at all — submit
+  refuses `409 session_not_open` before any precondition read; (2) firing the real subscriber
+  against the SAME fake `em`/`seededSessions` reopens the session to `open`, and a resubmit
+  now reaches `cartService.lock` with the right args; (3) re-approval on a price rise is
+  exactly `cart.lock`'s own `409 cart_requires_approval` (Step 3.1's already-tested gate,
+  mocked here only to stand in for that gate, not re-derive its threshold logic), surfaced by
+  submit UNCHANGED. Added `em.find` support to the harness's fake `em` (additive — nothing
+  else in `submit.ts` calls it) so the real subscriber could run against the exact same
+  session row rather than a second, parallel fake.
+- Files: `packages/checkout/src/modules/checkout/commands/approval.ts` (new),
+  `api/sessions/current/request-approval/route.ts` (new), `lib/approvalResumeSubscriber.ts`
+  (new), `subscribers/approval-{approved,rejected,expired,withdrawn}.ts` (new, 4 files),
+  `events.ts` (+3 `checkout.session.approval_*` ids); tests: `commands/__tests__/
+  approval.test.ts` (new, 7 tests), `lib/__tests__/approvalResumeSubscriber.test.ts` (new,
+  parametrized over 4 outcomes, 20 tests incl. tenant/org isolation + redelivery safety),
+  `commands/__tests__/submit.test.ts` (+3 glue tests, +`em.find` harness support). `yarn
+  generate` run — new route/command/subscribers confirmed present in `apps/mercato/.mercato/
+  generated/*` (gitignored, not committed).
+- Full `checkout` suite: 55/55 test suites, 462/462 tests green. Full `cart`+`customer_groups`
+  suites (`packages/core`): 75/77 passed, 2 pre-existing skips, 918/926 tests green, zero
+  regressions. `packages/checkout` typecheck clean after a full `tsconfig.tsbuildinfo` wipe.
+- Closes Phase 5's checkout half; 5.3/5.4 (`assisted_selling`) remain.

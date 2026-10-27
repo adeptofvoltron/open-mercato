@@ -41,6 +41,13 @@ const events = [
   { id: 'checkout.payment.initiated', label: 'Checkout Payment Initiated', entity: 'session', category: 'lifecycle' },
   { id: 'checkout.payment.succeeded', label: 'Checkout Payment Succeeded', entity: 'session', category: 'lifecycle' },
   { id: 'checkout.payment.failed', label: 'Checkout Payment Failed', entity: 'session', category: 'lifecycle' },
+  // Release 5, Step 5.2 (C11, §8.2, D-R5-32). State signals only — `customer_groups` is the
+  // only module that notifies about an approval decision (D-R5-6); checkout's own family
+  // mirrors its resume subscriber's three reachable outcomes (`approved`/`rejected`, the
+  // latter covering `rejected`/`expired`/`withdrawn` with the outcome in the payload).
+  { id: 'checkout.session.approval_requested', label: 'Checkout Session Approval Requested', entity: 'session', category: 'lifecycle' },
+  { id: 'checkout.session.approval_approved', label: 'Checkout Session Approval Approved', entity: 'session', category: 'lifecycle' },
+  { id: 'checkout.session.approval_rejected', label: 'Checkout Session Approval Rejected', entity: 'session', category: 'lifecycle' },
 ] as const
 
 export const eventsConfig = createModuleEvents({ moduleId: 'checkout', events })

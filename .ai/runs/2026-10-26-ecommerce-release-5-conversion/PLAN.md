@@ -57,7 +57,7 @@
 | 4 | 4.4-fix | assisted_selling: terminal-state subscriber (buyer accept/reject/expiry → thread/proposal rows) + migrate Step 3.3's provisional re-author subscriber in from `cart` | dispatch:standard | done | pending |
 | 4 | 4.5 | assisted_selling: buyer thread routes (Phase 2.1) + `/thread/events` (Phase 2.2) + retention/erasure (Phase 2.5) | dispatch:standard | done | pending |
 | 5 | 5.1 | checkout: B.5 B2B — PO term, `min_order_value`, on-account eligibility, `request_quote` method (D-R5-20), quote branch (C15–C17) | dispatch:standard | done | pending |
-| 5 | 5.2 | checkout: approval-resume subscriber (C11) + session-route identity binding (D-R5-33) | dispatch:standard | todo | — |
+| 5 | 5.2 | checkout: approval-resume subscriber (C11) + session-route identity binding (D-R5-33) | dispatch:standard | done | pending |
 | 5 | 5.3 | assisted_selling: rep console (Phase 2.3) — inbox, thread, composer, proposal builder | dispatch:standard | todo | — |
 | 5 | 5.4 | assisted_selling: Phase 4 attribution — entity, `cart.cart.converted` subscriber, `GET /attributions`, console report | dispatch:standard | todo | — |
 | 6 | 6.1 | All modules: integration-coverage completion per each analysis's test list (G23/A20/K17/S16/C26) | dispatch:standard | todo | — |
@@ -1596,6 +1596,35 @@ commit `c92470d8d5`).
   a different module's command than this Step's brief named, and Step 3.2's own text already
   noted the reason-value choice ("a fourth reason value may be needed... the owner should
   decide which") needs an owner call this Step has no more standing to make than Step 3.2 did.
+- Step 5.2 (C11 resume-subscriber transition map, task brief vs. the authoritative spec): the
+  task brief paraphrased the finding as "on `approved`, transition to `open`; on `rejected|
+  expired|withdrawn`, transition to `failed`" — a single two-way split. The REVISED,
+  authoritative spec text (§8.2 step 3) is explicit and three-way: `approved -> open` (quoted_
+  totals cleared); `rejected -> failed` (`failure_code: 'approval_rejected'`); `expired` AND
+  `withdrawn -> open`, NOT `failed` ("the buyer may request again or reduce the cart"), with
+  `checkout.session.approval_rejected` still emitted for those two but carrying the real
+  outcome in the payload. Implemented per the spec (root AGENTS.md: the spec is the
+  authoritative contract; the brief is only the analysis-era paraphrase that produced it — the
+  same class of call Steps 2.5/2.7/2.9/3.2/5.1 already made in this run). Verified against
+  `lib/session-status-machine.ts`'s own enum: `awaiting_approval -> {open, failed, canceled,
+  expired}` permits both targets, so neither reading was blocked by the state machine itself —
+  this was a pure spec-vs-brief reading call, not a schema constraint. Alternative considered:
+  follow the brief's literal two-way split — rejected as contradicting the spec's own explicit,
+  three-way, separately-justified table with no stated reason to diverge, and as the same
+  mistake class the brief's own "Read first" instructions (item 1) explicitly warned to check
+  for before writing any code.
+- Step 5.2 (D-R5-33 audit, no gap found): audited every existing `/api/checkout/sessions/
+  current/*` route file Steps 2.12/2.13/3.5/4.1/4.2/5.1 actually shipped (`route.ts` (GET/
+  PATCH), `delivery/route.ts`, `delivery-options/route.ts`, `payment-methods/route.ts`,
+  `submit/route.ts`) — every one already calls `lib/currentSessionRoute.ts#resolveCurrentSession`
+  (Step 2.12's own D-R5-33 helper) before any PII-bearing read, confirmed by direct grep and
+  code read, not by trusting prior Steps' own NOTIFY claims. No compliance gap existed to fix.
+  Three routes §9's own route table names (`POST .../cancel`, `POST .../step`, `POST .../
+  payment`) are NOT built in this worktree at all — confirmed via PLAN.md's own Step 2.12/2.13
+  NOTIFY entries, which explicitly deferred them (named by the spec's §17 Phase B.1 scope but
+  absent from each Step's own Implementation/test-priority list) — so there is no route to
+  audit there; a future Step building one must call the SAME helper, not invent a second
+  binding mechanism.
 
 ## External References
 
