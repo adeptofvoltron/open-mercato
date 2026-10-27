@@ -1761,6 +1761,27 @@ commit `c92470d8d5`).
   AGENTS.md`'s "Never leave broken tests"), and running that harness end-to-end was a materially
   larger time investment than the rest of this Step combined. Both are documented in NOTIFY.md
   with a concrete follow-up scope rather than silently dropped.
+- Post-6.4, UI QA step: a dedicated browser QA pass could not capture screenshots for the new
+  admin screens. The dev-QA environment stood up for real (fresh `.env`, disposable `om_qa_r5`
+  DB, `build:packages --force`/`build:app --force` confirmed 0-cached, migrations + `mercato
+  init` all genuinely run), but the booted dev server was completely unresponsive to every
+  request (`/api/healthz`, `/login`, `/api/auth/login` all 404 or timed out at 45-60s) across
+  6+ minutes of generous retries including one auto-restart, while this machine's swap sat at
+  ~95-96% full (31+ of 32GB) from unrelated concurrent cezar sessions — a documented pre-existing
+  machine-contention pattern on this exact host, not a defect in this branch (Postgres itself
+  was confirmed healthy with only 1 idle connection, ruling out a DB-pool cause). Waited 10
+  minutes and re-checked: swap was still ~96% full, so a same-day retry was judged unlikely to
+  succeed and not worth further run time. Chose to proceed to the PR-ready steps on the strength
+  of the automated evidence already gathered instead: the full validation gate (including the
+  real suite), plus the dedicated code-review pass's real-Postgres concurrency tests and
+  independently-verified security/money/visibility/compensation invariants. Alternative
+  considered: keep retrying the dev server indefinitely until the machine frees up — rejected as
+  unbounded and against the brief's own "don't sink unbounded time" posture; a human (or a later
+  run, on a quieter machine) can still do this pass before or shortly after merge, flagged
+  explicitly in the PR description. The one UI fact confirmed before the server died: no
+  dedicated staff admin UI exists for purchase approvals in this release (API routes only,
+  `customer_groups/api/customer-groups/approvals/*` + `api/portal/approvals/*`) — matching the
+  Step 2.6/G15 decision already on record above.
 
 ## External References
 
