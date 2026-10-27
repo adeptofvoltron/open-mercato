@@ -2259,3 +2259,13 @@ commit, credit link, codes/usage, gateway, lineMap, recovery — plus the public
   src/modules/assisted_selling` (packages/core) — 116/116 (14 suites). `yarn jest
   src/modules/cart` (packages/core) — 440/440 (31 suites, +3 against this Step's own
   `cartService.resolveBasketByToken` cases). 556/556 combined, zero regressions.
+
+## 2026-10-28T04:30:00Z — checkpoint 10 (Step 4.4-fix..4.5, closes Phase 4)
+- Range: `dd0093c3e0`..`33aa208ad5`. Summary: assisted_selling terminal-state subscriber +
+  re-author migration from cart; buyer thread routes + signal-only polling + retention/erasure.
+- Checks: forced full typecheck with tsbuildinfo wiped (40/40, 0 cached) pass; core sweep
+  (cart+customer_groups+availability+promotions+assisted_selling, 129/132 suites, 1479/1496
+  tests, 3 expected gated skips); full checkout suite (53/53 suites, 407/407 tests).
+- Decisions/problems: none blocking. One non-blocking deferral (time-based retention sweepers)
+  carried to Step 6.1.
+- Phase 4 is complete. All 5 planned Steps + 2 fix-forwards landed; no rescues needed this phase.
