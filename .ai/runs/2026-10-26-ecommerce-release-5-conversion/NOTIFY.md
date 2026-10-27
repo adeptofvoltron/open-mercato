@@ -2785,3 +2785,24 @@ of every item in the handed-off inventory:
   empty diff, no new env vars anywhere. All new Release 5 configuration (per-tenant email switch,
   approval expiry window, PO/quote terms, etc.) lives in DB-backed `ModuleConfigService`/
   `CustomerGroupTerms` settings, never process env — nothing to add here.
+
+## 2026-10-28T08:35:00Z — Step 6.4 full gate, running (fix-forward #1: 5 missing i18n keys)
+- Running the full `.ai/agentic.config.json` validation.commands gate in order, in the
+  foreground, verifying each command's real exit code from its own log (never through a pipe).
+  Steps 1-3 (build:packages --force, generate, build:packages --force) all passed cleanly
+  (EXIT=0 each; generate reported "outputs unchanged", no drift to commit).
+- Step 4 (`yarn i18n:check-sync`) passed cleanly first try (EXIT=0, all 5 locales in sync).
+- Step 5 (`yarn i18n:check-usage`) FAILED first try: EXIT=1, "5 missing keys" — all 5 genuinely
+  introduced by this release's new cart proposal seam, not pre-existing:
+  `cart.audit.proposal.{create,reject,accept}` (audit-log action labels, Step 3.3's
+  `commands/proposal.ts`) and `cart.errors.{unauthorized,tenant_required}` (Step 3.4's
+  `api/proposals/route.ts` defense-in-depth checks). The 8000 "unused keys" in the same report
+  is pre-existing and advisory-only (does not fail the gate on its own) — confirmed by checking
+  the summary line's own wording and by this exact count/wording recurring unchanged after the
+  fix below. Fixed: added all 5 keys to `cart`'s `en.json` (alongside the existing
+  `cart.audit.*`/`cart.errors.*` entries, exact English text already given as each call site's
+  own fallback argument) and to pl/es/de/ko with the SAME English text, matching every other key
+  in those 4 files (100% English placeholders, Phase 1 of the i18n remediation plan, same
+  convention this entire run has followed). Re-ran both checks: `check-sync` EXIT=0, `check-usage`
+  EXIT=0 with zero `MISSING KEYS`, same 8000 advisory-unused count.
+- Continuing the gate with steps 6-8 (`yarn typecheck`, `yarn test`, `yarn build:app`) next.
