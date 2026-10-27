@@ -2757,3 +2757,20 @@ of every item in the handed-off inventory:
 - Checks: scoped `yarn workspace @open-mercato/checkout typecheck` clean; targeted
   `submit`+`recover-stuck-submits` test files 4/4 suites, 72/72 tests; full `checkout` package
   suite 55/55 suites, 462/462 tests, zero regressions.
+
+## 2026-10-28T08:10:00Z — Step 6.2 (UPGRADE_NOTES.md)
+- Added three entries to the existing `## 0.9.0 → 0.9.1 (unreleased)` section (no new version
+  header — the doc's package.json version (0.10.0) is already ahead of this section's header,
+  a pre-existing inconsistency not touched here; appended to the existing unreleased section
+  rather than guessing a new version number):
+  1. D-R5-21 behaviour change — identified cart/checkout-session/thread routes now require the
+     matching customer session, not just the token; closes the X1 re-identification bypass.
+     Full before/after, the Sylius precedent, and the storefront-integration action item.
+  2. A16 — `InventoryReservationSourceType` gains `'checkout'`; exhaustive-switch compile/runtime
+     break for downstream code, with the exact action (add a case, treat like `'order'`).
+  3. G26 — `customer_groups` credit/approval methods ship on new DI keys
+     (`customerCreditService`/`customerPurchaseApprovalService`), never added to
+     `customerGroupsService`; the `entry.overrides.di` breakage this avoids, and the resolve-key
+     guidance for callers.
+- No dedicated validator exists for this file (plain markdown, only the standard pre-commit
+  i18n/template-sync hooks run on every commit).
