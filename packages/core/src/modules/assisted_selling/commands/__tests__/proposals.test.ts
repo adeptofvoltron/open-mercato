@@ -19,7 +19,7 @@ import {
 } from '../../data/entities'
 import { User } from '@open-mercato/core/modules/auth/data/entities'
 import { CART_PROPOSAL_CREATE_COMMAND_ID, CART_PROPOSAL_REJECT_COMMAND_ID } from '../../lib/cartProposalCommands'
-import { authorProposalCommand, withdrawProposalCommand, reauthorProposalCommand } from '../proposals'
+import { authorProposalCommand, withdrawProposalCommand, reauthorProposalCommand, reauthorProposalForMergeRetarget } from '../proposals'
 
 const TENANT_ID = '11111111-1111-4111-8111-111111111111'
 const ORG_ID = '22222222-2222-4222-8222-222222222222'
@@ -386,6 +386,31 @@ describe('assisted_selling.proposal.withdraw', () => {
       withdrawProposalCommand.execute({ tenantId: TENANT_ID, organizationIds: [OTHER_ORG_ID], proposalId: 'proposal-1' }, ctx),
     ).rejects.toMatchObject({ status: 404 })
   })
+
+  test('decrements the thread\'s live_proposal_count synchronously (Step 4.4-fix §6.4/§6.6)', async () => {
+    const proposal = makePublishedProposal()
+    const thread = makeOpenThread({ liveProposalCount: 1 })
+    const { em } = makeFakeEm({ proposals: [proposal], threads: [thread] })
+    const rbac = makeRbac(['assisted_selling.proposals.author'])
+    const commandBus = makeCommandBus()
+    const ctx = makeCtx({ em, rbac, commandBus, organizationIds: [ORG_ID] })
+
+    await withdrawProposalCommand.execute({ tenantId: TENANT_ID, organizationIds: [ORG_ID], proposalId: 'proposal-1' }, ctx)
+
+    expect(thread.liveProposalCount).toBe(0)
+  })
+
+  test('never decrements below zero, and no-ops gracefully when the thread row is not seeded', async () => {
+    const proposal = makePublishedProposal()
+    const { em } = makeFakeEm({ proposals: [proposal] })
+    const rbac = makeRbac(['assisted_selling.proposals.author'])
+    const commandBus = makeCommandBus()
+    const ctx = makeCtx({ em, rbac, commandBus, organizationIds: [ORG_ID] })
+
+    await expect(
+      withdrawProposalCommand.execute({ tenantId: TENANT_ID, organizationIds: [ORG_ID], proposalId: 'proposal-1' }, ctx),
+    ).resolves.toMatchObject({ status: 'withdrawn' })
+  })
 })
 
 describe('assisted_selling.proposal.reauthor', () => {
@@ -422,7 +447,7 @@ describe('assisted_selling.proposal.reauthor', () => {
 
   test('creates a new proposal from the old one\'s lines and supersedes the old row', async () => {
     const oldProposal = makePublishedProposal()
-    const thread = makeOpenThread()
+    const thread = makeOpenThread({ liveProposalCount: 1 })
     const { em } = makeFakeEm({ threads: [thread], proposals: [oldProposal] })
     const rbac = makeRbac(['assisted_selling.proposals.author', 'cart.proposals.author'])
     const commandBus = makeCommandBus()
@@ -461,6 +486,10 @@ describe('assisted_selling.proposal.reauthor', () => {
     expect(oldProposal.supersededByProposalId).toBe(result.proposalId)
     // §6.4: the old (still-published) proposal's cart is rejected by the same rule.
     expect(commandBus.rejectCalls.some((call: Row) => call.proposalCartId === PROPOSAL_CART_ID)).toBe(true)
+    // Step 4.4-fix: the new proposal's own publish increments the thread (performAuthorProposal),
+    // and this command's own supersede branch decrements it for the OLD one — net zero here
+    // because exactly one proposal stays live throughout (the old one hands off to the new one).
+    expect(thread.liveProposalCount).toBe(1)
   })
 
   test('refuses to re-author an accepted proposal with 409 proposal_already_accepted (D-R5-25)', async () => {
@@ -486,5 +515,97 @@ describe('assisted_selling.proposal.reauthor', () => {
     expect(isCrudHttpError(err)).toBe(true)
     expect(err.status).toBe(409)
     expect(err.body.code).toBe('proposal_already_accepted')
+  })
+})
+
+describe('reauthorProposalForMergeRetarget — Step 4.4-fix (§8.1/D-R5-14, migrated from cart)', () => {
+  function makeOldProposal(overrides: Row = {}): Row {
+    return {
+      id: 'old-proposal-1',
+      tenantId: TENANT_ID,
+      organizationId: ORG_ID,
+      threadId: THREAD_ID,
+      proposalCartId: PROPOSAL_CART_ID,
+      targetCartId: BUYER_CART_ID,
+      authoredByActorType: 'rep',
+      authoredByActorId: REP_USER_ID,
+      status: 'published',
+      resolvedAt: null,
+      supersededByProposalId: null,
+      __key: 'proposals',
+      ...overrides,
+    }
+  }
+
+  const MERGED_INTO_CART_ID = 'cart-merged-into-1'
+  const IDENTIFIED_CUSTOMER_ID = 'customer-identified-1'
+  const IDENTIFIED_CUSTOMER_USER_ID = 'customer-user-identified-1'
+
+  test('re-authors against the merged-into cart under the original author, then supersedes the old row (decrement, reject, .superseded event)', async () => {
+    const oldProposal = makeOldProposal()
+    // Stale guest identity on the thread itself — re-pointing it is a later Step's own
+    // scope (§5.1), so `resolveForBuyer` must use the event's identity, not this one.
+    const thread = makeOpenThread({ liveProposalCount: 1, customerId: null, customerUserId: null })
+    const { em } = makeFakeEm({ threads: [thread], proposals: [oldProposal] })
+    const rbac = makeRbac(['assisted_selling.proposals.author', 'cart.proposals.author'])
+    const commandBus = makeCommandBus()
+    commandBus.setNextProposalCartId('new-proposal-cart-id')
+    const storeContextService = makeStoreContextService()
+    const ctx = makeCtx({ em, rbac, commandBus, storeContextService, organizationIds: [ORG_ID], userId: REP_USER_ID })
+
+    const result = await reauthorProposalForMergeRetarget({
+      ctx,
+      oldProposal,
+      thread,
+      lines: [{ productId: 'prod-1', variantId: null, quantity: '2', configuration: null }],
+      targetCartId: MERGED_INTO_CART_ID,
+      targetCustomerId: IDENTIFIED_CUSTOMER_ID,
+      targetCustomerUserId: IDENTIFIED_CUSTOMER_USER_ID,
+      idempotencyKey: 'reauthor-on-merge:old-proposal-1',
+    })
+
+    expect(result.replayed).toBe(false)
+    expect(commandBus.createCalls[0].targetCartId).toBe(MERGED_INTO_CART_ID)
+    expect(storeContextService.resolveForBuyer).toHaveBeenCalledWith(
+      expect.objectContaining({ customerId: IDENTIFIED_CUSTOMER_ID, customerUserId: IDENTIFIED_CUSTOMER_USER_ID }),
+    )
+    expect(oldProposal.status).toBe('superseded')
+    expect(oldProposal.supersededByProposalId).toBe(result.proposalId)
+    expect(thread.liveProposalCount).toBe(1) // +1 new, -1 old
+    expect(commandBus.rejectCalls.some((call: Row) => call.proposalCartId === PROPOSAL_CART_ID && call.rejectedBy === 'author')).toBe(true)
+  })
+
+  test('a redelivered merge event replays the original result and skips the old-row bookkeeping a second time', async () => {
+    const oldProposal = makeOldProposal()
+    const thread = makeOpenThread({ liveProposalCount: 1 })
+    const { em } = makeFakeEm({ threads: [thread], proposals: [oldProposal] })
+    const rbac = makeRbac(['assisted_selling.proposals.author', 'cart.proposals.author'])
+    const commandBus = makeCommandBus()
+    commandBus.setNextProposalCartId('new-proposal-cart-id-2')
+    const ctx = makeCtx({ em, rbac, commandBus, organizationIds: [ORG_ID], userId: REP_USER_ID })
+    const params = {
+      ctx,
+      oldProposal,
+      thread,
+      lines: [{ productId: 'prod-1', variantId: null, quantity: '2', configuration: null }],
+      targetCartId: MERGED_INTO_CART_ID,
+      targetCustomerId: null,
+      targetCustomerUserId: null,
+      idempotencyKey: 'reauthor-on-merge:old-proposal-1',
+    }
+
+    const first = await reauthorProposalForMergeRetarget(params)
+    expect(first.replayed).toBe(false)
+    expect(oldProposal.status).toBe('superseded')
+    expect(thread.liveProposalCount).toBe(1)
+    const rejectCallsAfterFirst = commandBus.rejectCalls.length
+
+    const second = await reauthorProposalForMergeRetarget(params)
+    expect(second.replayed).toBe(true)
+    expect(second.proposalId).toBe(first.proposalId)
+    // No second supersede pass: status/count/reject-call-count all unchanged.
+    expect(oldProposal.status).toBe('superseded')
+    expect(thread.liveProposalCount).toBe(1)
+    expect(commandBus.rejectCalls.length).toBe(rejectCallsAfterFirst)
   })
 })

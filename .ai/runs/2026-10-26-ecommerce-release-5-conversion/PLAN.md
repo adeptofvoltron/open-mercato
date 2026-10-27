@@ -54,7 +54,7 @@
 | 4 | 4.2-fix | checkout: `expire-awaiting-payment` job (C1/§12 gap-fill — async gateway sessions never complete without it) | dispatch:standard | done | pending |
 | 4 | 4.3 | assisted_selling: module scaffold, store settings, `mode: rep\|off` validator, module registration (D-R5-36) | dispatch:standard | done | pending |
 | 4 | 4.4 | assisted_selling: threads/participants/messages + staff author routes wrapping `cart.proposal.create` | dispatch:standard | done | pending |
-| 4 | 4.4-fix | assisted_selling: terminal-state subscriber (buyer accept/reject/expiry → thread/proposal rows) + migrate Step 3.3's provisional re-author subscriber in from `cart` | dispatch:standard | todo | — |
+| 4 | 4.4-fix | assisted_selling: terminal-state subscriber (buyer accept/reject/expiry → thread/proposal rows) + migrate Step 3.3's provisional re-author subscriber in from `cart` | dispatch:standard | done | pending |
 | 4 | 4.5 | assisted_selling: buyer thread routes (Phase 2.1) + `/thread/events` (Phase 2.2) + retention/erasure (Phase 2.5) | dispatch:standard | todo | — |
 | 5 | 5.1 | checkout: B.5 B2B — PO term, `min_order_value`, on-account eligibility, `request_quote` method (D-R5-20), quote branch (C15–C17) | dispatch:standard | todo | — |
 | 5 | 5.2 | checkout: approval-resume subscriber (C11) + session-route identity binding (D-R5-33) | dispatch:standard | todo | — |
@@ -1461,6 +1461,55 @@ commit `c92470d8d5`).
   §6.1's own `POST /threads/:id/messages` is not part of this Step's scope either) and
   `attributions.view` stays Step 5.4's own scope. Same "defer a feature id until the entity/
   route it gates exists" precedent Step 1.7 and Step 4.3 both already set.
+- Step 4.4-fix (the cart-side provisional subscriber, full removal vs. stub): REMOVED outright
+  — `cart/lib/proposalRetarget.ts`, `cart/subscribers/cart-merged-proposal-retarget.ts` and
+  their own test file deleted, not stubbed. That mechanism was unshipped (this is an
+  in-progress fork PR, not a released version), explicitly self-labeled "PROVISIONAL" in its
+  own header comment with the real home already named as `assisted_selling`, and nothing
+  external (no committed generated registry, no other module) referenced it — only the
+  ephemeral, gitignored `apps/mercato/.mercato/generated/modules.generated.ts` did, and
+  `yarn generate` cleanly dropped it after removal (verified: zero `cart:proposal-retarget-
+  on-merge` references anywhere post-regen). `packages/events/AGENTS.md`'s subscriber
+  contract only forbids changing a *kept* subscriber's `{event, persistent?, id?}` metadata
+  shape; it says nothing about removing one, and `BACKWARD_COMPATIBILITY.md`'s `subscribers/
+  *.ts` row is the same. A stub was considered and rejected: a no-op handler left registered
+  under the old id would still fire on every `cart.cart.merged` and do nothing, which is
+  strictly worse than removing the listener entirely for a mechanism that was always going to
+  move. 437/437 pre-existing `cart` tests stayed green after removal (443 minus the 6 that
+  belonged to the deleted file itself).
+- Step 4.4-fix (the real decrement mechanics for `live_proposal_count`, not literally what
+  §6.6's prose describes): discovered mid-implementation that `withdrawProposalCommand` calls
+  `cart.proposal.reject` (which emits `cart.proposal.rejected` INLINE, synchronously, since
+  that specific `cart`-side emit carries no `persistent: true`) BEFORE writing its own local
+  `status: 'withdrawn'`, while `reauthorProposalCommand`'s supersede branch writes `status:
+  'superseded'` locally BEFORE calling `cart.proposal.reject` — opposite orderings between
+  the two existing Step 4.4 callers. A terminal-state subscriber that decides "should I
+  decrement" by reading the proposal's current `status` at delivery time would therefore
+  decrement correctly for withdraw but silently skip the decrement for reauthor's supersede
+  (and, by the same shape, for this Step's new merge-retarget supersede path too) — a real,
+  not-hypothetical double-counting/under-counting bug, not just a redelivery edge case.
+  Fixed by having every AUTHOR-initiated ending (withdraw, reauthor's supersede branch, the
+  new `reauthorProposalForMergeRetarget`'s supersede branch) decrement `live_proposal_count`
+  itself, synchronously, in its own local transaction — never deferred to the async
+  subscriber — and having the terminal-state subscriber's `.rejected` handler unconditionally
+  skip every `rejectedBy: 'author'` payload (`skipWhenRejectedByAuthor`), relying on that
+  field instead of on local-write ordering. This is a small, additive change to
+  `withdrawProposalCommand`/`reauthorProposalCommand` (both already shipped under Step 4.4,
+  same PR) — flagged here rather than silently folded in, since it touches code this Step
+  was not originally asked to touch. Alternative considered: add a dedicated "already
+  decremented" boolean column — rejected as unnecessary schema churn when `rejectedBy` (a
+  field the payload already carries) disambiguates the two cases for free.
+- Step 4.4-fix (re-author migration: reuse vs. port, per the task's own either/or): reused
+  Step 4.4's own `performAuthorProposal` (the `assisted_selling`-side §6.3 sequence), not
+  Step 3.3's cart-side retarget helpers — ported the SHAPE of Step 3.3's mechanism (candidate
+  enumeration, the eligibility/no-lines/thread-missing fallback branches, supersede-then-
+  reject) but not its code, because Step 3.3's own helpers are keyed off `cart.Cart`/
+  `CartLine` rows `assisted_selling` cannot import, and because they never resolved
+  `assortmentScope` at all (no `resolveForBuyer` call, no mode check) — a real gap against
+  §8.1's own "re-runs §6.3 in full, including step 0's live-mode check" text. The migrated
+  version now re-runs §6.3 in full, via `performAuthorProposal`'s own `targetCartId`/
+  `targetBuyerIdentity` overrides (additive params; every existing caller is unaffected),
+  rather than the author-context-only, no-repricing version Step 3.3 shipped.
 
 ## External References
 

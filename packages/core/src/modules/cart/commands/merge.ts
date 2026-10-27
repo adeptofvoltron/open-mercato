@@ -906,9 +906,9 @@ const mergeCartCommand: CommandHandler<CartMergeInput, CartMergeResult> = {
       sourceCartId: absorbedCart.id,
       targetCartId: survivorCart.id,
       // Step 3.3 (rev 10 — S3/D-R5-32): every new-or-extended Release 5 event payload
-      // carries tenant/organization scope so a subscriber (this module's own proposal
-      // retarget subscriber, `lib/proposalRetarget.ts`, and eventually `assisted_selling`'s
-      // §8.1) can filter before it loads anything by id — additive fields on an
+      // carries tenant/organization scope so a subscriber (`assisted_selling`'s own §8.1
+      // re-author-on-merge subscriber, `assisted_selling/lib/reauthorOnMerge.ts`, as of Step
+      // 4.4-fix) can filter before it loads anything by id — additive fields on an
       // already-shipped event id, never a removal.
       tenantId: survivorCart.tenantId,
       organizationId: survivorCart.organizationId,

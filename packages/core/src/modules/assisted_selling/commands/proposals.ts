@@ -124,8 +124,26 @@ async function performAuthorProposal(params: {
   idempotencyKey: string
   requestDigestPayload: unknown
   authorActorId: string
+  /** Step 4.4-fix (§8.1): the re-author-on-merge subscriber (`lib/reauthorOnMerge.ts`)
+   * authors against the cart a login merge just absorbed the thread's own basket INTO —
+   * never `thread.buyerCartId`, which still names the now-`merged`-away basket (re-pointing
+   * it is a later Step's own §5.1 scope, out of this Step's bounds). Every existing caller
+   * (`authorProposalCommand`, `reauthorProposalCommand`) omits this, so `thread.buyerCartId`
+   * stays the target exactly as before. */
+  targetCartId?: string
+  /** Paired with `targetCartId` — the merged-into basket's OWN identity, resolved
+   * server-side at `resolveForBuyer` time (§8.1: "the buyer's group has just become
+   * known"). `thread.customerId`/`.customerUserId` are stale on a merge (the thread itself
+   * is not re-pointed by this Step), so the merge subscriber supplies the event's own
+   * values instead of the thread's. */
+  targetBuyerIdentity?: { customerId: string | null; customerUserId: string | null }
 }): Promise<AssistedSellingProposalAuthorResponse> {
   const { ctx, thread, lines, note, idempotencyKey, requestDigestPayload, authorActorId } = params
+  const targetCartId = params.targetCartId ?? thread.buyerCartId
+  const targetBuyerIdentity = params.targetBuyerIdentity ?? {
+    customerId: thread.customerId ?? null,
+    customerUserId: thread.customerUserId ?? null,
+  }
   const scope = { tenantId: thread.tenantId }
   const requestDigest = computeAssistedSellingRequestDigest(requestDigestPayload)
 
@@ -166,8 +184,8 @@ async function performAuthorProposal(params: {
       tenantId: thread.tenantId,
       organizationId: thread.organizationId,
       storeId: thread.storeId,
-      customerUserId: thread.customerUserId ?? null,
-      customerId: thread.customerId ?? null,
+      customerUserId: targetBuyerIdentity.customerUserId,
+      customerId: targetBuyerIdentity.customerId,
     })
     if (resolved.assortmentScope === undefined) {
       throw new CrudHttpError(503, { error: '[internal] assortment_scope_unavailable', code: 'assortment_scope_unavailable' })
@@ -181,7 +199,7 @@ async function performAuthorProposal(params: {
   // §6.3 step 3: `cart.proposal.create` by command id — never a static cross-module import.
   const commandBus = ctx.container.resolve('commandBus') as CommandBus
   const createInput: CartProposalCreateCommandInput = {
-    targetCartId: thread.buyerCartId,
+    targetCartId,
     lines,
     ttlSeconds: settings.proposalTtlSeconds,
     routeContext: { assortmentScope },
@@ -218,7 +236,7 @@ async function performAuthorProposal(params: {
     organizationId: thread.organizationId,
     threadId: thread.id,
     proposalCartId: created.proposalCartId,
-    targetCartId: thread.buyerCartId,
+    targetCartId,
     authoredByActorType: 'rep' as const,
     authoredByActorId: authorActorId,
     status: 'published' as const,
@@ -394,6 +412,22 @@ const withdrawProposalCommand: CommandHandler<AssistedSellingProposalWithdrawInp
     const now = new Date()
     proposal.status = 'withdrawn'
     proposal.resolvedAt = now
+    // Step 4.4-fix (§6.4/§6.6): an author-initiated ending owns its own `live_proposal_count`
+    // decrement, synchronously, in THIS transaction — never left to the async terminal-state
+    // subscriber on `cart.proposal.rejected` (`lib/terminalStateSubscriber.ts`), which skips
+    // every `rejectedBy: 'author'` payload for exactly this reason (see that file's own
+    // header comment for why relying on event-delivery ordering between two commands is not
+    // safe here).
+    const thread = await em.findOne(AssistedSellingThread, {
+      id: proposal.threadId,
+      tenantId: proposal.tenantId,
+      organizationId: proposal.organizationId,
+      deletedAt: null,
+    })
+    if (thread) {
+      thread.liveProposalCount = Math.max(0, thread.liveProposalCount - 1)
+      em.persist(thread)
+    }
     await em.flush()
 
     await emitAssistedSellingEvent('assisted_selling.proposal.withdrawn', {
@@ -478,6 +512,10 @@ const reauthorProposalCommand: CommandHandler<AssistedSellingProposalReauthorInp
       if (wasLive) {
         oldProposal.status = 'superseded'
         oldProposal.resolvedAt = new Date()
+        // Step 4.4-fix (§6.4/§6.6): same synchronous, author-owned decrement
+        // `withdrawProposalCommand` applies above — see its own comment.
+        thread.liveProposalCount = Math.max(0, thread.liveProposalCount - 1)
+        em.persist(thread)
       }
       await em.flush()
 
@@ -500,6 +538,94 @@ const reauthorProposalCommand: CommandHandler<AssistedSellingProposalReauthorInp
 
     return result
   },
+}
+
+// ---------------------------------------------------------------------------
+// Step 4.4-fix (§8.1/D-R5-14) — re-author-on-merge, called from this module's OWN
+// `cart.cart.merged` subscriber (`lib/reauthorOnMerge.ts`), never from `cart`. Migrated in
+// from Step 3.3's PROVISIONAL `cart`-side mechanism (`cart/lib/proposalRetarget.ts`, removed
+// by this Step — see that file's own former header comment and NOTIFY.md's Step 3.3/4.4-fix
+// entries), because the supersede/live-count bookkeeping only this module's richer local rows
+// (`authored_by_*`, `thread_id`, `live_proposal_count`) can do properly now exists here.
+//
+// Reuses `performAuthorProposal` — the SAME §6.3 sequence `.author`/`.reauthor` already run
+// (mode check, `resolveForBuyer`, `cart.proposal.create`) — rather than re-implementing it a
+// third time, via the `targetCartId`/`targetBuyerIdentity` overrides that function gained for
+// exactly this caller. Unlike Step 3.3's cart-side version (which skipped both the mode check
+// and `resolveForBuyer` entirely — it had neither to call), this re-runs §6.3 "in full"
+// exactly as §8.1 specifies.
+// ---------------------------------------------------------------------------
+
+export async function reauthorProposalForMergeRetarget(params: {
+  ctx: CommandRuntimeContext
+  oldProposal: AssistedSellingProposal
+  thread: AssistedSellingThread
+  lines: CartProposalCreateLine[]
+  targetCartId: string
+  targetCustomerId: string | null
+  targetCustomerUserId: string | null
+  idempotencyKey: string
+}): Promise<AssistedSellingProposalAuthorResponse> {
+  const { ctx, oldProposal, thread, lines, targetCartId, targetCustomerId, targetCustomerUserId, idempotencyKey } = params
+
+  const result = await performAuthorProposal({
+    ctx,
+    thread,
+    lines,
+    note: undefined,
+    idempotencyKey,
+    requestDigestPayload: { reauthorOnMergeOf: oldProposal.id, targetCartId },
+    authorActorId: oldProposal.authoredByActorId,
+    targetCartId,
+    targetBuyerIdentity: { customerId: targetCustomerId, customerUserId: targetCustomerUserId },
+  })
+
+  if (!result.replayed) {
+    // §6.4/§8.1: the old row's own supersede bookkeeping — the SAME transition
+    // `.reauthor`'s own HTTP command applies above for the staff-initiated path, shared
+    // here instead of duplicated: `superseded_by_proposal_id`, `superseded` (only when
+    // still `published` — a STALE, redelivered merge event finding the old proposal already
+    // `rejected`/`expired`/etc. by the time it is reprocessed must not re-supersede it), the
+    // thread's own synchronous `live_proposal_count` decrement (never left to the async
+    // terminal-state subscriber — `lib/terminalStateSubscriber.ts`'s own header comment),
+    // and the `cart.proposal.reject` dispatch with `rejectedBy: 'author'` + the
+    // `.superseded` event.
+    const wasLive = oldProposal.status === 'published'
+    oldProposal.supersededByProposalId = result.proposalId
+    if (wasLive) {
+      oldProposal.status = 'superseded'
+      oldProposal.resolvedAt = new Date()
+      thread.liveProposalCount = Math.max(0, thread.liveProposalCount - 1)
+    }
+    const em = (ctx.container.resolve('em') as EntityManager).fork()
+    em.persist(oldProposal)
+    em.persist(thread)
+    await em.flush()
+
+    if (wasLive) {
+      const commandBus = ctx.container.resolve('commandBus') as CommandBus
+      await commandBus.execute<CartProposalRejectCommandInput, CartProposalRejectCommandResult>(
+        CART_PROPOSAL_REJECT_COMMAND_ID,
+        {
+          input: {
+            proposalCartId: oldProposal.proposalCartId,
+            tenantId: oldProposal.tenantId,
+            organizationId: oldProposal.organizationId,
+            rejectedBy: 'author',
+          },
+          ctx,
+        },
+      )
+      await emitAssistedSellingEvent('assisted_selling.proposal.superseded', {
+        threadId: oldProposal.threadId,
+        proposalId: oldProposal.id,
+        tenantId: oldProposal.tenantId,
+        organizationId: oldProposal.organizationId,
+      })
+    }
+  }
+
+  return result
 }
 
 registerCommand(authorProposalCommand)

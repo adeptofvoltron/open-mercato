@@ -2117,3 +2117,77 @@ commit, credit link, codes/usage, gateway, lineMap, recovery — plus the public
 - Decisions/problems: two real gaps found and tracked this window, not papered over —
   expire-awaiting-payment (already fixed, 4.2-fix) and assisted_selling's terminal-state
   subscriber + re-author migration (appended as 4.4-fix, next up).
+
+## 2026-10-28T04:15:00Z — executor: Step 4.4-fix landed, terminal-state subscriber + re-author migration
+
+- **Part 1 — §6.6 terminal-state subscriber.** Three thin subscriber files on `cart.proposal.
+  accepted|.rejected|.expired` (`subscribers/cart-proposal-{accepted,rejected,expired}.ts`),
+  sharing one handler factory (`lib/terminalStateSubscriber.ts`). Each resolves the local
+  `AssistedSellingProposal` by `(tenantId, organizationId, proposalCartId)` (reading scope from
+  the payload first, `ctx.tenantId/organizationId` as fallback — the sweeper-emitted `.expired`
+  carries scope only in `emitOptions`, never in the payload body itself), writes the target
+  status + `resolved_at` (+ `merge_log_id` for `.accepted`), decrements the thread's
+  `live_proposal_count`, and emits `assisted_selling.proposal.accepted|.rejected|.expired`
+  (newly declared in `events.ts` — Step 4.4 had deferred them). Idempotency: a proposal whose
+  local `status` is already non-`published` is left untouched entirely (no double-resolve).
+  New events are `clientBroadcast: true` per §6.8.
+- **A real correctness gap found and fixed while building Part 1, not part of the original
+  ask but required for it to work at all:** `withdrawProposalCommand` and `reauthorProposal
+  Command`'s own supersede branch order their local status write and their `cart.proposal.
+  reject` dispatch OPPOSITELY (reject-then-write vs. write-then-reject). A subscriber that
+  decides whether to decrement by reading "is this proposal still `published`" at delivery
+  time would therefore decrement correctly for withdraw and silently MISS it for reauthor's
+  supersede (and would have missed it for this Step's new merge-retarget supersede too).
+  Fixed by making every author-initiated ending decrement `live_proposal_count` itself,
+  synchronously, in its own transaction, and having the `.rejected` subscriber unconditionally
+  skip every `rejectedBy: 'author'` payload (the one ordering-independent signal on that
+  event). This touches `withdrawProposalCommand`/`reauthorProposalCommand`, both shipped under
+  Step 4.4 in this same PR — flagged in PLAN.md's decisions rather than silently folded in.
+- **Part 2 — re-author-on-merge migration.** New `lib/reauthorOnMerge.ts` +
+  `subscribers/cart-merged-reauthor.ts`, subscribing to `cart.cart.merged` with the same
+  `kind: 'basket'`-only filter §8.1 specifies (the OTHER `cart.cart.merged` emission — the
+  acceptance-merge inside `cart.proposal.accept`, `kind: 'proposal'` — is explicitly skipped).
+  Candidates are this module's OWN `AssistedSellingProposal` rows with `status: 'published'`
+  and `target_cart_id = sourceCartId` (the denormalized column Step 4.4 already added "so the
+  console can list by target without reaching into `cart`") — no `cart.Cart`/`CartLine` scan
+  at all, unlike the removed cart-side version, because this module's own rows already carry
+  `authored_by_actor_*` and `thread_id` directly. For each candidate: the same D-R5-14
+  eligibility/no-lines/thread-missing fallback checks as the original mechanism, then a new
+  exported `commands/proposals.ts#reauthorProposalForMergeRetarget`, which re-runs §6.3 IN
+  FULL (mode check, `resolveForBuyer` against the MERGED-INTO cart's own identity from the
+  event payload, `cart.proposal.create`) by reusing `performAuthorProposal` via two new
+  additive overrides (`targetCartId`, `targetBuyerIdentity`) — every existing caller
+  (`.author`, `.reauthor`) is unaffected and keeps using `thread.buyerCartId`/`.customerId`/
+  `.customerUserId` as before. On success it also applies the old row's own bookkeeping
+  (`superseded_by_proposal_id`, `superseded`, the synchronous decrement, the `rejectedBy:
+  'author'` reject dispatch, `.proposal.superseded`) — the SAME transition `.reauthor`'s own
+  HTTP command already applies, shared rather than duplicated a third time. The idempotency
+  key is derived from the old proposal's id (`reauthor-on-merge:<id>`), so a redelivered
+  `cart.cart.merged` replays through `performAuthorProposal`'s own idempotency lookup instead
+  of re-creating.
+- **Removed, not stubbed:** `cart/lib/proposalRetarget.ts`,
+  `cart/subscribers/cart-merged-proposal-retarget.ts` and their test file are deleted outright.
+  Unshipped, self-labeled provisional in its own header, nothing outside itself referenced it
+  except the ephemeral generated registry (`yarn generate` cleanly dropped it), and
+  `packages/events/AGENTS.md`'s subscriber contract only constrains a KEPT subscriber's
+  metadata shape, not removal. Full reasoning in PLAN.md's decisions.
+- **Tests (`packages/core`):** `lib/__tests__/terminalStateSubscriber.test.ts` (8 cases —
+  accepted/rejected-buyer/rejected-author-skip/expired, idempotency on redelivery, missing
+  payload scope, ctx-fallback scope, no-matching-proposal no-op). `lib/__tests__/
+  reauthorOnMerge.test.ts` (8 cases — ports every one of Step 3.3's original 6 cases from
+  `cart/lib/__tests__/proposalRetarget.test.ts` against the new location: re-author success,
+  supersede-on-create-refusal, supersede-on-ineligible-author, no-op-when-none-pending,
+  ignores-payload-missing-scope, two-siblings-independent — plus 2 new: no-lines fallback,
+  and the `kind: 'proposal'` emission is ignored). `commands/__tests__/proposals.test.ts`
+  gained 4 cases: withdraw's synchronous decrement, withdraw's graceful no-thread no-op,
+  reauthor's net-zero decrement/increment assertion added to its existing success test, and a
+  new `reauthorProposalForMergeRetarget` describe block (2 cases — full bookkeeping on
+  success including the identity-override assertion, and replay-skips-bookkeeping-twice).
+  61/61 new assertions across 20 new test cases, all green.
+- **Checks (local mode, every `tsconfig.tsbuildinfo` wiped repo-wide first):** `yarn generate`
+  clean (confirmed zero `cart:proposal-retarget-on-merge` references anywhere post-regen, and
+  the three new subscriber ids present). `yarn typecheck` — 40/40 package tasks green
+  (`@open-mercato/core` cache-miss-executed clean). `eslint` on every changed/new file clean
+  (exit 0). `yarn jest src/modules/assisted_selling` (packages/core) — 55/55 (35 pre-existing
+  + 20 new). `yarn jest src/modules/cart` (packages/core) — 437/437 (443 minus the 6 deleted
+  with `proposalRetarget.test.ts`), zero regressions.

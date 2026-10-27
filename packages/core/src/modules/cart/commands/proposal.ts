@@ -616,9 +616,11 @@ const rejectProposalCommand: CommandHandler<CartProposalRejectInput, CartProposa
     const scope: ProposalScope = { tenantId: input.tenantId, organizationId: input.organizationId }
     // Defense in depth, same reasoning `cart.proposal.create` applies: re-checked whenever
     // the caller actually presents a real principal. A pure system actor (no `ctx.auth` at
-    // all — this module's own re-author/supersede fallback, `lib/proposalRetarget.ts`) is
-    // trusted by construction, the same trust model `withdrawPendingCartApproval`'s
-    // `actor: { actorType: 'system' }` shape already uses for a cart-initiated withdrawal.
+    // all — `assisted_selling`'s own withdraw/reauthor-supersede and merge-retarget-supersede
+    // paths, `assisted_selling/commands/proposals.ts` and `assisted_selling/lib/
+    // reauthorOnMerge.ts`) is trusted by construction, the same trust model
+    // `withdrawPendingCartApproval`'s `actor: { actorType: 'system' }` shape already uses for
+    // a cart-initiated withdrawal.
     if (input.rejectedBy === 'author' && ctx.auth?.sub) {
       await requireProposalAuthorFeature(ctx, scope)
     }
