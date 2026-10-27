@@ -1564,3 +1564,15 @@ rotation.
 (once after a full `tsconfig.tsbuildinfo` wipe to rule out a stale incremental cache). Full
 `src/modules/cart` suite: 30/30 suites, 417/417 tests (38 new), zero regressions — every
 pre-existing guest-merge/undo/sweeper test passes unchanged.
+
+## 2026-10-27T23:30:00Z — checkpoint 7 (Steps 3.1–3.4 + 3.1-fix)
+- Range: `4a056a7764`..`469bd19c17` (incl. `efc2335eb9`). Summary: cart approval gate; resolveTerms
+  termsCurrencyCode fix; a real ecommerce typecheck regression found and fixed (3.1-fix);
+  request-approval route + K3 lifecycle; §7a proposal seam commands; §7a proposal routes +
+  sweepers + undo-merge refusal.
+- Checks: forced full typecheck with tsbuildinfo wiped (40/40, 0 cached) pass; full cart suite
+  (30/30 suites, 417/417 tests); customer_groups+ecommerce regression sweep (112/114 suites,
+  1365/1373 tests, 2 expected gated skips).
+- Decisions/problems: the Checkpoint 6 vs. post-3.1 typecheck discrepancy remains unexplained
+  (logged, not papered over); mitigated going forward by wiping tsbuildinfo before every forced
+  checkpoint typecheck. `cart`'s Phase 3 scope (approval gate + proposal seam) is now complete.
