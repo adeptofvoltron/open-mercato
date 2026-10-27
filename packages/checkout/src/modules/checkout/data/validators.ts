@@ -316,6 +316,16 @@ export const checkoutSessionUpdateSchema = z.object({
   termsAccepted: z.boolean().optional(),
 })
 
+// §9's route table: `POST /sessions/current/delivery` (B.3, §5.3). The buyer sends back
+// only the `deliveryMethodCode` of one of the options `GET .../delivery-options` just
+// offered — never a price (§13 Entitlement: "a client asking for a method without
+// entitlement is refused, never trusted"). The route re-resolves the real rate server-side
+// and refuses an unknown code with `422 delivery_unavailable`.
+export const checkoutSessionDeliverySelectSchema = z.object({
+  deliveryMethodCode: requiredTrimmedString('checkout.validation.common.required'),
+})
+
 export type CheckoutSessionCreateInput = z.infer<typeof checkoutSessionCreateSchema>
 export type CheckoutSessionUpdateInput = z.infer<typeof checkoutSessionUpdateSchema>
+export type CheckoutSessionDeliverySelectInput = z.infer<typeof checkoutSessionDeliverySelectSchema>
 export type PublicSubmitInput = z.infer<typeof publicSubmitSchema>

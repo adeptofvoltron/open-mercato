@@ -42,6 +42,11 @@ export type CartPeerDatabase = {
     locale: string
     customer_id: string | null
     customer_user_id: string | null
+    // Release 5, Step 2.13 (C8/D-R5-17): the buyer-context columns `promotionsService
+    // .evaluate()`'s `BuyerContext` needs (`cart/lib/promotionContext.ts`'s own
+    // `buyer` builder reads these same two columns off the real `Cart` entity).
+    customer_ids: string[] | null
+    customer_group_ids: string[] | null
     token_hash: string
   }
 }
@@ -58,29 +63,29 @@ export type CartPeerRow = {
   locale: string
   customerId: string | null
   customerUserId: string | null
+  customerIds: string[]
+  customerGroupIds: string[]
 }
 
-export async function lookupCartPeerByToken(em: EntityManager, cartToken: string): Promise<CartPeerRow | null> {
-  const tokenHash = hashCartTokenForLookup(cartToken)
-  const row = await em
-    .getKysely<CartPeerDatabase>()
-    .selectFrom('carts')
-    .select([
-      'id',
-      'tenant_id',
-      'organization_id',
-      'store_id',
-      'channel',
-      'kind',
-      'status',
-      'currency_code',
-      'locale',
-      'customer_id',
-      'customer_user_id',
-    ])
-    .where('token_hash', '=', tokenHash)
-    .executeTakeFirst()
-  if (!row) return null
+const CART_PEER_SELECT_COLUMNS = [
+  'id',
+  'tenant_id',
+  'organization_id',
+  'store_id',
+  'channel',
+  'kind',
+  'status',
+  'currency_code',
+  'locale',
+  'customer_id',
+  'customer_user_id',
+  'customer_ids',
+  'customer_group_ids',
+] as const
+
+type CartPeerSelectedRow = Pick<CartPeerDatabase['carts'], (typeof CART_PEER_SELECT_COLUMNS)[number]>
+
+function toCartPeerRow(row: CartPeerSelectedRow): CartPeerRow {
   return {
     id: row.id,
     tenantId: row.tenant_id,
@@ -93,5 +98,43 @@ export async function lookupCartPeerByToken(em: EntityManager, cartToken: string
     locale: row.locale,
     customerId: row.customer_id,
     customerUserId: row.customer_user_id,
+    customerIds: row.customer_ids ?? [],
+    customerGroupIds: row.customer_group_ids ?? [],
   }
+}
+
+export async function lookupCartPeerByToken(em: EntityManager, cartToken: string): Promise<CartPeerRow | null> {
+  const tokenHash = hashCartTokenForLookup(cartToken)
+  const row = await em
+    .getKysely<CartPeerDatabase>()
+    .selectFrom('carts')
+    .select(CART_PEER_SELECT_COLUMNS)
+    .where('token_hash', '=', tokenHash)
+    .executeTakeFirst()
+  if (!row) return null
+  return toCartPeerRow(row)
+}
+
+/**
+ * Same scope-free "FK-id + snapshot" read as `lookupCartPeerByToken`, but by the cart's
+ * own id (scoped by tenant/organization — unlike the token lookup, the caller already
+ * knows the scope here, from the `CheckoutSession` row). Used by the delivery-rate
+ * quoting and delivery-promotion-evaluation paths (§5.3/§5.4) to re-read the cart's
+ * buyer context without importing anything from `cart/lib`.
+ */
+export async function lookupCartPeerById(
+  em: EntityManager,
+  cartId: string,
+  scope: { tenantId: string; organizationId: string },
+): Promise<CartPeerRow | null> {
+  const row = await em
+    .getKysely<CartPeerDatabase>()
+    .selectFrom('carts')
+    .select(CART_PEER_SELECT_COLUMNS)
+    .where('id', '=', cartId)
+    .where('tenant_id', '=', scope.tenantId)
+    .where('organization_id', '=', scope.organizationId)
+    .executeTakeFirst()
+  if (!row) return null
+  return toCartPeerRow(row)
 }

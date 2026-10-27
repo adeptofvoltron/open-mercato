@@ -971,3 +971,122 @@
   suites, 272/272 tests, ZERO regressions on the pre-existing 36/270 Phase-A suite (C10
   guarantee). `yarn build:packages` — 40/40 tasks successful (incl. `@open-mercato/core` and
   `@open-mercato/checkout`).
+
+## 2026-10-27T21:15:00Z — Step 2.13 (checkout B.3: delivery rate quoting, delivery promotions,
+payment methods listing)
+- Second `checkout`-module Step, building directly on Step 2.12's `CheckoutSession`/step-
+  machine/security baseline. Read Step 2.12's own NOTIFY entry closely per the task brief —
+  confirmed `/sessions/current/step`/`/cancel` genuinely do not exist yet (irrelevant to this
+  Step's own route surface) and that store/channel/currency match is NOT enforced at session
+  creation (irrelevant here too — this Step reads the session's own snapshot fields, never
+  re-resolves the store).
+- Shipped: `GET /api/checkout/sessions/current/delivery-options` (rate quote + cache),
+  `POST /api/checkout/sessions/current/delivery` (method selection + delivery-promotion
+  evaluation, `checkout.session.selectDelivery` command), `GET /api/checkout/sessions/current/
+  payment-methods` (gateway listing). All three reuse Step 2.12's `resolveCurrentSession`
+  (D-R5-33 binding + C21 cross-tenant check) and rate-limit helpers verbatim.
+- **Route path decision:** the task brief's prose named `POST .../delivery-method`; the revised
+  spec's own §9 route table literally names `POST /sessions/current/delivery`. Built the spec's
+  literal path — the task brief itself says the spec is authoritative for "shapes", and this is
+  exactly that kind of discrepancy (paraphrase vs. the owning document).
+- **`delivery-options` (C13 §5.3).** Origin: gated behind `tryResolve('wmsReservationService')`,
+  reads the organization's primary `wms_warehouses` row via a raw-Kysely peer read (the same
+  "FK-id + snapshot" style `lib/cartPeer.ts` established in Step 2.12 — never an ORM import of
+  another module's entity). **Found during implementation:** `ecommerce.EcommerceStore` has NO
+  structured address at all (`settings.contact.address` is one free-text string) and no "tenant
+  default address" concept exists anywhere in the codebase — so C13's own three-tier origin
+  fallback (store → warehouse → tenant default) collapses to two reachable tiers here (warehouse
+  → unavailable). Flagged as a follow-up: a later Step should add a structured store address if
+  the owner wants tier 1 to ever be real. Packages: one parcel per cart, built from `cart_lines`
+  joined (via three flat raw-Kysely queries, never a cross-module join, for easy unit-testing)
+  against `catalog_products`/`catalog_product_variants` for weight/dimensions, variant overriding
+  product when present, the single-parcel default (1kg/30x20x10cm) substituted per missing line.
+  **Judgment call:** weight is summed per-line-times-quantity (physically correct — more units
+  really do weigh more); dimensions take the largest single-unit value per axis across lines (a
+  bounding box), NOT a literal sum — summing lengths across unrelated products would produce a
+  parcel no carrier could ever quote, and the spec's "one parcel per cart" framing only makes
+  sense as a bounding box. Documented in `lib/cartLinesPeer.ts`'s own doc comment. Carriers:
+  every adapter `listShippingAdapters()` returns is tried via `shippingCarrierService
+  .calculateRates`; a single adapter's failure is caught and logged, never surfaced — falls
+  through to the flat-rate fallback (R10) exactly like "no provider configured" does. Cached 5
+  min per `(address hash, cart hash)` via `@open-mercato/cache` (`lib/deliveryRateCache.ts`,
+  mirroring `promotions/services/promotion-cache.ts`'s own best-effort get/set shape) — a cache
+  read/write failure degrades to a recompute, never a failed request.
+- **Flat-rate fallback location (D-R5-35) — the one genuinely new data-model gap.** Neither
+  `ecommerce.EcommerceStore` nor `checkout.CheckoutLink` had ANY field for a flat-rate amount
+  before this Step; D-R5-35 names the SOURCE per channel but the spec never specifies the field's
+  shape. Added: an additive `shipping.flatRate: { amount, currencyCode } | null` key on
+  `ecommerceStoreSettingsSchema` (jsonb `settings` column, `.prefault(null)`, zero migration —
+  confirmed zero regressions: ran the FULL `@open-mercato/core` typecheck, 40/40 build tasks, and
+  the ecommerce module's own jest suite, 68/68 suites / 891/891 tests, all green; the existing
+  hand-written `mergeStoreSettings()` merge function in `api/stores/crud.ts` does not even pass
+  the new key through today, so no admin-facing write path exists yet — a follow-up gap, not a
+  blocker for this Step's own reads); and two additive nullable columns on
+  `CheckoutLinkTemplate`/`CheckoutLink` (`flat_rate_shipping_amount`/`flat_rate_shipping_currency
+  _code`, `Migration20261027180000.ts` + snapshot update, mirroring how `gateway_provider_key`
+  was added originally) for the link tier, read directly via `em.findOne(CheckoutLink, ...)`
+  since `CheckoutLink` is checkout's own entity (no cross-module peer-read needed there). Branch
+  is exact: `channel === 'pay_link' && linkId` reads the link; everything else with a `storeId`
+  reads the store; neither reads the other. Note: no live route can create a `channel: 'pay_link'`
+  session yet (B.2/Step 3.5 hasn't landed — `{source:'link'}` still 400s per Step 2.12), so the
+  link branch is unit-tested directly against a synthetic session input
+  (`lib/__tests__/deliveryRateQuote.test.ts`), not through a full HTTP fixture.
+- **`POST .../delivery` + delivery-promotion evaluation (C8/D-R5-17).** The command (`checkout.
+  session.selectDelivery`) never trusts a client-supplied price: it RE-resolves the real options
+  through the same cached `computeDeliveryOptions` call and 422s `delivery_unavailable` when the
+  requested `deliveryMethodCode` isn't among them (§13 Entitlement's "never trusted" rule, applied
+  here even though §13 only names it for payment methods explicitly). `promotionsService.evaluate`
+  is called with the cart's buyer context (customerId/customerIds/customerGroupIds, re-read via a
+  new `lookupCartPeerById` on `lib/cartPeer.ts`) plus `deliveryMethodCode`/`deliveryCost`, mirroring
+  `cart/commands/cart.ts`'s own `ctx.container.register({ auth: asValue(...) })` precedent for
+  resolving `promotionsService`'s scope. **Scoped decision:** `codes: []` is sent — this Step's
+  call never re-derives the cart's currently-entered codes (`CartPromotionApplication` rows),
+  since doing so properly would mean either importing `cart/lib` (forbidden, §6) or re-deriving
+  that table cross-module, and the only rule type this Step's own scope needs working is
+  `delivery_method`, which `rule-evaluators.ts` gates purely on `context.deliveryMethodCode`, not
+  on `codes`. A combined code+delivery rule is therefore a gap — flagged for Step 4.1's own
+  submit-time re-evaluation (§7.2 step 2) to close for real, since THAT call sits inside the
+  authoritative submit path and already has to get this right. Only the `DELIVERY_DISCOUNT`
+  effect is extracted from the result; `LINE_DISCOUNT`/`CART_DISCOUNT`/`ADD_FREE_ITEM` are ignored
+  (cart-stage effects, already applied by `cart.reprice`, never this Step's to re-apply). On a
+  match, writes a PARTIAL `quoted_totals` (`deliveryMethodCode`/`deliveryCost`/`deliveryDiscount`/
+  `currencyCode`/`evaluatedAt` only) — `goodsGross`/`payableGross` are deliberately NOT written;
+  §4.1's full shape is submit's own concern (Step 4.1), which this Step's brief explicitly
+  excludes. A promotions evaluation failure (exception) degrades to "no discount shown", never a
+  failed delivery-method selection — showing no discount is always safe, silently charging one
+  that errored is not.
+- **`GET .../payment-methods` (§5.5 gateway half only).** Lists every `isConfigured`,
+  currency-compatible `paymentGatewayDescriptorService.listResolved(scope)` descriptor for a
+  non-link session — `ecommerce` has no per-store gateway selection any more than it has a
+  flat-rate-fallback field (a parallel gap, not fixed here, since fixing it is out of this Step's
+  named scope). A link session restricts to the link's own single `gatewayProviderKey`, unchanged
+  from Phase A's one-provider-per-link model. `on_account`/`request_quote` are not offered at
+  all — expected per the task brief, since both need `customer_groups` terms
+  (`allow_purchase_on_account`/`allow_quote_requests`) not yet wired into checkout (B.5).
+- **Not built in this Step (named by §9/§17 B.3 but out of the task brief's own route list):**
+  `POST /sessions/current/payment` (method selection + PO capture) — a later B.5-adjacent Step
+  should add it, reusing this Step's `listCheckoutPaymentMethods` for server-side entitlement
+  checking before storing the choice.
+- Files: `packages/checkout/src/modules/checkout/lib/cartLinesPeer.ts` (+tests),
+  `lib/warehousePeer.ts`, `lib/storeSettingsPeer.ts`, `lib/linkFlatRate.ts`, `lib/deliveryAddress.ts`
+  (+tests), `lib/deliveryRateCache.ts` (+tests), `lib/deliveryRateQuote.ts` (+tests),
+  `lib/promotionsDeliveryEvaluation.ts` (+tests), `lib/paymentMethods.ts` (+tests), `lib/
+  cartPeer.ts` (+`lookupCartPeerById`, +`customerIds`/`customerGroupIds`), `lib/constants.ts`
+  (package defaults, cache TTL), `lib/rateLimiter.ts` (+`checkoutDeliveryOptionsRateLimitConfig`,
+  +`checkoutSessionOtherGetRateLimitConfig`), `data/validators.ts`
+  (+`checkoutSessionDeliverySelectSchema`), `data/entities.ts` (+`CheckoutLinkTemplate` flat-rate
+  columns), `commands/delivery.ts` (+tests) + `commands/index.ts` wiring,
+  `migrations/Migration20261027180000.ts` + `.snapshot-open-mercato.json`,
+  `api/sessions/current/delivery-options/route.ts` (+tests), `api/sessions/current/delivery/
+  route.ts` (+tests), `api/sessions/current/payment-methods/route.ts` (+tests). Cross-module:
+  `packages/core/src/modules/ecommerce/data/validators.ts` (+`ecommerceStoreShippingSchema`,
+  additive jsonb field on `ecommerceStoreSettingsSchema`).
+- Checks (local mode, from repo root): `yarn generate` — clean (first attempt caught a genuine
+  duplicate `currencyCodeSchema` declaration in the edited `ecommerce/data/validators.ts`, fixed,
+  re-ran clean). `yarn workspace @open-mercato/checkout run typecheck` — clean, exit 0.
+  `yarn workspace @open-mercato/core run typecheck` — clean, exit 0. `yarn workspace
+  @open-mercato/checkout test` — 47/47 suites, 328/328 tests, ZERO regressions on Step 2.12's own
+  37/272 Phase-A-plus-B.1 baseline. `yarn workspace @open-mercato/core test -- src/modules/
+  ecommerce` — 68/68 suites, 891/891 tests, ZERO regressions from the additive settings-schema
+  field. `yarn build:packages` — 40/40 tasks successful (incl. `@open-mercato/core` and
+  `@open-mercato/checkout`).

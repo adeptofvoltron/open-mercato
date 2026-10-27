@@ -42,7 +42,7 @@
 | 2 | 2.10 | cart: `markConverted` additive inputs (`salesOrderId`/`lineMap`/`salesQuoteId`, K8/D-R5-26); admin list + detail + reprice (K6) | dispatch:standard | done | pending |
 | 2 | 2.11 | cart: abandonment payload (K9) + code-reservation release on expire/abandon (K11) | dispatch:standard | done | pending |
 | 2 | 2.12 | checkout: B.1 session entity + step machine + token hash + C14 minimum (rate limits, encryption, redaction) | dispatch:standard | done | pending |
-| 2 | 2.13 | checkout: B.3 delivery + payment step (rate quoting C13, delivery-promotions evaluation C8) | dispatch:standard | todo | — |
+| 2 | 2.13 | checkout: B.3 delivery + payment step (rate quoting C13, delivery-promotions evaluation C8) | dispatch:standard | done | pending |
 | 3 | 3.1 | cart: approval gate K1–K5 (`requiresApproval`, lock refusal, `purpose: 'quote'` skip D-R5-23, guest fail-closed D-R5-12/29) | dispatch:standard | todo | — |
 | 3 | 3.2 | cart: `/current/request-approval` route + lifecycle withdrawal wiring (K3/K4/K7, `awaiting_approval_since` K5) | dispatch:standard | todo | — |
 | 3 | 3.3 | cart: §7a proposal seam commands (create/withdraw/supersede/re-author, D-R5-14) | dispatch:standard | todo | — |
@@ -692,6 +692,37 @@ commit `c92470d8d5`).
   `lib/rateLimiter.ts` respectively — §13's revised text actually DOES name the rate-limit numbers
   explicitly (20/min/IP create; 60/min/session + 120/min/IP mutate, both fail-closed), so those
   were read from the spec, not invented. Full reasoning: NOTIFY.md's Step 2.12 entry.
+
+- Step 2.13 (checkout B.3, C13/C8/D-R5-35): the revised spec's own route table (§9) names
+  `POST /sessions/current/delivery`, not the task brief's paraphrase `delivery-method` — built the
+  literal spec path, since the spec is the authoritative shape per this Step's own brief. Neither
+  `ecommerce.EcommerceStore` nor `checkout.CheckoutLink` had ANY field for a flat-rate fallback
+  amount before this Step — D-R5-35 names the SOURCE (store settings vs. link settings) but the
+  spec never specifies the field's shape, so one was added: an additive `shipping.flatRate` key on
+  `EcommerceStoreSettings` (jsonb, `.prefault(null)`, zero migration, 68/68 ecommerce suites still
+  green) and two additive nullable columns on `CheckoutLinkTemplate`/`CheckoutLink`
+  (`flat_rate_shipping_amount`/`_currency_code`, Migration20261027180000) for the link tier — no
+  admin UI wires either one yet (follow-up gap). `ecommerce.EcommerceStore` also has no structured
+  address (`settings.contact.address` is one free-text string) and no "tenant default address"
+  concept exists anywhere, so C13's three-tier origin fallback (store → warehouse → tenant default)
+  collapses to two: the organization's primary `wms` warehouse, or unavailable (origin tier 1 and 3
+  are both gaps, follow-up needed if a store-level address is ever modeled). Packages: weight is
+  summed per-line-times-quantity (physically correct), but dimensions take the largest single-unit
+  value per axis across lines (a bounding box) rather than a literal sum, which the spec's own
+  wording ("weight and dimensions summed") would otherwise produce an absurd single parcel for —
+  documented in `lib/cartLinesPeer.ts`. `promotionsService.evaluate()` is called with `codes: []`
+  (this Step's own delivery-selection call never re-derives the cart's currently-held entered
+  codes — reproducing that would mean either importing `cart/lib` or re-deriving
+  `CartPromotionApplication` rows, and the only rule this Step's scope needs working is the
+  `delivery_method` rule type, which does not read `codes`); a combined code+delivery rule is a
+  gap, flagged for Step 4.1 (the submit-time re-evaluation) to close for real. `payment-methods`
+  lists every currency-compatible, tenant-configured gateway descriptor for non-link sessions
+  (no per-store gateway selection exists in `ecommerce` either, a parallel gap to the shipping
+  one) and restricts to the link's own single `gatewayProviderKey` for link sessions (Phase A's
+  existing one-provider-per-link model, unchanged). `POST /sessions/current/payment` (method
+  selection + PO capture) is NOT built in this Step — the task brief's own route list names only
+  `delivery-options`, `delivery`, and `payment-methods`; §5.5's write side stays with whichever
+  Step actually needs it (B.5-adjacent). Full reasoning: NOTIFY.md's Step 2.13 entry.
 
 ## External References
 

@@ -157,6 +157,24 @@ export const checkoutSessionMutateIpRateLimitConfig = readEndpointRateLimitConfi
   keyPrefix: 'checkout-session-mutate-ip',
 })
 
+// Release 5, Step 2.13 (B.3, §13): "`GET /sessions/current/delivery-options` (B.3) |
+// 30/min per session". Fail-closed, per §13's own table.
+export const checkoutDeliveryOptionsRateLimitConfig = readEndpointRateLimitConfig('CHECKOUT_DELIVERY_OPTIONS', {
+  points: 30,
+  duration: 60,
+  blockDuration: 60,
+  keyPrefix: 'checkout-delivery-options',
+})
+
+// §13: "Other `GET` under `/sessions/current` | 120/min per session | fail-open" —
+// `GET .../payment-methods` (B.3) falls under this row.
+export const checkoutSessionOtherGetRateLimitConfig = readEndpointRateLimitConfig('CHECKOUT_SESSION_OTHER_GET', {
+  points: 120,
+  duration: 60,
+  blockDuration: 60,
+  keyPrefix: 'checkout-session-other-get',
+})
+
 /** Builds the session-scoped rate-limit key for `/sessions/current/*` mutations —
  * `enforceCheckoutRateLimit`'s `keyOverride`, keyed by the session's own token hash
  * (never the plaintext token) so the bucket survives across requests from different IPs

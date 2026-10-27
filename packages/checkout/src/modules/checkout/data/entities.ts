@@ -24,6 +24,8 @@ export class CheckoutLinkTemplate {
     | 'priceListItems'
     | 'gatewayProviderKey'
     | 'gatewaySettings'
+    | 'flatRateShippingAmount'
+    | 'flatRateShippingCurrencyCode'
     | 'customFieldsetCode'
     | 'collectCustomerDetails'
     | 'customerFieldsSchema'
@@ -123,6 +125,16 @@ export class CheckoutLinkTemplate {
 
   @Property({ name: 'gateway_settings', type: 'jsonb', nullable: true })
   gatewaySettings?: Record<string, unknown> | null
+
+  // Release 5, Step 2.13 (checkout C13/D-R5-35). The flat-rate carrier fallback for LINK
+  // carts (B.2/B.3, §5.3) — the storefront-cart equivalent lives on
+  // `ecommerce.EcommerceStore.settings.shipping.flatRate`. Inherited by `CheckoutLink`
+  // the same way `gatewayProviderKey`/`gatewaySettings` already are.
+  @Property({ name: 'flat_rate_shipping_amount', type: 'numeric', precision: 12, scale: 2, nullable: true })
+  flatRateShippingAmount?: string | null
+
+  @Property({ name: 'flat_rate_shipping_currency_code', type: 'text', nullable: true })
+  flatRateShippingCurrencyCode?: string | null
 
   @Property({ name: 'custom_fieldset_code', type: 'text', nullable: true })
   customFieldsetCode?: string | null
