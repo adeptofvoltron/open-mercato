@@ -315,4 +315,251 @@ export class CheckoutTransaction {
   updatedAt: Date = new Date()
 }
 
-export default [CheckoutLinkTemplate, CheckoutLink, CheckoutTransaction]
+// Release 5, Step 2.12 (B.1, §4.1/§4.2 of the revised spec). `CheckoutSession` is the
+// funnel's own aggregate — additive to Phase A, which keeps using `CheckoutLink` /
+// `CheckoutTransaction` unchanged end to end (C10/D-R5-18: `checkout`'s `requires` stays
+// exactly as it is today; see `index.ts`). `CheckoutSession` never holds cart lines — only
+// the cart's own id (§4.1's own words).
+@Entity({ tableName: 'checkout_sessions' })
+@Index({ properties: ['tokenHash'], options: { unique: true } })
+@Index({
+  properties: ['tenantId', 'submitIdempotencyKey'],
+  options: { unique: true, where: 'submit_idempotency_key is not null' },
+})
+@Index({ properties: ['tenantId', 'status', 'expiresAt'] })
+@Index({ properties: ['tenantId', 'cartId', 'status'] })
+export class CheckoutSession {
+  [OptionalProps]?:
+    | 'cartId'
+    | 'storeId'
+    | 'linkId'
+    | 'status'
+    | 'step'
+    | 'email'
+    | 'phone'
+    | 'customerId'
+    | 'customerUserId'
+    | 'shippingAddress'
+    | 'billingAddress'
+    | 'billingSameAsShipping'
+    | 'shippingMethod'
+    | 'quotedTotals'
+    | 'deliveryWindowId'
+    | 'paymentMethodCode'
+    | 'paymentIntentRef'
+    | 'paymentExpiresAt'
+    | 'purchaseOrderNumber'
+    | 'creditReservationKey'
+    | 'stockReservationKey'
+    | 'submitIdempotencyKey'
+    | 'submitAttempt'
+    | 'submitProgress'
+    | 'submitStartedAt'
+    | 'outcomeKind'
+    | 'salesOrderId'
+    | 'salesQuoteId'
+    | 'termsAcceptedAt'
+    | 'consentFlags'
+    | 'failureCode'
+    | 'failureDetail'
+    | 'completedAt'
+    | 'createdAt'
+    | 'updatedAt'
+    | 'deletedAt'
+
+  @PrimaryKey({ type: 'uuid', defaultRaw: 'gen_random_uuid()' })
+  id!: string
+
+  @Property({ name: 'organization_id', type: 'uuid' })
+  organizationId!: string
+
+  @Property({ name: 'tenant_id', type: 'uuid' })
+  tenantId!: string
+
+  /** SHA-256 hex of the opaque session token. The plaintext is returned once, by
+   * `POST /api/checkout/sessions`, and never stored (C4, D-R4-18). */
+  @Property({ name: 'token_hash', type: 'text' })
+  tokenHash!: string
+
+  /** `cart.Cart.id` (FK-id, no ORM relation — root AGENTS.md). Nullable until a cart is
+   * wired onto the session; every Step 2.12 creation path sets it immediately. */
+  @Property({ name: 'cart_id', type: 'uuid', nullable: true })
+  cartId?: string | null
+
+  /** `ecommerce.EcommerceStore.id`; null for link and API carts (X13). */
+  @Property({ name: 'store_id', type: 'uuid', nullable: true })
+  storeId?: string | null
+
+  /** `checkout.CheckoutLink.id` for merchant-initiated sessions (B.2, not built yet). */
+  @Property({ name: 'link_id', type: 'uuid', nullable: true })
+  linkId?: string | null
+
+  @Property({ type: 'text' })
+  channel!: 'storefront' | 'pos' | 'pay_link' | 'agent' | 'api'
+
+  @Property({ type: 'text', default: 'open' })
+  status: CheckoutSessionStatus = 'open'
+
+  @Property({ type: 'text', default: 'contact' })
+  step: CheckoutSessionStep = 'contact'
+
+  @Property({ name: 'currency_code', type: 'text' })
+  currencyCode!: string
+
+  @Property({ type: 'text' })
+  locale!: string
+
+  /** Encrypted at rest (`encryption.ts`). */
+  @Property({ type: 'text', nullable: true })
+  email?: string | null
+
+  /** Encrypted at rest (`encryption.ts`). */
+  @Property({ type: 'text', nullable: true })
+  phone?: string | null
+
+  @Property({ name: 'customer_id', type: 'uuid', nullable: true })
+  customerId?: string | null
+
+  /** A non-null value binds every `/current/*` route to that customer's session (§9.0). */
+  @Property({ name: 'customer_user_id', type: 'uuid', nullable: true })
+  customerUserId?: string | null
+
+  /** Encrypted at rest (`encryption.ts`). */
+  @Property({ name: 'shipping_address', type: 'jsonb', nullable: true })
+  shippingAddress?: Record<string, unknown> | null
+
+  /** Encrypted at rest (`encryption.ts`). */
+  @Property({ name: 'billing_address', type: 'jsonb', nullable: true })
+  billingAddress?: Record<string, unknown> | null
+
+  @Property({ name: 'billing_same_as_shipping', type: 'boolean', default: false })
+  billingSameAsShipping: boolean = false
+
+  @Property({ name: 'shipping_method', type: 'jsonb', nullable: true })
+  shippingMethod?: Record<string, unknown> | null
+
+  @Property({ name: 'quoted_totals', type: 'jsonb', nullable: true })
+  quotedTotals?: Record<string, unknown> | null
+
+  @Property({ name: 'delivery_window_id', type: 'uuid', nullable: true })
+  deliveryWindowId?: string | null
+
+  @Property({ name: 'payment_method_code', type: 'text', nullable: true })
+  paymentMethodCode?: string | null
+
+  @Property({ name: 'payment_intent_ref', type: 'text', nullable: true })
+  paymentIntentRef?: string | null
+
+  @Property({ name: 'payment_expires_at', type: Date, nullable: true })
+  paymentExpiresAt?: Date | null
+
+  @Property({ name: 'purchase_order_number', type: 'text', nullable: true })
+  purchaseOrderNumber?: string | null
+
+  @Property({ name: 'credit_reservation_key', type: 'text', nullable: true })
+  creditReservationKey?: string | null
+
+  @Property({ name: 'stock_reservation_key', type: 'text', nullable: true })
+  stockReservationKey?: string | null
+
+  @Property({ name: 'submit_idempotency_key', type: 'text', nullable: true })
+  submitIdempotencyKey?: string | null
+
+  @Property({ name: 'submit_attempt', type: 'integer', default: 0 })
+  submitAttempt: number = 0
+
+  @Property({ name: 'submit_progress', type: 'text', nullable: true })
+  submitProgress?: string | null
+
+  @Property({ name: 'submit_started_at', type: Date, nullable: true })
+  submitStartedAt?: Date | null
+
+  @Property({ name: 'outcome_kind', type: 'text', nullable: true })
+  outcomeKind?: 'order' | 'quote' | null
+
+  @Property({ name: 'sales_order_id', type: 'uuid', nullable: true })
+  salesOrderId?: string | null
+
+  @Property({ name: 'sales_quote_id', type: 'uuid', nullable: true })
+  salesQuoteId?: string | null
+
+  @Property({ name: 'terms_accepted_at', type: Date, nullable: true })
+  termsAcceptedAt?: Date | null
+
+  @Property({ name: 'consent_flags', type: 'jsonb', nullable: true })
+  consentFlags?: Record<string, unknown> | null
+
+  @Property({ name: 'failure_code', type: 'text', nullable: true })
+  failureCode?: string | null
+
+  /** Never holds PII (§4.1). */
+  @Property({ name: 'failure_detail', type: 'text', nullable: true })
+  failureDetail?: string | null
+
+  @Property({ name: 'expires_at', type: Date })
+  expiresAt!: Date
+
+  @Property({ name: 'completed_at', type: Date, nullable: true })
+  completedAt?: Date | null
+
+  @Property({ name: 'created_at', type: Date, onCreate: () => new Date() })
+  createdAt: Date = new Date()
+
+  @Property({ name: 'updated_at', type: Date, onUpdate: () => new Date() })
+  updatedAt: Date = new Date()
+
+  @Property({ name: 'deleted_at', type: Date, nullable: true })
+  deletedAt?: Date | null
+}
+
+/** §4.1 status enum, verbatim. */
+export type CheckoutSessionStatus =
+  | 'open'
+  | 'awaiting_approval'
+  | 'submitting'
+  | 'awaiting_payment'
+  | 'completed'
+  | 'failed'
+  | 'canceled'
+  | 'expired'
+
+/** §5.2 step machine, verbatim. */
+export type CheckoutSessionStep = 'contact' | 'addresses' | 'delivery' | 'payment' | 'review'
+
+/**
+ * Append-only audit of every step transition, external call and outcome (§4.2). No update,
+ * no delete; exempt from optimistic locking (C20) — there is no `updated_at` to guard.
+ * `payload` is redacted at write time (`lib/sessionEvents.ts`, C14): ids, codes, amounts and
+ * statuses only, never card data, addresses, e-mail, phone or gateway secrets.
+ */
+@Entity({ tableName: 'checkout_session_events' })
+@Index({ properties: ['tenantId', 'organizationId', 'sessionId', 'createdAt'] })
+export class CheckoutSessionEvent {
+  [OptionalProps]?: 'payload' | 'createdAt'
+
+  @PrimaryKey({ type: 'uuid', defaultRaw: 'gen_random_uuid()' })
+  id!: string
+
+  @Property({ name: 'organization_id', type: 'uuid' })
+  organizationId!: string
+
+  @Property({ name: 'tenant_id', type: 'uuid' })
+  tenantId!: string
+
+  @Property({ name: 'session_id', type: 'uuid' })
+  sessionId!: string
+
+  @Property({ type: 'text' })
+  kind!: string
+
+  @Property({ type: 'jsonb', nullable: true })
+  payload?: Record<string, unknown> | null
+
+  @Property({ type: 'text' })
+  actor!: 'buyer' | 'system' | 'merchant' | 'agent'
+
+  @Property({ name: 'created_at', type: Date, onCreate: () => new Date() })
+  createdAt: Date = new Date()
+}
+
+export default [CheckoutLinkTemplate, CheckoutLink, CheckoutTransaction, CheckoutSession, CheckoutSessionEvent]

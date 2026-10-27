@@ -292,4 +292,30 @@ export type CreateLinkInput = z.infer<typeof createLinkSchema>
 export type UpdateLinkInput = z.infer<typeof updateLinkSchema>
 export type CreateTransactionInput = z.infer<typeof transactionCreateSchema>
 export type UpdateTransactionStatusInput = z.infer<typeof transactionUpdateStatusSchema>
+
+// Release 5, Step 2.12 (B.1, §9.0). Only `{ source: 'cart' }` is accepted today —
+// `{ source: 'link' }` (B.2, merchant-initiated simple-checkout links) lands in Step 3.5;
+// sending it now fails validation with a `400`, not a silent no-op.
+export const checkoutSessionCreateSchema = z.object({
+  source: z.literal('cart'),
+})
+
+// §9's route table: `PATCH /sessions/current` — "Contact, addresses, consent, terms
+// acceptance". Step/delivery/payment fields (§5.2, B.3) are not part of this Step's
+// skeleton. Every field is optional — the route applies only the keys the caller sends.
+const optionalAddressSchema = z.record(z.string(), z.unknown()).optional().nullable()
+
+export const checkoutSessionUpdateSchema = z.object({
+  email: optionalTrimmedString,
+  phone: optionalTrimmedString,
+  shippingAddress: optionalAddressSchema,
+  billingAddress: optionalAddressSchema,
+  billingSameAsShipping: z.boolean().optional(),
+  locale: optionalTrimmedString,
+  consentFlags: z.record(z.string(), z.unknown()).optional().nullable(),
+  termsAccepted: z.boolean().optional(),
+})
+
+export type CheckoutSessionCreateInput = z.infer<typeof checkoutSessionCreateSchema>
+export type CheckoutSessionUpdateInput = z.infer<typeof checkoutSessionUpdateSchema>
 export type PublicSubmitInput = z.infer<typeof publicSubmitSchema>

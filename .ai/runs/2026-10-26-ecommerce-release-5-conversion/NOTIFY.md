@@ -878,3 +878,96 @@
   without pausing). No quality impact; resuming strict every-5 pacing from Step 2.12.
 - Decisions/problems: none blocking. One non-blocking gap from 2.11 (purge sweeper / converted
   baskets' code reservations) already logged above.
+
+## 2026-10-27T20:30:00Z — Step 2.12 (checkout B.1: session entity, step machine, C14 minimum)
+- First `checkout`-module Step in this run. `checkout` was Phase-A-only before this Step (pay
+  links/templates/transactions, `/pay/[slug]`); `index.ts` declared NO `requires` at all.
+- Shipped: `CheckoutSession` + `CheckoutSessionEvent` entities + hand-authored migration
+  (`Migration20261027120000.ts`) + `.snapshot-open-mercato.json` edit (local Postgres holds
+  unrelated QA-session schema drift, same reasoning Step 2.10 already gave — ran `yarn generate`
+  only, not `yarn db:generate`, against this worktree); `checkout.session.create`/`.update`
+  commands; `POST /api/checkout/sessions` (buyer, from `{ source: 'cart' }` + `X-Cart-Token`
+  only — `{ source: 'link' }`/B.2 is Step 3.5's own scope and fails zod validation, not a
+  silent no-op); `GET`/`PATCH /api/checkout/sessions/current` (`X-Checkout-Session-Token`,
+  D-R5-33 binding, C21 scope); admin `GET /api/checkout/sessions` + `/sessions/[id]`
+  (`checkout.sessions.view`); `checkout.sessions.view`/`.manage` ACL + `employee`/`admin` grants
+  (D-R5-34); `checkout:checkout_session` encryption map (email/phone/shipping_address/
+  billing_address); `CheckoutSessionEvent.payload` allowlist-redaction at write time;
+  `enforceCheckoutRateLimit` extended with an additive `keyOverride` + three new rate-limit
+  configs (create 20/min/IP, mutate 60/min/session + 120/min/IP, all fail-closed per §13's own
+  table); `lib/session-status-machine.ts` (the §4.1 status enum + this Step's own synthesized
+  legal-transition table, CAS-enforced via `nativeUpdate`, same pattern as `checkout.transaction
+  .updateStatus`'s `VALID_CHECKOUT_TRANSITIONS`).
+- **Decision — scope cut on session creation's cross-module cart lookup (not in the task brief,
+  found during implementation):** `cart.get`'s own command input REQUIRES `tenantId`/
+  `organizationId` upfront, which checkout cannot know before resolving a bare `X-Cart-Token`
+  (a guest buyer's only credential, §9.0 — no store/host-mapped tenant resolution is reliable for
+  every channel: `storeContextService.resolve` ALWAYS requires a resolvable store-by-host, which
+  would make `POST /sessions` unusable for the agent/API-only selling model the spec's own
+  Executive Summary names as a release invariant). Resolved by a SCOPE-FREE lookup
+  (`lib/cartPeer.ts#lookupCartPeerByToken`) against `cart`'s globally-unique `carts.token_hash`
+  column via a raw Kysely select on the table name — never an import of `cart`'s `Cart` entity or
+  any `cart/lib` function (the spec's own "checkout imports nothing from cart/lib" rule, §6),
+  mirroring `ecommerce/lib/storeContextService.ts#lookupStoreTenantId`'s own precedent for this
+  exact "FK-id + snapshot" coupling style (`packages/core/AGENTS.md` § Cross-Module Coupling).
+  The found row's own `tenantId`/`organizationId` become the session's ground truth. Alternative
+  considered: require `storeContextService.resolve` for every session creation — rejected as
+  making link/API/agent-channel session creation impossible with no ecommerce store configured,
+  contradicting the module's own stated release invariant.
+- **Decision — §7.1 check 4 (store/channel/currency consistency, C9) is NOT enforced at session
+  CREATE in this Step.** The task's own Implementation list scopes this Step to the session
+  entity + skeleton + security baseline, explicitly excluding B.3/B.4 business logic; C9 is a
+  SUBMIT precondition (Step 4.1) that the spec ALSO names at creation (§7.1), but implementing
+  the request-host-resolved-store comparison requires the same `storeContextService.resolve`
+  call this Step deliberately avoids making mandatory (see above). The session instead copies the
+  cart's own `storeId`/`channel`/`currencyCode` verbatim — correct as a snapshot, just not yet
+  cross-checked against a request-resolved store. **Follow-up needed**: Step 3.5 (B.2) or a
+  dedicated gap-fill must add the `storeContextService.resolve(request, { fresh: true })` +
+  `cart_store_mismatch` check at `POST /sessions` before B.3/B.4 can rely on it being pre-verified.
+- **Decision — exact state-enum adjacency table (the spec gives prose, not a table).** Built
+  `VALID_CHECKOUT_SESSION_TRANSITIONS` as: `open -> {awaiting_approval, submitting, canceled,
+  expired}`; `awaiting_approval -> {open, failed, canceled, expired}`; `submitting ->
+  {awaiting_payment, completed, failed, open}`; `awaiting_payment -> {completed, failed}`;
+  `completed`/`failed`/`canceled`/`expired` terminal. Same-state transitions are idempotent
+  no-ops (mirrors `isValidCheckoutStatusTransition`'s own convention for `CheckoutTransaction`).
+  Full per-row citation to the spec section it derives from is in `lib/session-status-machine.ts`'s
+  own doc comment. Only `open -> canceled` (cancel route skeleton via the "one live session per
+  cart" supersede rule, §9.0) is actually EXERCISED by code this Step ships — every other row is
+  untested-by-business-logic until Steps 2.13/3.5/4.1/4.2 land, but is unit-tested directly as a
+  legal transition via the table itself.
+- **Decision — exact rate-limit numbers for `POST /sessions` (C14 doesn't name them).** §13's own
+  table in the REVISED spec actually DOES name them explicitly (20/min per IP, fail-closed;
+  60/min per session + 120/min per IP for `/current` mutations) — read §13 directly rather than
+  guessing, since the task brief's own framing ("C14 doesn't name them explicitly") pre-dated the
+  spec revision pass. Used the spec's literal numbers, not invented ones.
+- **Decision — `/sessions/current/step` and `/sessions/current/cancel` are NOT built in this
+  Step**, despite the spec's own §17 Phase B.1 scope naming both. The task brief's own
+  Implementation bullet list enumerates only `POST /sessions` (create) and `GET`/`PATCH /sessions/
+  current` as this Step's route surface, and none of the 9 test priorities names either route.
+  Building them now would mean inventing the step-navigation validation (`/step`) and the
+  approval-interaction rule ("the cart's approval is kept") for `/cancel` ahead of any Step that
+  actually needs them. **Follow-up needed**: a later checkout Step (2.13 or a gap-fill) should
+  add both, reusing `lib/currentSessionRoute.ts#resolveCurrentSession` and `lib/session-status-
+  machine.ts` exactly as this Step's `current/route.ts` already does.
+- **Decision — `expire-checkout-sessions` background job is NOT built in this Step**, though §17
+  Phase B.1 names it. Not in the task brief's own Implementation list or test-priority list;
+  `CheckoutSession.expiresAt` is written (1-hour placeholder TTL, documented in `commands/
+  session.ts`) so a later Step can build the sweep without a further migration. **Follow-up
+  needed**: register the job + its `setup.ts` schedule when a Step actually needs sessions to
+  stop accumulating as `open` forever.
+- Files: `packages/checkout/src/modules/checkout/data/entities.ts` (+`CheckoutSession`,
+  `CheckoutSessionEvent`), `data/validators.ts` (+create/update schemas), `migrations/
+  Migration20261027120000.ts` + `.snapshot-open-mercato.json`, `encryption.ts`, `acl.ts`,
+  `setup.ts`, `events.ts` (+`.created`/`.canceled`), `commands/session.ts` (+`commands/index.ts`
+  wiring), `lib/tryResolve.ts`, `lib/sessionToken.ts`, `lib/cartPeer.ts`, `lib/currentSessionRoute.ts`,
+  `lib/session-status-machine.ts`, `lib/sessionEvents.ts`, `lib/sessionView.ts`, `lib/rateLimiter.ts`
+  (additive `keyOverride` + 3 new configs), `api/sessions/route.ts`, `api/sessions/[id]/route.ts`,
+  `api/sessions/current/route.ts`. Tests added: `lib/__tests__/session-status-machine.test.ts`,
+  `lib/__tests__/sessionEvents.test.ts`, `lib/__tests__/currentSessionRoute.identity-binding.test.ts`,
+  `commands/__tests__/session.test.ts`, `api/sessions/__tests__/route.test.ts`,
+  `__tests__/phase-a-non-regression.test.ts`, `__tests__/encryption.test.ts` (extended).
+- Checks (local mode, from repo root): `yarn generate` — clean. `yarn workspace @open-mercato/
+  checkout run typecheck` — clean, exit 0. `yarn workspace @open-mercato/checkout test` — 37/37
+  suites, 272/272 tests, ZERO regressions on the pre-existing 36/270 Phase-A suite (C10
+  guarantee). `yarn build:packages` — 40/40 tasks successful (incl. `@open-mercato/core` and
+  `@open-mercato/checkout`).

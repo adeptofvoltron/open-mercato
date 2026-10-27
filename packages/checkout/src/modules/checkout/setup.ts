@@ -64,8 +64,20 @@ export const setup: ModuleSetupConfig = {
 
   defaultRoleFeatures: {
     superadmin: ['checkout.*'],
-    admin: ['checkout.view', 'checkout.create', 'checkout.edit', 'checkout.delete', 'checkout.viewPii', 'checkout.export'],
-    employee: ['checkout.view'],
+    admin: [
+      'checkout.view',
+      'checkout.create',
+      'checkout.edit',
+      'checkout.delete',
+      'checkout.viewPii',
+      'checkout.export',
+      // Release 5, Step 2.12 (D-R5-34): admin keeps both session features.
+      'checkout.sessions.view',
+      'checkout.sessions.manage',
+    ],
+    // Release 5, Step 2.12 (D-R5-34): least privilege — `employee` gets `.view` only;
+    // `.manage` stays admin-only or is granted by hand.
+    employee: ['checkout.view', 'checkout.sessions.view'],
   },
 
   async seedExamples(ctx) {

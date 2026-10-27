@@ -69,8 +69,15 @@ export async function enforceCheckoutRateLimit(options: {
   namespace: string
   errorMessage: string
   posture: CheckoutRateLimitPosture
+  /**
+   * Overrides the default IP-derived key (`buildCheckoutRateLimitKey`). Session-scoped
+   * checkout routes (§13: "60/min per session" on `/sessions/current/*` mutations) key by
+   * the session's own token hash instead of the caller's IP — additive, every existing
+   * caller omits it and keeps the IP-keyed behavior unchanged.
+   */
+  keyOverride?: string
 }): Promise<NextResponse | null> {
-  const { req, container, config, namespace, errorMessage, posture } = options
+  const { req, container, config, namespace, errorMessage, posture, keyOverride } = options
   const rateLimiter = resolveOptionalRateLimiter(container)
   if (!rateLimiter) {
     logger.error('Rate limiter service is not registered — check RATE_LIMIT_* configuration; checkout rate limiting is not enforced', {
@@ -81,7 +88,7 @@ export async function enforceCheckoutRateLimit(options: {
   }
 
   try {
-    const key = buildCheckoutRateLimitKey(req, rateLimiter, namespace)
+    const key = keyOverride ?? buildCheckoutRateLimitKey(req, rateLimiter, namespace)
     return await checkRateLimit(rateLimiter, config, key, errorMessage, {
       failClosed: posture === 'fail-closed',
     })
@@ -122,3 +129,38 @@ export const checkoutPasswordRateLimitConfig = readEndpointRateLimitConfig('CHEC
   blockDuration: 120,
   keyPrefix: 'checkout-password',
 })
+
+// Release 5, Step 2.12 (B.1, §13 — C14's rate-limit minimum). Exact numbers per the
+// revised spec's own table; see `NOTIFY.md` for the create route's own (unnamed by C14)
+// choice.
+export const checkoutSessionCreateRateLimitConfig = readEndpointRateLimitConfig('CHECKOUT_SESSION_CREATE', {
+  points: 20,
+  duration: 60,
+  blockDuration: 60,
+  keyPrefix: 'checkout-session-create',
+})
+
+/** §13: "60/min per session" on every `PATCH`/`POST` under `/sessions/current`. */
+export const checkoutSessionMutateSessionRateLimitConfig = readEndpointRateLimitConfig('CHECKOUT_SESSION_MUTATE_SESSION', {
+  points: 60,
+  duration: 60,
+  blockDuration: 60,
+  keyPrefix: 'checkout-session-mutate-session',
+})
+
+/** §13: "120/min per IP" on the SAME routes — enforced alongside, not instead of, the
+ * per-session bucket above. */
+export const checkoutSessionMutateIpRateLimitConfig = readEndpointRateLimitConfig('CHECKOUT_SESSION_MUTATE_IP', {
+  points: 120,
+  duration: 60,
+  blockDuration: 60,
+  keyPrefix: 'checkout-session-mutate-ip',
+})
+
+/** Builds the session-scoped rate-limit key for `/sessions/current/*` mutations —
+ * `enforceCheckoutRateLimit`'s `keyOverride`, keyed by the session's own token hash
+ * (never the plaintext token) so the bucket survives across requests from different IPs
+ * for the same session. */
+export function buildCheckoutSessionScopedRateLimitKey(namespace: string, sessionTokenHash: string): string {
+  return `${namespace}:session:${sessionTokenHash}`
+}

@@ -17,6 +17,14 @@ const events = [
   { id: 'checkout.transaction.cancelled', label: 'Transaction Cancelled', entity: 'transaction', category: 'lifecycle' },
   { id: 'checkout.transaction.expired', label: 'Transaction Expired', entity: 'transaction', category: 'lifecycle' },
   { id: 'checkout.link.usageLimitReached', label: 'Usage Limit Reached', entity: 'link', category: 'lifecycle', clientBroadcast: true },
+  // Release 5, Step 2.12 (B.1, §10). State signals only — no checkout event sends a
+  // notification to a buyer or approver (D-R5-32). The full §10 family (`.step_changed`,
+  // `.submitted`, `.completed`, `.failed`, `.expired`, `.approval_*`, `checkout.payment.*`,
+  // `checkout.compensation.*`) is declared incrementally as the Step that emits it lands
+  // (Steps 2.13/3.5/4.1/4.2) — declaring an event with no emitter yet is the same dead-
+  // surface this run's own precedent (Step 2.7) avoided for `customer_groups.approval.decided`.
+  { id: 'checkout.session.created', label: 'Checkout Session Created', entity: 'session', category: 'lifecycle' },
+  { id: 'checkout.session.canceled', label: 'Checkout Session Canceled', entity: 'session', category: 'lifecycle' },
 ] as const
 
 export const eventsConfig = createModuleEvents({ moduleId: 'checkout', events })

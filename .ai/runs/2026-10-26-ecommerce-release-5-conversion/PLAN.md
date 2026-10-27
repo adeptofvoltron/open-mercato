@@ -41,7 +41,7 @@
 | 2 | 2.9 | cart: D-R5-21/D-R5-22 identity binding on `/current/*` + trusted `resolveForBuyer` path for pay_link/api/agent | dispatch:standard | done | pending |
 | 2 | 2.10 | cart: `markConverted` additive inputs (`salesOrderId`/`lineMap`/`salesQuoteId`, K8/D-R5-26); admin list + detail + reprice (K6) | dispatch:standard | done | pending |
 | 2 | 2.11 | cart: abandonment payload (K9) + code-reservation release on expire/abandon (K11) | dispatch:standard | done | pending |
-| 2 | 2.12 | checkout: B.1 session entity + step machine + token hash + C14 minimum (rate limits, encryption, redaction) | dispatch:standard | todo | — |
+| 2 | 2.12 | checkout: B.1 session entity + step machine + token hash + C14 minimum (rate limits, encryption, redaction) | dispatch:standard | done | pending |
 | 2 | 2.13 | checkout: B.3 delivery + payment step (rate quoting C13, delivery-promotions evaluation C8) | dispatch:standard | todo | — |
 | 3 | 3.1 | cart: approval gate K1–K5 (`requiresApproval`, lock refusal, `purpose: 'quote'` skip D-R5-23, guest fail-closed D-R5-12/29) | dispatch:standard | todo | — |
 | 3 | 3.2 | cart: `/current/request-approval` route + lifecycle withdrawal wiring (K3/K4/K7, `awaiting_approval_since` K5) | dispatch:standard | todo | — |
@@ -671,6 +671,27 @@ commit `c92470d8d5`).
   cart purged 90 days late) rather than the cause (two commands that can resolve a basket without
   ever releasing its codes), and as a sweeper quietly growing a responsibility (per-command
   lifecycle cleanup) this Step was never asked to give it.
+
+- Step 2.12 (checkout B.1, C10/C9/C14/C20/D-R5-33): `checkout`'s own `requires` confirmed
+  unchanged (still none) — the Phase-A-only-boot guarantee holds by construction (zero static
+  imports of `cart`/`customer_groups`/`availability`/`promotions`/`shipping_carriers`/`ecommerce`
+  anywhere in the new code; every peer is `tryResolve`d). Session creation resolves the cart
+  addressed by `X-Cart-Token` via a SCOPE-FREE Kysely read against `carts.token_hash` (globally
+  unique) rather than requiring `storeContextService.resolve` up front — the latter would make
+  session creation impossible for link/API/agent-channel carts with no store configured,
+  contradicting the module's own "sells through the API and pay links, without a storefront"
+  invariant. Consequence: §7.1 check 4 (store/channel/currency match, C9) is NOT enforced at
+  session CREATE in this Step — the session snapshots the cart's own store/channel/currency
+  verbatim; a later Step (3.5 or a gap-fill) must add the request-resolved-store comparison
+  before B.3/B.4 can rely on it. `/sessions/current/step` and `/sessions/current/cancel` (named
+  by the spec's own §17 Phase B.1 scope) and the `expire-checkout-sessions` job are also deferred
+  — none is in the task brief's own Implementation/test-priority list; `CheckoutSession.expiresAt`
+  is written now (placeholder 1h TTL) so the job can be added without a further migration. The
+  state-machine's exact adjacency table (the spec gives prose, not a table) and the exact
+  rate-limit numbers are both documented in `lib/session-status-machine.ts`'s own doc comment and
+  `lib/rateLimiter.ts` respectively — §13's revised text actually DOES name the rate-limit numbers
+  explicitly (20/min/IP create; 60/min/session + 120/min/IP mutate, both fail-closed), so those
+  were read from the spec, not invented. Full reasoning: NOTIFY.md's Step 2.12 entry.
 
 ## External References
 
