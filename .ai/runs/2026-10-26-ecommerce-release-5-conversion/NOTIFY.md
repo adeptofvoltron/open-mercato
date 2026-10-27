@@ -1186,3 +1186,29 @@ payment methods listing)
   472/472 tests, zero regressions. Full `src/modules/currencies` suite: 27/27, 203/203,
   zero regressions (unaffected — `baseCurrencyService` itself was not touched, only
   consumed).
+
+## 2026-10-27T21:30:00Z — dispatcher: fix-forward Step 3.1-fix
+- A forced full `yarn typecheck` run immediately after Step 3.1 landed found a real TS error
+  (`TS2741`/later `TS2322`) at `packages/core/src/modules/ecommerce/api/stores/crud.ts`'s
+  `mergeStoreSettings`: Step 2.13 added a required `shipping` field to `EcommerceStoreSettings`
+  (and a separate omission — `shipping` was never added to `EcommerceStoreSettingsPatchSchema`
+  either, meaning there was previously no way to ever SET it via `PUT /stores/:id`) but never
+  updated this pre-existing merge function or the patch schema. Oddly, Checkpoint 6's own forced
+  typecheck (run right after Step 2.13, before Step 3.1) reported this exact file tree as clean
+  (`40 successful, 40 total, 0 cached`) — re-confirmed by inspecting the committed source at
+  `aac84cb6ad` directly: the bug was present in that commit's source. The checkpoint's green result
+  for this specific check cannot be explained from the committed diff alone and is not reproduced
+  on a second forced run against the same commit; logged here as an unresolved discrepancy rather
+  than asserted as a known cause, so it isn't mistaken for a resolved explanation.
+- Fixed directly (small, well-understood, one-line-class fix): moved `currencyCodeSchema`/
+  `ecommerceStoreShippingSchema` above `ecommerceStoreSettingsPatchSchema` (declaration-order
+  fix), added `shipping: ecommerceStoreShippingSchema.optional()` to the patch schema (full-object
+  replace, matching contact/seo/branding), and `shipping: patch.shipping ?? current?.shipping ?? {
+  flatRate: null }` to `mergeStoreSettings`. Added two regression tests (set via patch; preserved
+  when the patch doesn't touch it) plus updated one pre-existing test's assertion that had been
+  silently relying on the missing field. Full monorepo forced typecheck (40/40, 0 cached) and the
+  full `ecommerce` suite (68/68 suites, 893/893 tests — 2 new) now pass.
+- Lesson for future checkpoints in this run: treat a clean forced typecheck as strong evidence, not
+  absolute proof — if a later Step's own typecheck disagrees with a prior checkpoint's result for
+  the same committed tree, trust the fresh run and fix forward, as done here, rather than assuming
+  the fresh run is wrong.
