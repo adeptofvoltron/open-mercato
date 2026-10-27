@@ -138,3 +138,47 @@ export async function lookupCartPeerById(
   if (!row) return null
   return toCartPeerRow(row)
 }
+
+// Release 5, Step 4.1 (checkout §7.2 step 2, flagged by Step 2.13's own NOTIFY entry: "a
+// combined code+delivery rule is a gap... flagged for Step 4.1's own submit-time
+// re-evaluation to close for real"). `promotionsService.evaluate()`'s own `codes: CodeRef[]`
+// input needs the cart's currently-entered codes — `cart`'s own `cart_promotion_applications`
+// table (`code_id`/`code_type`, non-null only for an EXPLICITLY entered code; an automatic,
+// codeless promotion's application row carries neither) is the same "FK-id + snapshot" read
+// `lib/cartLinesPeer.ts`/`lib/cartPeer.ts` already establish for this module — never an
+// import of `cart/lib`.
+export type CartPromotionApplicationsDatabase = {
+  cart_promotion_applications: {
+    cart_id: string
+    tenant_id: string
+    organization_id: string
+    code_id: string | null
+    code_type: string | null
+  }
+}
+
+export type CartEnteredCodeRef = { id: string; type: 'static' | 'dynamic' }
+
+export async function lookupCartEnteredCodes(
+  em: EntityManager,
+  cartId: string,
+  scope: { tenantId: string; organizationId: string },
+): Promise<CartEnteredCodeRef[]> {
+  const rows = await em
+    .getKysely<CartPromotionApplicationsDatabase>()
+    .selectFrom('cart_promotion_applications')
+    .select(['code_id', 'code_type'])
+    .where('cart_id', '=', cartId)
+    .where('tenant_id', '=', scope.tenantId)
+    .where('organization_id', '=', scope.organizationId)
+    .where('code_id', 'is not', null)
+    .execute()
+
+  const byId = new Map<string, CartEnteredCodeRef>()
+  for (const row of rows) {
+    if (!row.code_id) continue
+    const type: 'static' | 'dynamic' = row.code_type === 'dynamic' ? 'dynamic' : 'static'
+    byId.set(row.code_id, { id: row.code_id, type })
+  }
+  return Array.from(byId.values())
+}

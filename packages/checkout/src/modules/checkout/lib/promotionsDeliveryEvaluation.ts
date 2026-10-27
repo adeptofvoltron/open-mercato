@@ -2,6 +2,7 @@ import { asValue } from 'awilix'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import type {
   BuyerContext,
+  CodeRef,
   DeliveryDiscountEffect,
   EvaluateItem,
   PromotionsService,
@@ -71,6 +72,14 @@ export async function evaluateDeliveryDiscount(
     currencyCode: string
     deliveryMethodCode: string
     deliveryCost: string
+    /**
+     * Release 5, Step 4.1 (§7.2 step 2). Closes the gap Step 2.13 flagged in NOTIFY.md: a
+     * combined code+delivery rule needs the cart's currently-entered codes re-derived
+     * (`lib/cartPeer.ts#lookupCartEnteredCodes`) — defaults to `[]`, preserving Step 2.13's
+     * own delivery-selection call (`commands/delivery.ts`) exactly as it behaved before this
+     * Step, since that call site has no reason to re-derive codes on every rate re-quote.
+     */
+    codes?: CodeRef[]
   },
 ): Promise<DeliveryDiscountResult | null> {
   const promotionsService = tryResolve<PromotionsService>(container, 'promotionsService')
@@ -102,7 +111,7 @@ export async function evaluateDeliveryDiscount(
       buyer,
       customerOrderCount: null,
       cartWeight: null,
-      codes: [],
+      codes: input.codes ?? [],
       deliveryMethodCode: input.deliveryMethodCode,
       deliveryCost: input.deliveryCost,
     })

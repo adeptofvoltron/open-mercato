@@ -160,6 +160,19 @@ const lockCartCommand: CommandHandler<CartLockInput, CartLockResult> = {
     // `requireActive` caller — `cart.lock` only ever fires `active -> locked` (§9).
     if (existingCart.status !== 'active') throw notFound('[internal] cart not found')
 
+    // §6a.1a/C2 (Release 5 Phase 4, checkout's own submit sequence): every `storefront`
+    // cart was created through the route edge, which always resolves and supplies a
+    // `routeContext` — a caller that locks a storefront cart without one is a programming
+    // error (fail fast), mirroring `commands/lines.ts#assertStorefrontHasRouteContext`'s
+    // identical defense-in-depth check at this module's own line-write call sites. Deferred
+    // by Step 2.8/2.9 ("until a real caller exists") — checkout (Step 4.1) is that caller.
+    if (existingCart.channel === 'storefront' && !input.routeContext) {
+      throw new CrudHttpError(400, {
+        error: '[internal] assortment_scope_required_for_storefront_channel',
+        code: 'assortment_scope_required_for_storefront_channel',
+      })
+    }
+
     // §9/§6a.2/§6a.5/D-R4-22: forces a whole-cart re-price AND (via this step's own
     // extension of `commands/cart.ts`'s `runWholeCartRevisibilityPass`) the whole-cart
     // re-visibility pass, with a freshly-resolved buyer context, BEFORE this command ever

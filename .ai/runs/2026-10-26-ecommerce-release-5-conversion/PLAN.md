@@ -49,7 +49,7 @@
 | 3 | 3.3 | cart: §7a proposal seam commands (create/withdraw/supersede/re-author, D-R5-14) | dispatch:standard | done | pending |
 | 3 | 3.4 | cart: §7a proposal routes + sweeper branches (K13–K16/S13–S15) + undo-merge refusal (D-R5-25) | dispatch:standard | done | pending |
 | 3 | 3.5 | checkout: B.2 cart-backed links — trusted pay-link seeding (D-R5-19) + store/channel/currency check (C9) | dispatch:standard | done | pending |
-| 4 | 4.1 | checkout: B.4 submit sequence part 1 — preconditions, lock, `availability.reserve`, `reserveCredit`, idempotent document creation (C3/C7) | dispatch:standard | todo | — |
+| 4 | 4.1 | checkout: B.4 submit sequence part 1 — preconditions, lock, `availability.reserve`, `reserveCredit`, idempotent document creation (C3/C7) | dispatch:standard | done | pending |
 | 4 | 4.2 | checkout: B.4 submit sequence part 2 — commit, credit link, codes/usage, gateway, `lineMap`, recovery table (C5/C6/C18/C24) | dispatch:standard | todo | — |
 | 4 | 4.3 | assisted_selling: module scaffold, store settings, `mode: rep\|off` validator, module registration (D-R5-36) | dispatch:standard | todo | — |
 | 4 | 4.4 | assisted_selling: threads/participants/messages + staff author routes wrapping `cart.proposal.create` | dispatch:standard | todo | — |
@@ -1039,6 +1039,84 @@ commit `c92470d8d5`).
   one pre-existing test needed a `storeContextService` mock added (a storefront cart with a
   real store now genuinely requires one, matching §3.4's own documented behavior), every other
   pre-existing test already uses a `store_id: null` cart peer and is completely unaffected.
+
+- Step 4.1 (checkout B.4 submit, C19 steps 1-5): the Step 2.13 NOTIFY question ("does submit
+  take the payment method as a direct input, or build a selection route first?") is resolved
+  as the FORMER — `checkout.session.submit`'s own input carries a required `paymentMethodCode`
+  field, read nowhere else; no `POST /sessions/current/payment` route is built by this Step (or
+  any Step before it). `purpose` stays `'order'` unconditionally — `paymentMethodCode ===
+  'request_quote'` is refused outright (`422 payment_method_unavailable`) rather than silently
+  mis-handled, since the quote branch's own `cart.lock({ purpose: 'quote' })` semantics are
+  Step 5.1's scope.
+- Step 4.1 (C7, genuine gap found during implementation, not anticipated by the task brief):
+  `cartService.getSalesSnapshot` — the function C7/the cart module's own spec (§3.1a/§9.1 rev
+  10) names as the single source checkout must use to build its quote — did NOT exist anywhere
+  in the `cart` module before this Step (confirmed: zero hits for `getSalesSnapshot`/
+  `toSalesSnapshots` outside spec/analysis text). Built it as `cart/lib/toSalesSnapshots.ts`
+  (per the spec's own named file path) plus a new `getSalesSnapshot` method on the existing
+  `cartService` DI key — additive, matching the cart spec's own BC table entry for exactly this
+  ("DI | cartService.getSalesSnapshot (new method on an existing key) | Additive"). Per-line
+  mapping reuses `lib/reprice.ts#toCartTotalsLineSnapshot` verbatim (never a second mapper);
+  order-scope adjustments are reconstructed from the persisted `CartPromotionApplication`
+  (`scope: 'order'`) rows rather than recomputed, since nothing holds the in-memory
+  `SalesAdjustmentDraft[]` `cart.reprice` built past that one request.
+- Step 4.1 (C2, the SAME genuine-gap class): `cart.lock`'s own storefront-routeContext
+  assertion, which C2's finding text explicitly names ("This adds the assertion lock.ts:75-85
+  deferred 'until a real caller exists'" — Step 2.8/2.9's own documented deferral), was still
+  unbuilt. Added it to `commands/lock.ts` (400 `assortment_scope_required_for_storefront_
+  channel`) and extended `cartService.lock`'s OWN input with an additive `request` field so a
+  cross-module caller (checkout) can get a real `ResolvedCartRouteContext` resolved WITHOUT
+  violating `routeContext.ts`'s own documented invariant ("the ONLY function permitted to
+  construct one is `resolveCartRouteContext`") — the facade resolves it in-module from the
+  request when supplied, degrading to `undefined` (never throwing) when `ecommerce` is absent,
+  so `cart.lock`'s own assertion is always the correct backstop either way.
+- Step 4.1 (`sales`, additive, Ask-First already covered by D-R5-30's own package accept):
+  `quoteCreateSchema`/`createQuoteCommand` never exposed `externalReference`/`customerReference`
+  as inputs, even though the `SalesQuote` entity has carried both columns since before this
+  release and `orderCreateSchema`/`createOrderCommand` already wire the identical pair — C3's
+  own design ("`sales.quotes.create` with: `external_reference`...") requires them. Closed the
+  gap with the minimal mirror of `orderCreateSchema`'s own two fields (additive, optional,
+  non-breaking) rather than a two-step create-then-update workaround (which would leave a
+  not-yet-externally-referenced quote briefly unindexed between the two calls). Added the
+  `(tenant_id, external_reference)` index itself (D-R5-30, pre-approved) as a hand-authored,
+  `CONCURRENTLY`-built migration (Migration20261028010000), matching this module's own
+  established precedent for a non-trivial table (Migration20260806120000/20260821120000/
+  20260916120000) rather than a `yarn db:generate` diff.
+- Step 4.1 (C7, the quote's own persisted totals vs. the cart's "goods" totals): the
+  calculation engine (`sales/lib/calculations.ts`) folds a `shipping`-kind adjustment directly
+  into `subtotalNet/GrossAmount` (not a separate "goods subtotal" field) — so the QUOTE's own
+  `subtotalNetAmount` etc., once checkout's own shipping + delivery-discount adjustments are
+  added, can never equal the CART's `subtotalNetAmount` key-for-key without first subtracting
+  shipping back out via engine-internal arithmetic this command would then have to keep in
+  sync forever. Implemented the equality check instead as an INDEPENDENT, goods-only
+  `salesCalculationService.calculateDocumentTotals` call (the same engine, the SAME
+  `snapshot.lines`/`snapshot.adjustments` — no shipping, no delivery discount), compared
+  against `cart.totals` — mathematically a sanity/regression guard (same engine, same inputs,
+  provably equal unless a real bug or a race exists) rather than a literal re-read of the
+  persisted quote row's own totals. D-R5-24's SEPARATE "full payable amount" check (goods
+  gross + delivery cost − delivery discount vs. the reserved credit amount) is a distinct
+  comparison, implemented separately, exactly as the task brief's own "do not conflate them"
+  instruction required.
+- Step 4.1 (idempotent-retry test scope, task brief's own test priority #2): "a killed-process-
+  style retry... resumes/no-ops correctly at each already-completed step" is tested as the
+  idempotent REUSE of an existing quote/order found by `external_reference`/`id` — not as two
+  literal top-level calls to `checkout.session.submit` with the same session. A second literal
+  call while `status = 'submitting'` is, per §7.4's own text, a UNIFORM `409
+  submit_in_progress` ("it does not queue behind it... never a resume") — the only way the SAME
+  attempt/keys are genuinely replayed is a crash-recovery mechanism re-running the lower-level
+  calls directly, which is Step 4.2's own named scope (`recover-stuck-submits`, C24). Testing
+  the quote-lookup-before-create reuse directly is the one NEW idempotency mechanism this Step
+  itself builds; `cart.lock`'s own idempotent extend and `availability.reserve`/
+  `customerCreditService.reserveCredit`'s own idempotency-key replay are already covered by
+  their own Steps' test suites (2.8, 2.2, 1.6) and are not re-proven here.
+- Step 4.1 (availability absence, D-R5-18): gated on `tryResolve(container,
+  'policyResolutionService')` as the "is `availability` active" signal (the one DI key that
+  module's `di.ts` registers unconditionally) rather than dispatching `availability.reserve`
+  unconditionally and catching a "command not found" error — consistent with every other
+  soft-peer check this module already makes (`cartService`, `customerCreditService`,
+  `salesCalculationService`). The SAME gate protects the compensation path's `availability
+  .release` call, so a submit that never reserved stock (availability absent) never attempts a
+  pointless release that would otherwise be misreported as a compensation failure.
 
 ## External References
 

@@ -740,6 +740,13 @@ export const orderUpdateSchema = z
 
 export const quoteCreateSchema = scoped.extend({
   quoteNumber: z.string().trim().min(1).max(191).optional(),
+  // Release 5 Phase 4 (checkout C3/C19). Mirrors orderCreateSchema's own pair — the
+  // SalesQuote entity has carried both columns since before this release; only the create
+  // schema/command never exposed them as inputs. Checkout's idempotent document creation
+  // sets externalReference to 'checkout:' + sessionId + ':' + attempt and customerReference
+  // to the buyer's PO number (D-R5-28, deferred past this Step).
+  externalReference: z.string().trim().max(191).optional(),
+  customerReference: z.string().trim().max(191).optional(),
   statusEntryId: uuid().optional(),
   customerEntityId: uuid().optional(),
   customerContactId: uuid().optional(),

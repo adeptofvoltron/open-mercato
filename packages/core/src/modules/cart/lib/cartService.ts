@@ -1,3 +1,4 @@
+import type { EntityManager } from '@mikro-orm/postgresql'
 import type { CommandBus, CommandRuntimeContext } from '@open-mercato/shared/lib/commands'
 import { lockCartCommand, markConvertedCommand, unlockCartCommand } from '../commands/lock'
 import type {
@@ -8,6 +9,8 @@ import type {
   CartUnlockInput,
   CartUnlockResult,
 } from '../commands/lock'
+import { isCartStoreContextUnavailableError, resolveCartRouteContext } from './routeContext'
+import { getCartSalesSnapshot, type CartSalesSnapshot, type GetCartSalesSnapshotInput } from './toSalesSnapshots'
 
 // Step 7.5 — §9/§3.1a's own prose repeatedly says `cartService.lock`/`.unlock`/
 // `.markConverted` ("checkout calls the DI service/command directly, in-process") — but
@@ -24,10 +27,27 @@ export type CartServiceContainer = {
   resolve: <T = unknown>(name: string) => T
 }
 
+/**
+ * Release 5 Phase 4 (checkout C2). `cart.lock` itself only ever takes an ALREADY-resolved
+ * `ResolvedCartRouteContext` (§6a.1a: "an internal, branded type... the ONLY function
+ * permitted to construct one is `resolveCartRouteContext`"), so a cross-module caller like
+ * `checkout` cannot build one directly without violating that invariant. `request` is this
+ * facade's own additive input — when supplied (and `storeContextService` is available),
+ * `lock()` resolves a fresh `ResolvedCartRouteContext` itself, in-module, and forwards it;
+ * when absent, or when resolution fails because `ecommerce` is not registered, `routeContext`
+ * stays whatever the caller already passed (usually `undefined`) — `cart.lock`'s own
+ * storefront assertion (`commands/lock.ts`) is the backstop for a `storefront`-channel cart
+ * that still has no context by the time the command runs.
+ */
+export type CartServiceLockInput = CartLockInput & { request?: Request | null }
+
 export type CartService = {
-  lock(input: CartLockInput): Promise<CartLockResult>
+  lock(input: CartServiceLockInput): Promise<CartLockResult>
   unlock(input: CartUnlockInput): Promise<CartUnlockResult>
   markConverted(input: CartMarkConvertedInput): Promise<CartMarkConvertedResult>
+  /** (C7, `.ai/specs/2026-08-14-cart-module.md` §3.1a/§9.1 rev 10) The only source checkout
+   * uses to build its quote — see `lib/toSalesSnapshots.ts`'s own header comment. */
+  getSalesSnapshot(input: GetCartSalesSnapshotInput): Promise<CartSalesSnapshot>
 }
 
 type CartServiceAuthContext = CommandRuntimeContext['auth']
@@ -67,11 +87,33 @@ function resolveCartServiceCommandBus(container: CartServiceContainer): CommandB
 export class CartServiceImpl implements CartService {
   constructor(private readonly container: CartServiceContainer) {}
 
-  async lock(input: CartLockInput): Promise<CartLockResult> {
+  async lock(input: CartServiceLockInput): Promise<CartLockResult> {
+    const { request, ...commandInput } = input
+    let routeContext = commandInput.routeContext
+    if (!routeContext && request) {
+      try {
+        routeContext = await resolveCartRouteContext(request, this.container as unknown as {
+          resolve: <T = unknown>(name: string) => T
+        }, { fresh: true })
+      } catch (err) {
+        if (!isCartStoreContextUnavailableError(err)) throw err
+        // No `ecommerce` peer registered — leave `routeContext` unset; a storefront-channel
+        // cart will then correctly hit `cart.lock`'s own `assortment_scope_required_for_
+        // storefront_channel` refusal rather than this facade silently swallowing the gap.
+      }
+    }
     const commandBus = resolveCartServiceCommandBus(this.container)
-    const ctx = buildCartServiceCommandContext(this.container, input)
-    const { result } = await commandBus.execute<CartLockInput, CartLockResult>(lockCartCommand.id, { input, ctx })
+    const ctx = buildCartServiceCommandContext(this.container, commandInput)
+    const { result } = await commandBus.execute<CartLockInput, CartLockResult>(lockCartCommand.id, {
+      input: { ...commandInput, routeContext },
+      ctx,
+    })
     return result
+  }
+
+  async getSalesSnapshot(input: GetCartSalesSnapshotInput): Promise<CartSalesSnapshot> {
+    const em = (this.container.resolve('em') as EntityManager).fork()
+    return getCartSalesSnapshot(em, input)
   }
 
   async unlock(input: CartUnlockInput): Promise<CartUnlockResult> {

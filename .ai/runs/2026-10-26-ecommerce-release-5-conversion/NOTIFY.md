@@ -1705,3 +1705,105 @@ seeding D-R5-19 + store/channel/currency mismatch check C9)
 - Decisions/problems: none blocking. Two non-blocking gaps logged (CheckoutLinkCartTemplate admin
   write route; catalog-only template lines) — neither blocks Phase 4.
 - Phase 3 is complete. All 5 Steps landed plus one fix-forward; no rescues needed this phase.
+
+## 2026-10-28T01:30:00Z — Step 4.1 landed (checkout B.4 submit, steps 1-5 of C19/§7.2 —
+preconditions, cart.lock, availability.reserve, on-account reserveCredit, idempotent document
+creation + the C7 equality check — STOPS there, Step 4.2 continues)
+
+- First real caller of nearly every mechanism built in Phases 1-3 at once (cart lock,
+  availability reserve, credit reserve, the C9 guard) — built as ONE new command,
+  `checkout.session.submit` (`commands/submit.ts`), that performs steps 1-5 of the revised
+  §7.2 sequence and intentionally stops after document creation + the C7 check (session left
+  `submitting`, `submitProgress: 'document_created'`, `salesQuoteId`/`salesOrderId` written —
+  never `completed`/`failed`). Each of steps 1-5 is its own, separately-committing call
+  (`cart.lock`, `availability.reserve`, `customerCreditService.reserveCredit`,
+  `sales.quotes.create`, `sales.quotes.convert_to_order`); this orchestrating function is NOT
+  itself one outer transaction, matching §7.2's own "each step is a separate transaction."
+- **Payment-method-selection question (tracked after Step 2.13), resolved:** submit takes
+  `paymentMethodCode` as a direct, required input field — no `POST /sessions/current/payment`
+  selection route is built anywhere in this run. `purpose` stays `'order'` unconditionally;
+  `paymentMethodCode === 'request_quote'` is refused outright (`422
+  payment_method_unavailable`), since the quote branch is Step 5.1's own scope.
+- **Genuine gap found during implementation, not anticipated by the task brief (C7):**
+  `cartService.getSalesSnapshot` — the cart module's own spec (§3.1a/§9.1 rev 10) names this
+  as the ONE source checkout must use to build its quote — did not exist anywhere in `cart`
+  before this Step. Built `cart/lib/toSalesSnapshots.ts` (the spec's own named file path) plus
+  a new `getSalesSnapshot` method on the existing `cartService` DI key (additive, per the cart
+  spec's own BC table). Per-line mapping reuses `lib/reprice.ts#toCartTotalsLineSnapshot`
+  verbatim; order-scope adjustments are reconstructed from persisted `CartPromotionApplication`
+  (`scope: 'order'`) rows. See PLAN.md's own decision entries for the full reasoning on this
+  and the four other cross-module gaps this Step closed (`cart.lock`'s deferred storefront-
+  routeContext assertion, C2; `sales`'s missing `externalReference`/`customerReference` create
+  inputs, C3/D-R5-30; the C7-vs-D-R5-24 totals-comparison design; the idempotent-retry test
+  scoping decision; the availability-absence compensation gate).
+- **§7.2 step 2 (delivery re-evaluation) closed for real, per Step 2.13's own NOTIFY flag:**
+  re-validates the stored shipping rate (via the SAME `getOrComputeDeliveryOptions` cache Step
+  2.13's own `/current/delivery` command uses) and re-runs `evaluateDeliveryDiscount` with the
+  cart's CURRENTLY-entered codes, re-derived from `cart_promotion_applications`
+  (`lib/cartPeer.ts#lookupCartEnteredCodes`, new) — `evaluateDeliveryDiscount` itself gained an
+  additive, optional `codes` param (default `[]`, so Step 2.13's own `/current/delivery` call
+  site is completely unaffected). A mismatch against `session.quotedTotals` aborts `409
+  price_changed` with `reason: 'delivery_changed' | 'promotion_newly_eligible'`.
+- **C9 re-fires at submit, not just at session creation (Step 3.5's own documented gap, now
+  closed):** reuses `lib/cartSessionConsistency.ts`'s SAME `assertCartMatchesCheckoutScope` +
+  `resolveRequestStoreIdForConsistencyCheck` functions Step 3.5 left ready for exactly this —
+  no second implementation of the four comparisons.
+- **Preconditions built, per the task's own explicit scope:** C9 (above); K1/K2 approval and
+  D-R5-12 guest are enforced authoritatively INSIDE `cart.lock` itself (Step 3.1), so this
+  command does not duplicate them — only calls `cart.lock` with the right inputs. C15 PO
+  number/`min_order_value` are confirmed NOT implemented anywhere yet (grep-verified, same as
+  Step 3.1's own confirmation) and are correctly deferred to Step 5.1, per that Step's own
+  scope. Also added, not explicitly named by the brief but needed for a coherent sequence: cart
+  non-empty (`409 cart_empty`, checked via the snapshot read since nothing earlier can prove
+  it), a delivery method already selected (`422 steps_incomplete`).
+- **Compensation (§7.3):** a central `compensate()` helper releases credit/stock/unlocks the
+  cart per-step per the spec's own table, then CASes the session back to `open` — UNLESS the
+  compensation itself fails, in which case the session is deliberately left `submitting`
+  (recoverable by Step 4.2's own `recover-stuck-submits` job, C24) rather than silently
+  returning to `open` while a reservation may still be live (§7.3: "never swallowed"). The
+  created quote is never deleted on a totals-mismatch abort — left as an ordinary, visible,
+  unconverted quote, exactly per §7.3's own text.
+- **D-R5-24 vs. C7 — kept as two distinct comparisons, per the task's own explicit warning not
+  to conflate them:** C7 compares GOODS totals (cart vs. an independent, goods-only
+  `calculateDocumentTotals` call using the identical snapshot lines/adjustments — not the
+  persisted quote row's own totals, which also carry the shipping/delivery-discount
+  adjustments this command adds and are therefore not key-for-key comparable, since the
+  calculation engine folds a `shipping` adjustment into `subtotalNet/GrossAmount` by design).
+  D-R5-24 compares the FULL PAYABLE amount (goods gross + delivery cost − delivery discount)
+  against the reserved credit amount, ON-ACCOUNT ONLY (there is no "reserved amount" to compare
+  against on the gateway path). Either mismatch aborts the SAME `500 totals_mismatch`.
+- **Idempotent document creation (C3):** looks up an existing `SalesQuote` by `(tenant_id,
+  external_reference)` before ever calling `sales.quotes.create`; `convert_to_order` runs only
+  if no `SalesOrder` already exists for that id (the order's id defaults to the quote's own id,
+  the existing `documents.ts` convention — `orderId: payload.orderId ?? quote.id`). Both
+  lookups exclude a soft-deleted row (`deleted_at IS NULL`).
+- Files: `packages/checkout/src/modules/checkout/commands/submit.ts` (new, +tests),
+  `commands/index.ts` (registration), `events.ts` (+`checkout.session.submitted`,
+  `.compensation.executed`, `.compensation.failed`), `lib/cartPeer.ts`
+  (+`lookupCartEnteredCodes`), `lib/promotionsDeliveryEvaluation.ts` (+optional `codes` param).
+  Cross-module: `packages/core/src/modules/cart/lib/toSalesSnapshots.ts` (new, +tests),
+  `lib/cartService.ts` (+`getSalesSnapshot`, `lock()` gains an additive `request` field,
+  +tests), `commands/lock.ts` (+storefront routeContext assertion, +tests in `lock.test.ts`);
+  `packages/core/src/modules/sales/data/validators.ts` (+`externalReference`/
+  `customerReference` on `quoteCreateSchema`), `commands/documents.ts` (wired into
+  `createQuoteCommand`, +test), `data/entities.ts` (+index on `SalesQuote`),
+  `migrations/Migration20261028010000_sales_quotes_external_reference_idx.ts` +
+  `.snapshot-open-mercato.json`.
+- Checks (local mode, from repo root, `tsconfig.tsbuildinfo` wiped first per this run's own
+  Checkpoint-7 standard): forced full `yarn typecheck` — 40/40 tasks, 0 cached (core and
+  checkout genuine cache misses), clean. `yarn build:packages` — 40/40 successful. `yarn
+  generate` — clean, no unexpected diffs. `eslint` on every changed/new file — clean. Full
+  `checkout` suite: 50/50 suites, 370/370 tests (+1 suite, +17 tests on Step 3.5's own 49/353
+  baseline), zero regressions. Full `cart` suite: 32/32 suites, 443/443 tests (+2 suites, +16
+  tests on Step 3.5's own 30/427 baseline), zero regressions. Full `sales` suite: 133/133
+  suites, 1068/1068 tests (+1 suite, +2 tests), zero regressions. Full `customer_groups` +
+  `availability` suites: 56/59 suites (3 pre-existing pg-gated skips), 587/587 non-skipped
+  tests, zero regressions.
+- Not built in this Step, by its own explicit scope: `availability.commit`, credit linkage
+  (`linkCreditReservationToOrder`), code usage (`useCode`/`registerUsage`), the gateway step,
+  `markConverted`'s `lineMap`, and the `recover-stuck-submits` recovery job — all Step 4.2. No
+  public HTTP route calls `checkout.session.submit` yet (same precedent `cart.lock`/
+  `.markConverted` set for a whole release before a real caller existed) — a route would need
+  to call the FULL sequence (steps 1-8) to ever reach a terminal session status, so building a
+  half-finished route in this Step would strand a session in `submitting` with no way to
+  complete. Flagging for whichever Step builds it (likely alongside or after Step 4.2).

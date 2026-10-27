@@ -353,6 +353,57 @@ describe('cart.lock', () => {
     )
   })
 
+  // Release 5 Phase 4 (checkout C2, §6a.1a): deferred by Step 2.8/2.9 "until a real caller
+  // exists" — checkout (Step 4.1) is that caller, so this is now enforced for real.
+  it('refuses with 400 assortment_scope_required_for_storefront_channel when a storefront cart is locked without a routeContext', async () => {
+    seededCarts = [makeCartFixture({ channel: 'storefront' })]
+    const handler = getHandler<CartLockInput, CartLockResult>('cart.lock')
+    const em = makeEm()
+    const commandBus = makeFakeCommandBus()
+    const ctx = makeCtx({ em, commandBus })
+
+    let captured: unknown
+    try {
+      await handler.execute(
+        { cartId: CART_ID, tenantId: TENANT_ID, organizationId: ORG_ID, checkoutSessionId: 'checkout-session-1' },
+        ctx,
+      )
+    } catch (err) {
+      captured = err
+    }
+
+    expect(isCrudHttpError(captured)).toBe(true)
+    expect((captured as { status: number }).status).toBe(400)
+    expect((captured as { body?: Record<string, unknown> }).body).toMatchObject({
+      code: 'assortment_scope_required_for_storefront_channel',
+    })
+    // A refusal, not a partial commit — the cart must still be active, and `cart.reprice`
+    // (which would otherwise run first) must never have been dispatched.
+    expect(seededCarts.find((row) => row.id === CART_ID)!.status).toBe('active')
+    expect((commandBus.execute as jest.Mock).mock.calls.filter(([id]) => id === 'cart.reprice')).toHaveLength(0)
+  })
+
+  it('succeeds on a storefront cart when a routeContext IS supplied', async () => {
+    seededCarts = [makeCartFixture({ channel: 'storefront' })]
+    const handler = getHandler<CartLockInput, CartLockResult>('cart.lock')
+    const em = makeEm()
+    const commandBus = makeFakeCommandBus()
+    const ctx = makeCtx({ em, commandBus })
+
+    const result = await handler.execute(
+      {
+        cartId: CART_ID,
+        tenantId: TENANT_ID,
+        organizationId: ORG_ID,
+        checkoutSessionId: 'checkout-session-1',
+        routeContext: makeRouteContext(),
+      },
+      ctx,
+    )
+
+    expect(result.cart.status).toBe('locked')
+  })
+
   // Documented mechanics (Step 7.5): after the forced re-price dispatch settles, `cart.lock`
   // re-reads every non-deleted `CartLine` and refuses with 409 if ANY carries a non-null
   // `flag_state` — exercised here by letting §6a.2's whole-cart re-visibility pass (gated to

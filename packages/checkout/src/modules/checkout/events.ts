@@ -25,6 +25,13 @@ const events = [
   // surface this run's own precedent (Step 2.7) avoided for `customer_groups.approval.decided`.
   { id: 'checkout.session.created', label: 'Checkout Session Created', entity: 'session', category: 'lifecycle' },
   { id: 'checkout.session.canceled', label: 'Checkout Session Canceled', entity: 'session', category: 'lifecycle' },
+  // Release 5, Step 4.1 (B.4 submit, §7.2 step 0 / §7.3). `.submitted` fires once per
+  // `open -> submitting` CAS win; the `.completed`/`.failed`/`.payment.*`/`.approval_*`
+  // family stays declared incrementally, per this file's own precedent, as the Step that
+  // emits each one lands (Step 4.2 reaches a terminal state; this Step never does).
+  { id: 'checkout.session.submitted', label: 'Checkout Session Submitted', entity: 'session', category: 'lifecycle' },
+  { id: 'checkout.compensation.executed', label: 'Checkout Compensation Executed', entity: 'session', category: 'lifecycle' },
+  { id: 'checkout.compensation.failed', label: 'Checkout Compensation Failed', entity: 'session', category: 'lifecycle' },
 ] as const
 
 export const eventsConfig = createModuleEvents({ moduleId: 'checkout', events })
