@@ -11,6 +11,7 @@ import type {
   CartUnlockResult,
 } from '../commands/lock'
 import { toCartSummary, type CartSummary } from '../commands/cart'
+import { toCartLineSnapshot, type CartLineSnapshot } from '../commands/lines'
 import { Cart, CartLine } from '../data/entities'
 import { isCartStoreContextUnavailableError, resolveCartRouteContext } from './routeContext'
 import { getCartSalesSnapshot, type CartSalesSnapshot, type GetCartSalesSnapshotInput } from './toSalesSnapshots'
@@ -103,6 +104,44 @@ export type CartServiceResolvedBasketIdentity = {
   customerUserId: string | null
 }
 
+/**
+ * Step 5.3 (`assisted_selling` §7.1/§7.2, S22). The rep console's proposal builder and thread
+ * page must show "the buyer's resolved unit price with the `price_row_id` explanation... each
+ * proposal line renders the buyer's resolved unit price... labelled as the buyer's" — the exact
+ * `CartLine` columns `cart.proposal.create` already wrote when it priced the proposal cart AS
+ * THE BUYER (§7a.2 there, R1). Reading those columns back (never recomputing) is what makes S22's
+ * "byte-identical to the buyer's own `GET /api/cart/current` pricing" true by construction: it is
+ * the same stored row, not an independent calculation that could drift from it.
+ */
+export type CartServiceGetProposalCartPricedLinesInput = {
+  tenantId: string
+  organizationId: string
+  proposalCartId: string
+}
+
+export type CartServiceProposalCartPricedLine = Pick<
+  CartLineSnapshot,
+  | 'id'
+  | 'productId'
+  | 'variantId'
+  | 'sku'
+  | 'name'
+  | 'quantity'
+  | 'unitPriceNet'
+  | 'unitPriceGross'
+  | 'taxRate'
+  | 'priceKindId'
+  | 'priceRowId'
+  | 'lineTotals'
+>
+
+export type CartServiceProposalCartPricedDetail = {
+  currencyCode: string
+  status: Cart['status']
+  expiresAt: Date
+  lines: CartServiceProposalCartPricedLine[]
+} | null
+
 export type CartService = {
   lock(input: CartServiceLockInput): Promise<CartLockResult>
   unlock(input: CartUnlockInput): Promise<CartUnlockResult>
@@ -121,6 +160,12 @@ export type CartService = {
    * returns `null` for an unknown token, a `kind: 'proposal'` cart's id/token, or no match at
    * all (same no-enumeration-oracle collapse `cart`'s own `/current/*` routes apply). */
   resolveBasketByToken(input: CartServiceResolveBasketByTokenInput): Promise<CartServiceResolvedBasketIdentity | null>
+  /** Step 5.3 (§7.2, S22). A `kind: 'proposal'` cart's own lines, WITH the pricing columns
+   * `cart.proposal.create` already wrote — `null` when the proposal cart no longer exists
+   * (purged, §10.3's "renders as purged rather than failing to load"). */
+  getProposalCartPricedLines(
+    input: CartServiceGetProposalCartPricedLinesInput,
+  ): Promise<CartServiceProposalCartPricedDetail>
 }
 
 type CartServiceAuthContext = CommandRuntimeContext['auth']
@@ -238,6 +283,50 @@ export class CartServiceImpl implements CartService {
       quantity: line.quantity,
       configuration: line.configuration ?? null,
     }))
+  }
+
+  async getProposalCartPricedLines(
+    input: CartServiceGetProposalCartPricedLinesInput,
+  ): Promise<CartServiceProposalCartPricedDetail> {
+    const em = (this.container.resolve('em') as EntityManager).fork()
+    const scope = { tenantId: input.tenantId, organizationId: input.organizationId }
+    const cart = (await findOneWithDecryption(
+      em,
+      Cart,
+      { id: input.proposalCartId, tenantId: input.tenantId, organizationId: input.organizationId, kind: 'proposal' as const },
+      {},
+      scope,
+    )) as Cart | null
+    if (!cart) return null
+    const lines = (await findWithDecryption(
+      em,
+      CartLine,
+      { cartId: input.proposalCartId, deletedAt: null, tenantId: input.tenantId, organizationId: input.organizationId },
+      { orderBy: { lineNumber: 'ASC' } },
+      scope,
+    )) as CartLine[]
+    return {
+      currencyCode: cart.currencyCode,
+      status: cart.status,
+      expiresAt: cart.expiresAt,
+      lines: lines.map((line) => {
+        const snapshot = toCartLineSnapshot(line)
+        return {
+          id: snapshot.id,
+          productId: snapshot.productId,
+          variantId: snapshot.variantId,
+          sku: snapshot.sku,
+          name: snapshot.name,
+          quantity: snapshot.quantity,
+          unitPriceNet: snapshot.unitPriceNet,
+          unitPriceGross: snapshot.unitPriceGross,
+          taxRate: snapshot.taxRate,
+          priceKindId: snapshot.priceKindId,
+          priceRowId: snapshot.priceRowId,
+          lineTotals: snapshot.lineTotals,
+        }
+      }),
+    }
   }
 
   async resolveBasketByToken(input: CartServiceResolveBasketByTokenInput): Promise<CartServiceResolvedBasketIdentity | null> {

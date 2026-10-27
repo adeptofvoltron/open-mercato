@@ -2426,3 +2426,91 @@ session-route identity binding audit D-R5-33, opens the final Phase 5 pair)
   suites (`packages/core`): 75/77 passed, 2 pre-existing skips, 918/926 tests green, zero
   regressions. `packages/checkout` typecheck clean after a full `tsconfig.tsbuildinfo` wipe.
 - Closes Phase 5's checkout half; 5.3/5.4 (`assisted_selling`) remain.
+
+## 2026-10-27T09:45:01Z — executor: Step 5.3 landed, assisted_selling rep console (inbox, thread, composer, proposal builder)
+
+- **The missing staff routes the console needs, built here (not claimed by any other Step).**
+  Steps 4.4/4.4-fix/4.5 explicitly deferred `GET /threads/:id`, `POST /threads/:id/{join,leave,
+  assign}` and `POST /threads/:id/messages` to "the rep console (Step 5.3)" — built all five,
+  with three new commands (`assisted_selling.thread.{join,leave,assign}` in `commands/
+  threads.ts`, `assisted_selling.message.post` in a new `commands/messages.ts`). `assign` is
+  optimistic-locked on the thread's `updated_at` (§6.1); `join`/`leave` are idempotent no-ops
+  on a repeat call, and a rep who left and rejoins re-emits `.participant.joined` (a left
+  participant is not "already joined"). Added the `assisted_selling.messages.post` ACL feature
+  §6.9 names (Step 4.4 deferred it) and granted it to `employee` per `setup.ts`'s own
+  already-written anticipation of this. `GET /threads/:id` requires BOTH `assisted_selling.
+  threads.view` AND `cart.proposals.view`, per §6.1's two-feature discipline for exactly this
+  route (proposals carry the buyer's priced lines).
+- **S22 price provenance: a fourth additive `cartService` method, read back verbatim.** The
+  console's proposal cards must show "the buyer's resolved unit price... labelled as the
+  buyer's" with `price_row_id` provenance (§7.2). The existing `getProposalCartLines` (Step
+  4.4) carries no pricing columns by design (it only feeds reauthor). Added `cartService.
+  getProposalCartPricedLines` (`cart/lib/cartService.ts`) — reads the proposal cart's own
+  `CartLine` rows back through the SAME `toCartLineSnapshot` mapper `cart`'s command layer
+  already uses, never recomputing. This makes S22's "byte-identical to the buyer's own `GET
+  /api/cart/current` pricing" true by construction: the columns were written by `cart.
+  proposal.create` pricing AS THE BUYER (§6.3 step 3) and are read back unchanged. Tested at
+  the `cartService` layer (2 new cases in `cart/lib/__tests__/cartService.test.ts`); a full
+  buyer-`/current`-vs-console comparison belongs to the Playwright suite this run's own
+  instructions placed out of this Step's scope (no dev server, no browser here).
+- **Four screens, exactly the task brief's own list** (inbox, thread page, composer, proposal
+  builder) — the settings page UI and attribution report UI are deliberately NOT built here;
+  see PLAN.md's decisions for why (settings has no claiming Step at all; attribution is Step
+  5.4's own scope).
+  - **Inbox** (`backend/assisted-selling/page.tsx`): `DataTable` over `GET /threads`,
+    additively extended with `assignedActorId` (`me`/`unassigned`/a uuid) and
+    `hasLiveProposals` query filters (backward compatible with Step 4.4's own shape). Row
+    actions: open, assign to me. Live-updates via `useAppEventCoalesced('assisted_selling.*',
+    ...)` — no custom polling.
+  - **Thread page** (`backend/assisted-selling/threads/[id]/page.tsx`): participants,
+    message/proposal timeline (decrypted via the route's own `findWithDecryption`), join/
+    leave/assign-to-me, a composer, withdraw/re-propose per proposal, each proposal line
+    showing its buyer price + `price_row_id` provenance. Live-updates via `useAppEvent*`
+    filtered to this `threadId`.
+  - **Proposal builder** (`ProposalBuilderDialog.tsx`): a dialog (not literally `CrudForm` —
+    see PLAN.md's decision on why) with a line-item array (product via `ComboboxInput` against
+    `GET /api/catalog/products?search=`, variant id, quantity), a note, Cmd/Ctrl+Enter submit,
+    `rejectedLines` surfaced after submit. No client-side pricing — the server prices as the
+    buyer.
+  - **Composer**: plain-text only (S24), inline in the thread page, Cmd/Ctrl+Enter to send.
+- **Route-enumeration test** (`api/__tests__/routeEnumeration.test.ts`, 5 cases): statically
+  reads every `route.ts` this module ships (no import/mock graph to keep in sync) and asserts
+  no route exports `PATCH`/`DELETE` anywhere, `PUT` exists only on the settings route, and
+  neither a route nor a command file ever references `cart.lines.{add,update,remove,bulkAdd}`
+  — the §7.2/§10.5 "no console affordance writes to the buyer's cart" guarantee, enumerated
+  rather than inspected in the UI.
+- **i18n**: 77 new keys in `en.json`; `yarn i18n:check-sync --fix` propagated them to de/es/
+  ko/pl with EN values as placeholders — the SAME convention this module's own locale files
+  already used before this Step (every locale carried identical English text already;
+  `i18n:check-hardcoded`/`i18n:check-values` stay advisory in Phase 1 per root AGENTS.md).
+- **Tests** (`packages/core`, `yarn jest src/modules/assisted_selling` style): `commands/
+  __tests__/threadActions.test.ts` (new, 10 cases — join/rejoin/idempotent-join, mode-off
+  refusal, S9 cross-org 404, S21 missing-feature 403; leave idempotent no-op; assign-to-me,
+  assign-a-named-rep, and the real two-concurrent-assigns-one-409 race test using a SHARED
+  fake-EM row reference so the second call observes the first's write exactly like two
+  requests racing a real row would); `commands/__tests__/messages.test.ts` (new, 6 cases).
+  `cart/lib/__tests__/cartService.test.ts` (+2 cases for `getProposalCartPricedLines`).
+  `api/__tests__/routeEnumeration.test.ts` (new, 5 cases). 140/140 `assisted_selling` tests
+  green (116 pre-existing + 24 new); 442/442 `cart` tests green (zero regressions from the
+  additive `cartService` method).
+- **Checks (local mode, every `tsconfig.tsbuildinfo` wiped repo-wide first):** `yarn generate`
+  clean (727 OpenAPI paths, up from 714 at Step 4.3; new routes/commands discovered, no
+  unrelated diffs). `yarn typecheck` — 40/40 package tasks green (`@open-mercato/core`
+  cache-miss-executed clean after fixing one real `useGuardedMutation` generic-type mismatch
+  this Step's own build caught). `eslint` on every changed/new file clean (exit 0; the "Pages
+  directory cannot be found" line is Next's own informational noise). `yarn jest src/modules/
+  assisted_selling src/modules/cart` — 582/582. `yarn i18n:check-sync` clean. `yarn i18n:
+  check-hardcoded` — zero `assisted_selling` findings (advisory gate, exit 0 regardless).
+  One DS violation caught and fixed before commit: an arbitrary `text-[11px]` in the thread
+  page's price-provenance label, replaced with the DS `text-xs` scale token.
+- **Known, deliberately scoped-out gaps** (all flagged in PLAN.md's decisions, not silently
+  dropped): (1) no settings-page UI — the API has existed since Step 4.3 with no claiming
+  Step for its console surface; (2) the proposal builder's product picker is a bare
+  `ComboboxInput` against `catalog`'s product search, not a richer merchandising picker, and
+  assumes the authoring rep also holds `catalog.products.view` (not newly required by this
+  Step, but a real-world precondition worth naming); (3) `EmailThreadsPanel`/`MessageComposer`
+  reuse named by §7.1 was not literally wired — their backend shape (many email threads;
+  the generic `messages` module's own entity) does not fit one conversation with embedded
+  priced proposal cards; built from DS primitives instead, same interaction conventions.
+  Recommend a dedicated Step — or Step 5.4/6.1 — pick up the settings page if the full
+  Release-5 console scope (D-R5-15) is still the bar.

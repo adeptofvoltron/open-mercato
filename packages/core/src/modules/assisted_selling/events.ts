@@ -12,11 +12,18 @@ import { createModuleEvents } from '@open-mercato/shared/modules/events'
 // subscriber's own emissions (`lib/terminalStateSubscriber.ts`), the three ids Step 4.4
 // itself deferred for exactly this reason.
 //
+// Step 5.3 adds `.participant.left` — the console's own `POST /threads/:id/join`'s
+// counterpart (`/leave`), the one remaining id §6.8's own table names that Step 4.4 had not
+// yet built a writer for. `.thread.closed` and `.attribution.degraded` stay deferred —
+// neither mechanism (the §5.10 retention/erasure sweepers, the §6.7 attribution subscriber)
+// ships in this Step either.
+//
 // `clientBroadcast: true` on every one of them (§6.8: "on thread, participant, message and
 // proposal events so the rep console updates without polling").
 const events = [
   { id: 'assisted_selling.thread.opened', label: 'Assisted Selling Thread Opened', entity: 'thread', category: 'lifecycle', clientBroadcast: true },
   { id: 'assisted_selling.participant.joined', label: 'Assisted Selling Participant Joined', entity: 'participant', category: 'lifecycle', clientBroadcast: true },
+  { id: 'assisted_selling.participant.left', label: 'Assisted Selling Participant Left', entity: 'participant', category: 'lifecycle', clientBroadcast: true },
   { id: 'assisted_selling.message.posted', label: 'Assisted Selling Message Posted', entity: 'message', category: 'crud', clientBroadcast: true },
   { id: 'assisted_selling.proposal.published', label: 'Assisted Selling Proposal Published', entity: 'proposal', category: 'lifecycle', clientBroadcast: true },
   { id: 'assisted_selling.proposal.withdrawn', label: 'Assisted Selling Proposal Withdrawn', entity: 'proposal', category: 'lifecycle', clientBroadcast: true },

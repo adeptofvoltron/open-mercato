@@ -26,6 +26,35 @@ export type AssistedSellingProposalCartLine = {
 }
 
 /**
+ * Step 5.3 (`assisted_selling` §7.1/§7.2, S22). The console's own "the buyer's price,
+ * labelled as the buyer's, with `price_row_id` provenance" — read back verbatim off the
+ * proposal cart's own `CartLine` rows (`cart`'s fourth additive `cartService` method, after
+ * `getForOrganizations`/`getProposalCartLines`/`resolveBasketByToken`). Never recomputed: this
+ * is what makes S22's byte-identical guarantee true by construction.
+ */
+export type AssistedSellingProposalCartPricedLine = {
+  id: string
+  productId: string
+  variantId: string | null
+  sku: string | null
+  name: string
+  quantity: string
+  unitPriceNet: string | null
+  unitPriceGross: string | null
+  taxRate: string | null
+  priceKindId: string | null
+  priceRowId: string | null
+  lineTotals: Record<string, unknown>
+}
+
+export type AssistedSellingProposalCartPricedDetail = {
+  currencyCode: string
+  status: string
+  expiresAt: Date
+  lines: AssistedSellingProposalCartPricedLine[]
+} | null
+
+/**
  * Step 4.5 (§5.1/§6.2, D-R5-21). The buyer thread routes' own "resolve the `X-Cart-Token`
  * header to its basket cart through `cart`'s DI service" — the same `cartService` surface
  * this file already duck-types, one more method. `status` is a plain string here (never
@@ -56,6 +85,13 @@ export type AssistedSellingCartServiceLike = {
   /** Step 4.5. Scope-free `kind: 'basket'` resolution by token — `null` for an unknown
    * token, collapsing with every other "no match" outcome (no enumeration oracle). */
   resolveBasketByToken(input: { token: string }): Promise<AssistedSellingResolvedBasket | null>
+  /** Step 5.3 (§7.1/§7.2, S22). A `kind: 'proposal'` cart's own priced lines, for the
+   * thread detail read and the console's proposal cards. */
+  getProposalCartPricedLines(input: {
+    tenantId: string
+    organizationId: string
+    proposalCartId: string
+  }): Promise<AssistedSellingProposalCartPricedDetail>
 }
 
 export function resolveCartService(container: {

@@ -4,9 +4,10 @@ jest.mock('../toSalesSnapshots', () => ({
 }))
 
 const mockFindOneWithDecryption = jest.fn()
+const mockFindWithDecryption = jest.fn(async () => [])
 jest.mock('@open-mercato/shared/lib/encryption/find', () => ({
   findOneWithDecryption: (...args: unknown[]) => mockFindOneWithDecryption(...args),
-  findWithDecryption: jest.fn(async () => []),
+  findWithDecryption: (...args: unknown[]) => mockFindWithDecryption(...args),
 }))
 
 const mockResolveCartRouteContext = jest.fn()
@@ -169,5 +170,94 @@ describe('CartServiceImpl.resolveBasketByToken (Step 4.5, §5.1/§6.2, D-R5-21)'
     await service.resolveBasketByToken({ token: 'a-real-token' })
 
     expect(commandBus.execute).not.toHaveBeenCalled()
+  })
+})
+
+describe('CartServiceImpl.getProposalCartPricedLines (Step 5.3, §7.1/§7.2, S22)', () => {
+  it('returns null when the proposal cart no longer exists (purged, §10.3)', async () => {
+    mockFindOneWithDecryption.mockResolvedValueOnce(null)
+    const { container } = makeContainer()
+    const service = new CartServiceImpl(container)
+
+    const result = await service.getProposalCartPricedLines({
+      tenantId: 'tenant-1',
+      organizationId: 'org-1',
+      proposalCartId: 'proposal-cart-1',
+    })
+
+    expect(result).toBeNull()
+    const [, , where] = mockFindOneWithDecryption.mock.calls[0]
+    expect(where).toMatchObject({ kind: 'proposal', id: 'proposal-cart-1' })
+  })
+
+  it('reads the pricing columns back verbatim — never recomputed (S22 byte-identical guarantee)', async () => {
+    mockFindOneWithDecryption.mockResolvedValueOnce({
+      id: 'proposal-cart-1',
+      tenantId: 'tenant-1',
+      organizationId: 'org-1',
+      currencyCode: 'USD',
+      status: 'active',
+      expiresAt: new Date('2026-11-01T00:00:00.000Z'),
+    })
+    mockFindWithDecryption.mockResolvedValueOnce([
+      {
+        id: 'line-1',
+        cartId: 'proposal-cart-1',
+        tenantId: 'tenant-1',
+        organizationId: 'org-1',
+        lineNumber: 1,
+        productId: 'product-1',
+        variantId: null,
+        sku: 'SKU-1',
+        name: 'Widget',
+        optionValues: null,
+        quantity: '2.0000',
+        quantityUnit: null,
+        unitPriceNet: '19.9900',
+        unitPriceGross: '24.5877',
+        taxRate: '0.2300',
+        priceKindId: 'price-kind-1',
+        priceRowId: 'price-row-1',
+        priceTierMinQuantity: null,
+        pricedAt: new Date(),
+        lineTotals: { grandTotalGrossAmount: 49.1754 },
+        discountTotalNet: null,
+        promotionId: null,
+        origin: 'customer',
+        configuration: null,
+        addedByActorType: 'rep',
+        addedByActorId: null,
+        metadata: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        deletedAt: null,
+      },
+    ])
+    const { container } = makeContainer()
+    const service = new CartServiceImpl(container)
+
+    const result = await service.getProposalCartPricedLines({
+      tenantId: 'tenant-1',
+      organizationId: 'org-1',
+      proposalCartId: 'proposal-cart-1',
+    })
+
+    expect(result).toMatchObject({ currencyCode: 'USD', status: 'active' })
+    expect(result?.lines).toEqual([
+      {
+        id: 'line-1',
+        productId: 'product-1',
+        variantId: null,
+        sku: 'SKU-1',
+        name: 'Widget',
+        quantity: '2.0000',
+        unitPriceNet: '19.9900',
+        unitPriceGross: '24.5877',
+        taxRate: '0.2300',
+        priceKindId: 'price-kind-1',
+        priceRowId: 'price-row-1',
+        lineTotals: { grandTotalGrossAmount: 49.1754 },
+      },
+    ])
   })
 })

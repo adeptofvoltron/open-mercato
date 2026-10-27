@@ -7,6 +7,10 @@ export { ensureOrganizationScope, ensureSameScope, ensureTenantScope } from '@op
 
 export const ASSISTED_SELLING_STORE_SETTINGS_RESOURCE_KIND = 'assisted_selling.store_settings'
 export const ASSISTED_SELLING_PROPOSAL_RESOURCE_KIND = 'assisted_selling.proposal'
+// Step 5.3 (§6.1). `POST /threads/:id/assign` is optimistic-locked on the thread's own
+// `updated_at` — "two reps claiming the same conversation get one success and one 409, never
+// a silent last-write-wins."
+export const ASSISTED_SELLING_THREAD_RESOURCE_KIND = 'assisted_selling.thread'
 
 /**
  * Step 4.4 (S21). "Every feature check goes through `rbacService.userHasAllFeatures` ... a

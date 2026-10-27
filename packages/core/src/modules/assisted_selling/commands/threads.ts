@@ -14,7 +14,7 @@ import { resolveEffectiveAssistedSellingSettings } from '../lib/settings'
 import { resolveCartService } from '../lib/cartAccess'
 import { resolveOrBuildRepParticipant } from '../lib/participants'
 import { emitAssistedSellingEvent } from '../events'
-import { requireAssistedSellingFeatures } from './shared'
+import { enforceAssistedSellingOptimisticLock, requireAssistedSellingFeatures, ASSISTED_SELLING_THREAD_RESOURCE_KIND } from './shared'
 
 // Step 4.4 (§6.1, §6.3 step 0, §5.1, S9). `POST /threads`: "Staff opens a conversation about a
 // basket, by cart id ... The cart is read through cart's organization-scoped admin detail read
@@ -233,6 +233,212 @@ const openThreadCommand: CommandHandler<AssistedSellingThreadOpenInput, Assisted
   },
 }
 
-registerCommand(openThreadCommand)
+// ---------------------------------------------------------------------------
+// Step 5.3 (§6.1, §7.1) — the remaining staff thread actions the console needs: join, leave,
+// assign. Scoped the same way `performAuthorProposal`'s own thread resolution is — tenant +
+// the caller's `organizationIds` list, any status (unlike `resolveOpenThreadForCaller` in
+// `commands/proposals.ts`, which only accepts `status: 'open'` — a closed thread can still be
+// reassigned or left from the console's own history view).
+// ---------------------------------------------------------------------------
 
-export { openThreadCommand }
+async function resolveThreadForCaller(
+  em: EntityManager,
+  scope: { tenantId: string; organizationIds: string[] | null },
+  threadId: string,
+): Promise<AssistedSellingThread> {
+  const where: Record<string, unknown> = { id: threadId, tenantId: scope.tenantId, deletedAt: null }
+  if (Array.isArray(scope.organizationIds)) {
+    if (scope.organizationIds.length === 0) throw notFound('[internal] thread not found')
+    where.organizationId = { $in: scope.organizationIds }
+  }
+  const thread = await em.findOne(AssistedSellingThread, where)
+  if (!thread) throw notFound('[internal] thread not found')
+  return thread
+}
+
+export type AssistedSellingThreadJoinInput = {
+  tenantId: string
+  organizationIds: string[] | null
+  threadId: string
+}
+
+export type AssistedSellingThreadJoinResult = {
+  threadId: string
+  participantId: string
+  alreadyJoined: boolean
+}
+
+const joinThreadCommand: CommandHandler<AssistedSellingThreadJoinInput, AssistedSellingThreadJoinResult> = {
+  id: 'assisted_selling.thread.join',
+  isUndoable: false,
+  async execute(input, ctx: CommandRuntimeContext) {
+    ensureTenantScope(ctx, input.tenantId)
+    await requireAssistedSellingFeatures(ctx, ['assisted_selling.threads.participate'])
+    const actorId = ctx.auth?.sub
+    if (!actorId) throw notFound('[internal] no authenticated principal to join this thread as')
+
+    const em = (ctx.container.resolve('em') as EntityManager).fork()
+    const thread = await resolveThreadForCaller(em, { tenantId: input.tenantId, organizationIds: input.organizationIds }, input.threadId)
+
+    // §6.3 step 0: "The same check gates `POST /threads` and `/threads:id/join`."
+    const settings = await resolveEffectiveAssistedSellingSettings(em, {
+      tenantId: thread.tenantId,
+      organizationId: thread.organizationId,
+      storeId: thread.storeId,
+    })
+    if (settings.mode !== 'rep') {
+      throw new CrudHttpError(409, { error: '[internal] assisted_selling_unavailable', code: 'assisted_selling_unavailable' })
+    }
+
+    const { participant, isNew } = await resolveOrBuildRepParticipant(
+      em,
+      { tenantId: thread.tenantId, organizationId: thread.organizationId, threadId: thread.id },
+      actorId,
+    )
+    // A rep who previously left and rejoins is a fresh "join" event too, not a silent no-op —
+    // `resolveOrBuildRepParticipant` only keys on `(threadId, actorType, actorId)`, so its own
+    // `isNew: false` does not distinguish "still here" from "left, now back".
+    const isRejoin = !isNew && participant.leftAt != null
+    if (isNew || isRejoin) {
+      if (isRejoin) participant.leftAt = null
+      const now = new Date()
+      thread.lastActivityAt = now
+      thread.updatedAt = now
+      await withAtomicFlush(
+        em,
+        [
+          async () => {
+            em.persist(participant)
+            em.persist(thread)
+          },
+        ],
+        { transaction: true, label: 'assisted_selling.thread.join' },
+      )
+      // §8.3/R3: "A rep joining appears in the buyer's next thread read, with no store
+      // setting able to suppress it" — the event this module's own text names for exactly
+      // that disclosure.
+      await emitAssistedSellingEvent('assisted_selling.participant.joined', {
+        threadId: thread.id,
+        participantId: participant.id,
+        tenantId: thread.tenantId,
+        organizationId: thread.organizationId,
+      })
+    }
+
+    return { threadId: thread.id, participantId: participant.id, alreadyJoined: !isNew && !isRejoin }
+  },
+}
+
+export type AssistedSellingThreadLeaveInput = {
+  tenantId: string
+  organizationIds: string[] | null
+  threadId: string
+}
+
+export type AssistedSellingThreadLeaveResult = {
+  threadId: string
+  left: boolean
+}
+
+const leaveThreadCommand: CommandHandler<AssistedSellingThreadLeaveInput, AssistedSellingThreadLeaveResult> = {
+  id: 'assisted_selling.thread.leave',
+  isUndoable: false,
+  async execute(input, ctx: CommandRuntimeContext) {
+    ensureTenantScope(ctx, input.tenantId)
+    await requireAssistedSellingFeatures(ctx, ['assisted_selling.threads.participate'])
+    const actorId = ctx.auth?.sub
+    if (!actorId) throw notFound('[internal] no authenticated principal to leave this thread as')
+
+    const em = (ctx.container.resolve('em') as EntityManager).fork()
+    const thread = await resolveThreadForCaller(em, { tenantId: input.tenantId, organizationIds: input.organizationIds }, input.threadId)
+
+    const participant = await em.findOne(AssistedSellingParticipant, {
+      tenantId: thread.tenantId,
+      threadId: thread.id,
+      actorType: 'rep',
+      actorId,
+      deletedAt: null,
+    })
+    // Idempotent: never joined, or already left — a no-op rather than a 404, since "leave" is
+    // not a resource lookup.
+    if (!participant || participant.leftAt) {
+      return { threadId: thread.id, left: false }
+    }
+
+    const now = new Date()
+    participant.leftAt = now
+    await withAtomicFlush(
+      em,
+      [
+        async () => {
+          em.persist(participant)
+        },
+      ],
+      { transaction: true, label: 'assisted_selling.thread.leave' },
+    )
+
+    await emitAssistedSellingEvent('assisted_selling.participant.left', {
+      threadId: thread.id,
+      participantId: participant.id,
+      tenantId: thread.tenantId,
+      organizationId: thread.organizationId,
+    })
+
+    return { threadId: thread.id, left: true }
+  },
+}
+
+export type AssistedSellingThreadAssignInput = {
+  tenantId: string
+  organizationIds: string[] | null
+  threadId: string
+  actorId?: string
+  updatedAt?: string
+}
+
+export type AssistedSellingThreadAssignResult = {
+  threadId: string
+  assignedActorId: string
+  updatedAt: string
+}
+
+const assignThreadCommand: CommandHandler<AssistedSellingThreadAssignInput, AssistedSellingThreadAssignResult> = {
+  id: 'assisted_selling.thread.assign',
+  isUndoable: false,
+  async execute(input, ctx: CommandRuntimeContext) {
+    ensureTenantScope(ctx, input.tenantId)
+    await requireAssistedSellingFeatures(ctx, ['assisted_selling.threads.participate'])
+    const callerId = ctx.auth?.sub
+    if (!callerId) throw notFound('[internal] no authenticated principal to assign this thread as')
+
+    const em = (ctx.container.resolve('em') as EntityManager).fork()
+    const thread = await resolveThreadForCaller(em, { tenantId: input.tenantId, organizationIds: input.organizationIds }, input.threadId)
+    // §6.1: "Optimistic-locked on the thread's `updated_at`: two reps claiming the same
+    // conversation get one success and one 409, never a silent last-write-wins."
+    await enforceAssistedSellingOptimisticLock(ctx, thread, ASSISTED_SELLING_THREAD_RESOURCE_KIND, input.updatedAt ?? null)
+
+    const assignedActorId = input.actorId ?? callerId
+    const now = new Date()
+    thread.assignedActorId = assignedActorId
+    thread.updatedAt = now
+
+    await withAtomicFlush(
+      em,
+      [
+        async () => {
+          em.persist(thread)
+        },
+      ],
+      { transaction: true, label: 'assisted_selling.thread.assign' },
+    )
+
+    return { threadId: thread.id, assignedActorId, updatedAt: now.toISOString() }
+  },
+}
+
+registerCommand(openThreadCommand)
+registerCommand(joinThreadCommand)
+registerCommand(leaveThreadCommand)
+registerCommand(assignThreadCommand)
+
+export { openThreadCommand, joinThreadCommand, leaveThreadCommand, assignThreadCommand }

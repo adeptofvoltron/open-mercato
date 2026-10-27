@@ -108,6 +108,41 @@ export const assistedSellingProposalReauthorRequestSchema = z
 export type AssistedSellingProposalReauthorRequest = z.infer<typeof assistedSellingProposalReauthorRequestSchema>
 
 // ---------------------------------------------------------------------------
+// Step 5.3 — the remaining staff thread routes the console needs (§6.1, §7.1): join, leave,
+// assign, and posting a plain-text message. `.strict()` throughout, same discipline as every
+// other Release 5 request body.
+// ---------------------------------------------------------------------------
+
+/** `POST /threads/:id/join` (§6.1). No body fields named by the spec. */
+export const assistedSellingThreadJoinRequestSchema = z.object({}).strict()
+export type AssistedSellingThreadJoinRequest = z.infer<typeof assistedSellingThreadJoinRequestSchema>
+
+/** `POST /threads/:id/leave` (§6.1). No body fields named by the spec. */
+export const assistedSellingThreadLeaveRequestSchema = z.object({}).strict()
+export type AssistedSellingThreadLeaveRequest = z.infer<typeof assistedSellingThreadLeaveRequestSchema>
+
+/** `POST /threads/:id/assign` (§6.1). `actorId` omitted assigns the caller ("assign to me");
+ * an explicit `actorId` reassigns to a named rep. Optimistic-locked on the thread's
+ * `updated_at` — "two reps claiming the same conversation get one success and one 409". */
+export const assistedSellingThreadAssignRequestSchema = z
+  .object({
+    actorId: uuid().optional(),
+    updatedAt: z.string().optional(),
+  })
+  .strict()
+export type AssistedSellingThreadAssignRequest = z.infer<typeof assistedSellingThreadAssignRequestSchema>
+
+/** `POST /threads/:id/messages` (§6.1). `body_format: 'text'` only (S24) — the staff-side
+ * counterpart of `assistedSellingBuyerMessagePostRequestSchema`. */
+export const assistedSellingMessagePostRequestSchema = z
+  .object({
+    body: z.string().trim().min(1).max(2000),
+    bodyFormat: z.literal('text').optional(),
+  })
+  .strict()
+export type AssistedSellingMessagePostRequest = z.infer<typeof assistedSellingMessagePostRequestSchema>
+
+// ---------------------------------------------------------------------------
 // Step 4.5 — buyer thread request bodies (§6.2). Public, cart-token bound; `.strict()`
 // throughout, same discipline as the staff bodies above.
 // ---------------------------------------------------------------------------

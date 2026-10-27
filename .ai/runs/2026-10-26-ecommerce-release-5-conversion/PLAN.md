@@ -58,7 +58,7 @@
 | 4 | 4.5 | assisted_selling: buyer thread routes (Phase 2.1) + `/thread/events` (Phase 2.2) + retention/erasure (Phase 2.5) | dispatch:standard | done | pending |
 | 5 | 5.1 | checkout: B.5 B2B — PO term, `min_order_value`, on-account eligibility, `request_quote` method (D-R5-20), quote branch (C15–C17) | dispatch:standard | done | pending |
 | 5 | 5.2 | checkout: approval-resume subscriber (C11) + session-route identity binding (D-R5-33) | dispatch:standard | done | pending |
-| 5 | 5.3 | assisted_selling: rep console (Phase 2.3) — inbox, thread, composer, proposal builder | dispatch:standard | todo | — |
+| 5 | 5.3 | assisted_selling: rep console (Phase 2.3) — inbox, thread, composer, proposal builder | dispatch:standard | done | pending |
 | 5 | 5.4 | assisted_selling: Phase 4 attribution — entity, `cart.cart.converted` subscriber, `GET /attributions`, console report | dispatch:standard | todo | — |
 | 6 | 6.1 | All modules: integration-coverage completion per each analysis's test list (G23/A20/K17/S16/C26) | dispatch:standard | todo | — |
 | 6 | 6.2 | `UPGRADE_NOTES.md` — D-R5-21 behaviour change, A16, G26 | inline | todo | — |
@@ -1625,6 +1625,77 @@ commit `c92470d8d5`).
   absent from each Step's own Implementation/test-priority list) — so there is no route to
   audit there; a future Step building one must call the SAME helper, not invent a second
   binding mechanism.
+- Step 5.3 (missing staff routes this Step's own console needs, task brief vs. §6.1's full
+  route table): Steps 4.4/4.4-fix/4.5 built only `GET/POST /threads`, `POST /threads/:id/
+  proposals`, `POST /proposals/:id/{withdraw,reauthor}` and `GET/PUT /settings/:storeId` —
+  explicitly deferring `GET /threads/:id`, `POST /threads/:id/{join,leave,assign}` and `POST
+  /threads/:id/messages` to "the rep console (Step 5.3)" (Step 4.4's own NOTIFY entry). Built
+  all five here, with three new commands (`assisted_selling.thread.{join,leave,assign}` in
+  `commands/threads.ts`, `assisted_selling.message.post` in a new `commands/messages.ts`) and
+  the matching routes — the console cannot function without them, and no other Step in
+  PLAN.md's table claims them. Added the ACL feature §6.9 already names but Step 4.4 deferred
+  (`assisted_selling.messages.post`) and granted it to `employee` per setup.ts's own
+  already-written comment anticipating this. `assign` is optimistic-locked on the thread's
+  `updated_at` per §6.1's own text; `join`/`leave` are idempotent, no-op rather than erroring on
+  a repeat call. `GET /threads/:id` requires BOTH `assisted_selling.threads.view` and
+  `cart.proposals.view` per §6.1's own two-feature discipline for exactly this route.
+- Step 5.3 (S22 price provenance read, additive `cartService` method): the console's proposal
+  cards must show "the buyer's resolved unit price... labelled as the buyer's" with
+  `price_row_id` provenance (§7.2), but the only existing `cartService` read for a proposal
+  cart (`getProposalCartLines`, Step 4.4) returns bare product/variant/quantity — no pricing
+  columns, by design (it exists only to re-price on reauthor). Added a FOURTH additive
+  `cartService` method, `getProposalCartPricedLines`, that reads the proposal cart's own
+  `CartLine` rows (`unitPriceNet`/`unitPriceGross`/`taxRate`/`priceRowId`/`lineTotals`) back
+  verbatim via the same `toCartLineSnapshot` mapper `cart`'s own command layer already uses —
+  never recomputed. This is what makes S22's "byte-identical to the buyer's own `GET /api/
+  cart/current` pricing" true by construction rather than by coincidence: the proposal cart's
+  columns were written by `cart.proposal.create` pricing AS THE BUYER (§6.3 step 3) and are
+  read back unchanged. Unit-tested at the `cartService` layer (`cart/lib/__tests__/
+  cartService.test.ts`) rather than through a full buyer-`/current`-vs-console integration
+  test, which belongs to the Playwright suite this run's own instructions place out of this
+  Step's scope (no dev server, no browser verification here).
+- Step 5.3 (console scope, task brief's explicit screen list vs. §7's full console): the task
+  brief's own title and "Implementation" bullets name exactly four screens — inbox, thread
+  page, composer, proposal builder — and do NOT list a settings page or the attribution report,
+  even though §7's full Release-5 console scope (D-R5-15) includes both. The settings API
+  already exists with no UI (Step 4.3); the attribution entity/subscriber/route are explicitly
+  Step 5.4's own scope per this PLAN.md's own Phase 5 listing. Built exactly the four named
+  screens; the settings page UI and attribution report UI are NOT built here — flagged as an
+  open gap for whichever Step is meant to close it (5.4 for attribution; no Step currently
+  names the settings page).
+- Step 5.3 (`CrudForm` over a line-item field array, §7.1's prescribed shape vs. what exists):
+  §7.1 names "Proposal builder: ... `CrudForm` over a line-item field array" as the component
+  to reuse. This codebase's `CrudForm` (`packages/ui/src/backend/CrudForm.tsx`) has no
+  array-field primitive today (confirmed by inspection — no `type: 'array'`/repeater field kind
+  anywhere in its schema). Building one would be a new, separate UI-primitive feature, not a
+  console screen. Built the proposal builder instead as a focused dialog from DS primitives
+  (`Dialog`/`Input`/`Textarea`/`ComboboxInput`/`Button`), keeping §7.2's own behavioural rules
+  (Cmd/Ctrl+Enter submit, Escape cancel via the Dialog primitive's own default, aria-labelled
+  icon buttons, no client-side pricing, `rejectedLines` surfaced after submit). Flagged as a
+  gap against the spec's literal component choice, not against its behavioural contract.
+- Step 5.3 (`EmailThreadsPanel`/`MessageComposer` reuse, §7.1's named component vs. the shape
+  mismatch): §7.1 names `EmailThreadsPanel` ("A thread viewer of `EmailThreadsPanel`'s shape")
+  and `MessageComposer`'s inline variant for the timeline/composer. Both are built for a
+  DIFFERENT backend shape: `EmailThreadsPanel` is a master-list-of-MANY-conversations + detail
+  pane for email threads (subject/participants/messages, no concept of an embedded priced
+  proposal card); `MessageComposer` is bound to the `messages` module's own generic
+  `ObjectMessage` entity (`entityModule`/`entityType`/`entityId`), not this module's bespoke
+  `AssistedSellingMessage`/`AssistedSellingProposal` rows. Force-fitting either would need a
+  nontrivial adapter layer with its own bugs, for a page that is ONE conversation with embedded
+  proposal cards, not a list of many. Built a focused timeline + inline composer from DS
+  primitives instead (`StatusBadge`, `Button`, `Textarea`, the `detail` family for loading/
+  error states), following the SAME visual and interaction conventions (status via DS tokens,
+  Cmd/Ctrl+Enter send, no custom polling — wired to `useAppEvent`/`useAppEventCoalesced`
+  instead, per `.ai/ui-backend-components.md`'s own "message and thread surfaces subscribe
+  through the shared hook" rule). Flagged as a gap against the spec's literal component
+  choice, not against the "reuse, don't rebuild" principle it serves.
+- Step 5.3 (inbox "assignee: a named rep" filter, task brief vs. no reps-directory API): §7.1
+  names filtering by "assignee ('mine', 'unassigned', a named rep)". No existing API lists
+  staff users holding `assisted_selling.threads.participate` for a rep-picker, and building one
+  is a new, separate capability. Implemented `mine`/`unassigned`/a literal rep user-id (the
+  `GET /threads` query already accepts a bare uuid, so a future rep-picker widget needs no
+  server change) — the filter UI itself offers only `mine`/`unassigned` today, with a bare
+  store-id text filter alongside it. Flagged as a UX gap, not a missing server capability.
 
 ## External References
 

@@ -27,11 +27,20 @@ export const metadata = {
   POST: { requireAuth: true, requireFeatures: ['assisted_selling.threads.participate', 'cart.carts.view'] },
 }
 
+// Step 5.3 (§7.1's inbox): "filters for store, status, assignee ('mine', 'unassigned', a
+// named rep) and 'awaiting the buyer' (`live_proposal_count > 0`)". `assignedActorId` accepts
+// a bare uuid (a named rep) or the sentinels `me` (resolved against `ctx.auth.sub` below) /
+// `unassigned` (`assigned_actor_id IS NULL`) — additive, backward compatible with the Step 4.4
+// query shape.
+const assignedActorIdSchema = z.union([z.literal('me'), z.literal('unassigned'), z.string().uuid()])
+
 const listQuerySchema = z.object({
   page: z.coerce.number().int().min(1).optional(),
   pageSize: z.coerce.number().int().min(1).max(100).optional(),
   storeId: z.string().uuid().optional(),
   status: z.enum(['open', 'closed']).optional(),
+  assignedActorId: assignedActorIdSchema.optional(),
+  hasLiveProposals: z.coerce.boolean().optional(),
 })
 
 async function resolveCallerContext(req: Request) {
@@ -49,7 +58,7 @@ async function resolveCallerContext(req: Request) {
 export async function GET(req: Request) {
   const { translate } = await resolveTranslations()
   try {
-    const { container, tenantId, organizationIds } = await resolveCallerContext(req)
+    const { container, auth, tenantId, organizationIds } = await resolveCallerContext(req)
     const url = new URL(req.url)
     const query = listQuerySchema.parse(Object.fromEntries(url.searchParams.entries()))
     const page = query.page ?? 1
@@ -63,6 +72,10 @@ export async function GET(req: Request) {
     }
     if (query.storeId) where.storeId = query.storeId
     if (query.status) where.status = query.status
+    if (query.assignedActorId === 'unassigned') where.assignedActorId = null
+    else if (query.assignedActorId === 'me') where.assignedActorId = auth.sub ?? null
+    else if (query.assignedActorId) where.assignedActorId = query.assignedActorId
+    if (query.hasLiveProposals) where.liveProposalCount = { $gt: 0 }
 
     const [rows, total] = await em.findAndCount(AssistedSellingThread, where, {
       orderBy: { lastActivityAt: 'DESC' },
@@ -166,7 +179,7 @@ export const openApi: OpenApiRouteDoc = {
   methods: {
     GET: {
       summary: 'List selling conversations',
-      description: 'Scoped to the caller\'s organizations (S9). pageSize <= 100.',
+      description: 'Scoped to the caller\'s organizations (S9). pageSize <= 100. Filters by store, status, assignee (a uuid, "me" or "unassigned") and hasLiveProposals ("awaiting the buyer", §7.1).',
       query: listQuerySchema,
       responses: [{ status: 200, description: 'Paged list of threads', schema: z.object({ items: z.array(threadRowSchema), total: z.number(), page: z.number(), pageSize: z.number() }) }],
     },
