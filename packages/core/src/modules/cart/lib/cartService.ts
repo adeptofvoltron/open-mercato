@@ -14,6 +14,7 @@ import { toCartSummary, type CartSummary } from '../commands/cart'
 import { Cart, CartLine } from '../data/entities'
 import { isCartStoreContextUnavailableError, resolveCartRouteContext } from './routeContext'
 import { getCartSalesSnapshot, type CartSalesSnapshot, type GetCartSalesSnapshotInput } from './toSalesSnapshots'
+import { hashCartToken } from './token'
 
 // Step 7.5 — §9/§3.1a's own prose repeatedly says `cartService.lock`/`.unlock`/
 // `.markConverted` ("checkout calls the DI service/command directly, in-process") — but
@@ -79,6 +80,29 @@ export type CartServiceProposalCartLine = {
   configuration: Record<string, unknown> | null
 }
 
+/**
+ * Step 4.5 (`assisted_selling` §5.1/§6.2, D-R5-21). A bare `X-Cart-Token` carries no scope —
+ * the FIRST of D-R5-21's two steps: "resolves the `X-Cart-Token` header to its basket cart
+ * through `cart`'s DI service (`cartService.resolveBasketByToken`)... applies the
+ * identified-buyer binding... then finds the thread." `Cart.tokenHash` is globally unique
+ * (`@Unique(['tokenHash'])`, `data/entities.ts`), so this never dispatches `cart.get` and
+ * never re-prices — it is the smallest possible read that lets a cross-module caller learn a
+ * basket's tenant/organization/customerUserId from the token alone, mirroring this file's own
+ * `peekCartCustomerUserId`-shaped precedent in `lib/currentCartRoute.ts` (which the SAME
+ * identity check already runs once a scope is known).
+ */
+export type CartServiceResolveBasketByTokenInput = { token: string }
+
+export type CartServiceResolvedBasketIdentity = {
+  id: string
+  tenantId: string
+  organizationId: string
+  storeId: string | null
+  status: Cart['status']
+  customerId: string | null
+  customerUserId: string | null
+}
+
 export type CartService = {
   lock(input: CartServiceLockInput): Promise<CartLockResult>
   unlock(input: CartUnlockInput): Promise<CartUnlockResult>
@@ -93,6 +117,10 @@ export type CartService = {
   /** Step 4.4 (§6.4). A `kind: 'proposal'` cart's own lines, mapped to
    * `cart.proposal.create`'s own line-input shape. */
   getProposalCartLines(input: CartServiceGetProposalCartLinesInput): Promise<CartServiceProposalCartLine[]>
+  /** Step 4.5 (§5.1/§6.2, D-R5-21). Scope-free `kind: 'basket'` resolution by token hash —
+   * returns `null` for an unknown token, a `kind: 'proposal'` cart's id/token, or no match at
+   * all (same no-enumeration-oracle collapse `cart`'s own `/current/*` routes apply). */
+  resolveBasketByToken(input: CartServiceResolveBasketByTokenInput): Promise<CartServiceResolvedBasketIdentity | null>
 }
 
 type CartServiceAuthContext = CommandRuntimeContext['auth']
@@ -210,5 +238,25 @@ export class CartServiceImpl implements CartService {
       quantity: line.quantity,
       configuration: line.configuration ?? null,
     }))
+  }
+
+  async resolveBasketByToken(input: CartServiceResolveBasketByTokenInput): Promise<CartServiceResolvedBasketIdentity | null> {
+    const em = (this.container.resolve('em') as EntityManager).fork()
+    const cart = (await findOneWithDecryption(
+      em,
+      Cart,
+      { tokenHash: hashCartToken(input.token), kind: 'basket' as const },
+      {},
+    )) as Cart | null
+    if (!cart) return null
+    return {
+      id: cart.id,
+      tenantId: cart.tenantId,
+      organizationId: cart.organizationId,
+      storeId: cart.storeId ?? null,
+      status: cart.status,
+      customerId: cart.customerId ?? null,
+      customerUserId: cart.customerUserId ?? null,
+    }
   }
 }

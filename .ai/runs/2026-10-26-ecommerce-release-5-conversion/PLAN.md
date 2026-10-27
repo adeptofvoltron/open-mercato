@@ -55,7 +55,7 @@
 | 4 | 4.3 | assisted_selling: module scaffold, store settings, `mode: rep\|off` validator, module registration (D-R5-36) | dispatch:standard | done | pending |
 | 4 | 4.4 | assisted_selling: threads/participants/messages + staff author routes wrapping `cart.proposal.create` | dispatch:standard | done | pending |
 | 4 | 4.4-fix | assisted_selling: terminal-state subscriber (buyer accept/reject/expiry → thread/proposal rows) + migrate Step 3.3's provisional re-author subscriber in from `cart` | dispatch:standard | done | pending |
-| 4 | 4.5 | assisted_selling: buyer thread routes (Phase 2.1) + `/thread/events` (Phase 2.2) + retention/erasure (Phase 2.5) | dispatch:standard | todo | — |
+| 4 | 4.5 | assisted_selling: buyer thread routes (Phase 2.1) + `/thread/events` (Phase 2.2) + retention/erasure (Phase 2.5) | dispatch:standard | done | pending |
 | 5 | 5.1 | checkout: B.5 B2B — PO term, `min_order_value`, on-account eligibility, `request_quote` method (D-R5-20), quote branch (C15–C17) | dispatch:standard | todo | — |
 | 5 | 5.2 | checkout: approval-resume subscriber (C11) + session-route identity binding (D-R5-33) | dispatch:standard | todo | — |
 | 5 | 5.3 | assisted_selling: rep console (Phase 2.3) — inbox, thread, composer, proposal builder | dispatch:standard | todo | — |
@@ -1510,6 +1510,62 @@ commit `c92470d8d5`).
   version now re-runs §6.3 in full, via `performAuthorProposal`'s own `targetCartId`/
   `targetBuyerIdentity` overrides (additive params; every existing caller is unaffected),
   rather than the author-context-only, no-repricing version Step 3.3 shipped.
+- Step 4.5 (route prefix, S4): the executor brief's own shorthand named `GET/POST /thread`
+  under `/api/assisted_selling`, but §6.2's own literal text is explicit — "Paths below are
+  relative to `/api/assisted_selling/storefront`." Built the four routes at
+  `/api/assisted_selling/storefront/thread`, `/thread/messages` and `/thread/events`, matching
+  the spec's own router-derivable shape (S4's own rule: every path must be producible by
+  `/api/<module_id>/<api subpath>`) rather than the brief's paraphrase. Alternative
+  considered: follow the brief literally — rejected as contradicting the spec it was itself
+  quoting from one line earlier.
+- Step 4.5 (`cartService.resolveBasketByToken`, cross-module surface): §5.1 names this exact
+  method on `cart`'s own DI service, but it did not exist on `CartService`/`CartServiceImpl`
+  yet. Added it there (one more scope-free, `kind: 'basket'`-only read, the SAME shape
+  Step 4.4's own `getForOrganizations`/`getProposalCartLines` additions already set a
+  precedent for) rather than reimplementing `cart`'s token-hash algorithm a second time in
+  this module — `lib/cartAccess.ts`'s own header comment is explicit that this module may
+  duck-type `cartService`'s DI surface but must never import `cart/lib` directly for
+  CART-domain logic. The D-R5-21 identity-binding check itself (comparing the resolved
+  basket's `customerUserId` against the caller's customer session) stays in THIS module's own
+  `lib/buyerIdentity.ts`, via the SAME static `getCustomerAuthFromRequest` import
+  `cart/lib/currentCartRoute.ts` (Step 2.9) and `checkout/lib/currentSessionRoute.ts` already
+  use for the identical helper — not a new precedent, a fourth call site of one.
+- Step 4.5 (Phase 2 item 5 scope: the two time-based sweepers vs. the three event subscribers):
+  the Step's own brief enumerated exactly three erasure triggers (`cart.cart.purged`,
+  `customer_accounts.user.deleted`, `auth.user.deleted`) under "Retention/erasure sweepers"
+  and its own test list named only these three — never the idle-close or retention-day
+  sweepers §5.10 also requires (an open thread idle past `idle_close_days`; a closed thread
+  past `conversation_retention_days`). Built exactly the three the brief named, sharing one
+  `eraseThread` routine (`lib/retention.ts#eraseAssistedSellingThread`) so a later Step's
+  idle-close/retention sweepers reuse it rather than duplicating the hard-delete/clear/
+  soft-delete sequence a third way. Alternative considered: build all five §5.10 triggers in
+  this Step for full Phase-2-item-5 compliance — rejected as scope creep past the Step's own
+  enumerated brief (cron/job registration, its own settings-driven scheduling, and its own
+  test surface are a materially different unit of work from "wire three event subscribers"),
+  and because the brief's own test list is the authoritative acceptance bar for this Step. The
+  two sweepers remain an open gap against §5.10/S7's full text — flagged for whichever Step
+  picks up Phase 6.1's integration-coverage completion pass, or a dedicated follow-up.
+- Step 4.5 (buyer participant `displayName`, no literal spec text): §5.2 says a buyer
+  participant's `display_name` is "Snapshot, shown to the other party" but never gives a
+  literal value for the buyer's OWN snapshot the way §5.10 does for the anonymized-rep case
+  ("Former team member"). Used `'Customer'` for an identified buyer and `'Guest'` for a guest,
+  plain literal snapshots (not `t()`-routed) — the same class of stored, shown-to-the-other-
+  party text `lib/participants.ts#resolveDisplayName` already stores for a rep's real name,
+  never run through i18n either. Alternative considered: resolve the buyer's real name via a
+  new soft dependency on `customer_accounts`/`customers` — rejected as scope creep this Step's
+  own brief does not ask for (no rep console exists yet in this Step to even render it), and
+  because `cartAccess.ts`'s own established DI surface does not expose a name lookup today.
+- Step 4.5 (`POST /thread`'s missing-store-id edge, not named by §6.10's error table): a
+  basket with no resolved `store_id` (e.g. a `pos`/`api` cart never bound to a store) has
+  nowhere to read `AssistedSellingStoreSettings.mode` from, mirroring `commands/threads.ts`'s
+  own staff-side `store_required` case one Step up — but the buyer route has no error code
+  named for it in §6.10 either. Answered `409 assisted_selling_unavailable` (the SAME code the
+  table already uses for "live mode refuses") rather than inventing a new `store_required`
+  code for the buyer side, since from the buyer's point of view the two cases are
+  indistinguishable ("this conversation feature isn't available for this basket right now").
+  Alternative considered: a new `store_required` buyer error code — rejected as an
+  unnecessary, spec-silent addition to §6.10's closed error-code table for an edge case the
+  spec itself never anticipated on this side.
 
 ## External References
 

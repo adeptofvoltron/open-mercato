@@ -106,3 +106,23 @@ export const assistedSellingProposalReauthorRequestSchema = z
   })
   .strict()
 export type AssistedSellingProposalReauthorRequest = z.infer<typeof assistedSellingProposalReauthorRequestSchema>
+
+// ---------------------------------------------------------------------------
+// Step 4.5 — buyer thread request bodies (§6.2). Public, cart-token bound; `.strict()`
+// throughout, same discipline as the staff bodies above.
+// ---------------------------------------------------------------------------
+
+/** `POST /thread` (§6.2). No body fields named by the spec's own table — an empty object,
+ * `.strict()` so an unexpected field is a `400` rather than silently ignored. */
+export const assistedSellingBuyerThreadOpenRequestSchema = z.object({}).strict()
+export type AssistedSellingBuyerThreadOpenRequest = z.infer<typeof assistedSellingBuyerThreadOpenRequestSchema>
+
+/** `POST /thread/messages` (§6.2). `bodyFormat`, when present, MUST be `'text'` (S24) — any
+ * other value is a `400`, never silently coerced. */
+export const assistedSellingBuyerMessagePostRequestSchema = z
+  .object({
+    body: z.string().trim().min(1).max(2000),
+    bodyFormat: z.literal('text').optional(),
+  })
+  .strict()
+export type AssistedSellingBuyerMessagePostRequest = z.infer<typeof assistedSellingBuyerMessagePostRequestSchema>

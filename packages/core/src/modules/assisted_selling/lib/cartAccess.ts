@@ -25,6 +25,23 @@ export type AssistedSellingProposalCartLine = {
   configuration: Record<string, unknown> | null
 }
 
+/**
+ * Step 4.5 (§5.1/§6.2, D-R5-21). The buyer thread routes' own "resolve the `X-Cart-Token`
+ * header to its basket cart through `cart`'s DI service" — the same `cartService` surface
+ * this file already duck-types, one more method. `status` is a plain string here (never
+ * `cart`'s own `Cart['status']` literal union type), consistent with `AssistedSellingCartSummary`
+ * above — this file intentionally carries no type import from `cart/data/entities.ts` either.
+ */
+export type AssistedSellingResolvedBasket = {
+  id: string
+  tenantId: string
+  organizationId: string
+  storeId: string | null
+  status: string
+  customerId: string | null
+  customerUserId: string | null
+}
+
 export type AssistedSellingCartServiceLike = {
   getForOrganizations(input: {
     tenantId: string
@@ -36,6 +53,9 @@ export type AssistedSellingCartServiceLike = {
     organizationId: string
     proposalCartId: string
   }): Promise<AssistedSellingProposalCartLine[]>
+  /** Step 4.5. Scope-free `kind: 'basket'` resolution by token — `null` for an unknown
+   * token, collapsing with every other "no match" outcome (no enumeration oracle). */
+  resolveBasketByToken(input: { token: string }): Promise<AssistedSellingResolvedBasket | null>
 }
 
 export function resolveCartService(container: {

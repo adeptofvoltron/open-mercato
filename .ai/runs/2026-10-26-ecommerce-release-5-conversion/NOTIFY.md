@@ -2191,3 +2191,71 @@ commit, credit link, codes/usage, gateway, lineMap, recovery — plus the public
   (exit 0). `yarn jest src/modules/assisted_selling` (packages/core) — 55/55 (35 pre-existing
   + 20 new). `yarn jest src/modules/cart` (packages/core) — 437/437 (443 minus the 6 deleted
   with `proposalRetarget.test.ts`), zero regressions.
+
+## 2026-10-27T08:12:01Z — Step 4.5 landed
+
+- `assisted_selling`: buyer thread routes under `/api/assisted_selling/storefront/thread`
+  (§6.2, S4) — `GET`/`POST /thread`, `POST /thread/messages`, `GET /thread/events` — plus the
+  three §5.10 event-driven erasure subscribers (`cart.cart.purged`, `customer_accounts.
+  user.deleted`, `auth.user.deleted`).
+- **Identity binding (D-R5-13/D-R5-21), the THIRD application of this run's own mechanism.**
+  Added `cartService.resolveBasketByToken` to `cart`'s own `CartService`/`CartServiceImpl`
+  (§5.1 names this exact call) — a scope-free, `kind: 'basket'`-only lookup by the globally
+  unique `token_hash`, no `cart.get` dispatch, no re-price. `lib/cartAccess.ts` duck-types it
+  the same way it already duck-types `getForOrganizations`/`getProposalCartLines`. The
+  identity check itself (`lib/buyerIdentity.ts#resolveIdentifiedBuyerBasket`) lives in THIS
+  module, via the same static `getCustomerAuthFromRequest` import `cart/lib/
+  currentCartRoute.ts` and `checkout/lib/currentSessionRoute.ts` already use — a guest basket
+  resolves on the token alone; an identified basket additionally requires the matching
+  customer session, collapsing every refusal (unknown token, wrong session, no session) to
+  the same `404` as an unknown thread.
+- **Buyer routes/commands** (`commands/buyerThread.ts`): `assisted_selling.thread.
+  openAsBuyer` (creates a thread with a `buyer`-typed participant, `actorId` = the
+  identified `customerUserId` or `null` for a guest — never a staff-authored shape; returns
+  the existing open thread unchanged when one already exists) and `assisted_selling.
+  message.postAsBuyer` (404s when the basket has no open thread; no live-mode check, per
+  §8.4 — an already-open conversation stays usable after the store turns `off`). Both run
+  with `ctx.auth: null`, mirroring `cart`'s own `/current/*` buyer-route convention — trust
+  comes from the already-identity-bound basket, never a staff principal.
+- **`GET /thread/events` (§6.2, S25).** Server-side `ETag`/`304` only — `cursor` is the
+  thread's own `updatedAt` ISO string (bumped by any message, participant or proposal-status
+  change that touches the thread row); `If-None-Match` (preferred) or `?since=` matching the
+  current cursor short-circuits to `304` with no body before any proposal read; otherwise
+  `200` with `{ cursor, changed: true, threadUpdatedAt, proposalIds }` — `proposalIds` is
+  every live proposal id when `since` is absent/invalid, or only those whose `updatedAt` is
+  newer than `since` otherwise. Asserted (test) that the 200 response carries exactly those
+  four keys — no message body, line, price or participant name ever appears in it. No client
+  polling cadence is implemented (S25: that is the integrator's own documented contract).
+- **Rate limiting.** New `lib/rateLimit.ts`, this module's own copy of `cart/lib/
+  rateLimit.ts`'s shape (own `ASSISTED_SELLING_*` env prefixes), §6.2's own four buckets:
+  `read` 120/min, `open` 10/min, `message` 30/min, `events` 240/min, keyed `ip:token`,
+  fail-open on an unavailable limiter.
+- **Retention/erasure — scope narrowed to the three event-driven triggers the Step's own
+  brief named**, not the two time-based sweepers (`idle_close_days`/
+  `conversation_retention_days`) §5.10 also specifies. `lib/retention.ts#
+  eraseAssistedSellingThread` is the ONE erase routine (hard-delete messages/participants,
+  clear proposal `rejectionReason`, soft-delete the thread) both this Step's `cart.cart.
+  purged` trigger and a later Step's sweepers should share. `lib/retention.ts#
+  anonymizeAssistedSellingRepParticipants` replaces a deleted rep's `display_name` with the
+  spec's own literal label, `'Former team member'`. All three subscribers
+  (`subscribers/cart-purged-erasure.ts`, `customer-accounts-user-deleted-erasure.ts`,
+  `auth-user-deleted-erasure.ts`) are `persistent: true`, scope by the payload's own
+  `tenantId`(/`organizationId` when carried), and are idempotent on redelivery by construction
+  (the erase routine's own `deletedAt: null` read-guard; the anonymize routine's own
+  already-labeled skip). Flagged in PLAN.md's decisions as an open gap for Phase 6.1 or a
+  dedicated follow-up.
+- **Tests (`packages/core`):** `cart/lib/__tests__/cartService.test.ts` gained 3 cases for
+  `resolveBasketByToken`. `assisted_selling/commands/__tests__/buyerThread.test.ts` (11
+  cases), `lib/__tests__/buyerIdentity.test.ts` (8 cases), `lib/__tests__/retention.test.ts`
+  (6 cases), `lib/__tests__/erasureSubscribers.test.ts` (11 cases), and three route-level
+  suites — `api/storefront/thread/__tests__/route.test.ts` (12 cases),
+  `api/storefront/thread/messages/__tests__/route.test.ts` (8 cases),
+  `api/storefront/thread/events/__tests__/route.test.ts` (9 cases) — covering identity
+  binding, tenant/organization isolation, the buyer-authored entity shapes, ETag/304
+  mechanics and the signal-only response shape, and rate-limit wiring.
+- **Checks (local mode, every `tsconfig.tsbuildinfo` wiped repo-wide first):** `yarn generate`
+  clean (new routes/subscribers discovered, no unrelated diffs). `yarn typecheck`
+  (`packages/core`) clean. `eslint` on every changed/new file clean (exit 0). `yarn jest
+  src/modules/assisted_selling` (packages/core) — 116/116 (14 suites). `yarn jest
+  src/modules/cart` (packages/core) — 440/440 (31 suites, +3 against this Step's own
+  `cartService.resolveBasketByToken` cases). 556/556 combined, zero regressions.

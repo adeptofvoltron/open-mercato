@@ -3,6 +3,12 @@ jest.mock('../toSalesSnapshots', () => ({
   getCartSalesSnapshot: (...args: unknown[]) => mockGetCartSalesSnapshot(...args),
 }))
 
+const mockFindOneWithDecryption = jest.fn()
+jest.mock('@open-mercato/shared/lib/encryption/find', () => ({
+  findOneWithDecryption: (...args: unknown[]) => mockFindOneWithDecryption(...args),
+  findWithDecryption: jest.fn(async () => []),
+}))
+
 const mockResolveCartRouteContext = jest.fn()
 class FakeCartStoreContextUnavailableError extends Error {}
 jest.mock('../routeContext', () => ({
@@ -105,5 +111,63 @@ describe('CartServiceImpl.lock — request-based routeContext resolution (C2)', 
     expect(mockResolveCartRouteContext).not.toHaveBeenCalled()
     const call = (commandBus.execute as jest.Mock).mock.calls[0]
     expect(call[1].input.routeContext).toBe(routeContext)
+  })
+})
+
+describe('CartServiceImpl.resolveBasketByToken (Step 4.5, §5.1/§6.2, D-R5-21)', () => {
+  it('returns null for an unknown token — never throws, same collapse as an unknown token elsewhere', async () => {
+    mockFindOneWithDecryption.mockResolvedValueOnce(null)
+    const { container } = makeContainer()
+    const service = new CartServiceImpl(container)
+
+    const result = await service.resolveBasketByToken({ token: 'not-a-real-token' })
+
+    expect(result).toBeNull()
+    const [, , where] = mockFindOneWithDecryption.mock.calls[0]
+    expect(where).toMatchObject({ kind: 'basket' })
+  })
+
+  it('maps the matched basket to its plain identity fields, scope-free (no tenantId/organizationId filter)', async () => {
+    mockFindOneWithDecryption.mockResolvedValueOnce({
+      id: 'cart-1',
+      tenantId: 'tenant-1',
+      organizationId: 'org-1',
+      storeId: 'store-1',
+      status: 'active',
+      customerId: 'customer-1',
+      customerUserId: 'customer-user-1',
+    })
+    const { container } = makeContainer()
+    const service = new CartServiceImpl(container)
+
+    const result = await service.resolveBasketByToken({ token: 'a-real-token' })
+
+    expect(result).toEqual({
+      id: 'cart-1',
+      tenantId: 'tenant-1',
+      organizationId: 'org-1',
+      storeId: 'store-1',
+      status: 'active',
+      customerId: 'customer-1',
+      customerUserId: 'customer-user-1',
+    })
+  })
+
+  it('never calls `cart.get` / the command bus — a pure DB read, no re-price', async () => {
+    mockFindOneWithDecryption.mockResolvedValueOnce({
+      id: 'cart-1',
+      tenantId: 'tenant-1',
+      organizationId: 'org-1',
+      storeId: null,
+      status: 'active',
+      customerId: null,
+      customerUserId: null,
+    })
+    const { container, commandBus } = makeContainer()
+    const service = new CartServiceImpl(container)
+
+    await service.resolveBasketByToken({ token: 'a-real-token' })
+
+    expect(commandBus.execute).not.toHaveBeenCalled()
   })
 })

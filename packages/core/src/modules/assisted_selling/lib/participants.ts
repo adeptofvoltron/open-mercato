@@ -52,3 +52,49 @@ export async function resolveOrBuildRepParticipant(
   })
   return { participant, isNew: true }
 }
+
+// Step 4.5 (§6.2, S6). The buyer side of the same `resolveOrBuild*Participant` family —
+// `POST /thread`/`POST /thread/messages` need the buyer's own `AssistedSellingParticipant`
+// row the same way the staff routes need the rep's. `actorId` is `customerUserId` for an
+// identified buyer, `null` for a guest (§5.2: "NULL only for a guest buyer") — the entity's
+// own `(thread_id, actor_type, actor_id)` uniqueness is a partial index on `deleted_at`, not a
+// true-NULL-distinct guarantee for a guest's repeated `null`, but a single buyer only ever
+// holds one open thread on one basket (§5.1's own `(tenant_id, buyer_cart_id)` partial unique
+// index), so the plain find-then-create below never races in practice.
+
+/** `[internal]`-free by design (rev of the i18n hardcoded-string rule): this is a stored
+ * data snapshot shown to the OTHER party (§5.2), not a thrown error or a toast — the same
+ * class of literal text `resolveDisplayName` above already stores for a rep's real name. */
+export function buildAssistedSellingBuyerDisplayName(customerUserId: string | null): string {
+  return customerUserId ? 'Customer' : 'Guest'
+}
+
+export async function resolveOrBuildBuyerParticipant(
+  em: EntityManager,
+  scope: { tenantId: string; organizationId: string; threadId: string },
+  customerUserId: string | null,
+): Promise<{ participant: AssistedSellingParticipant; isNew: boolean }> {
+  const existing = await em.findOne(AssistedSellingParticipant, {
+    tenantId: scope.tenantId,
+    threadId: scope.threadId,
+    actorType: 'buyer',
+    actorId: customerUserId,
+    deletedAt: null,
+  })
+  if (existing) return { participant: existing, isNew: false }
+
+  const now = new Date()
+  const participant = em.create(AssistedSellingParticipant, {
+    id: randomUUID(),
+    tenantId: scope.tenantId,
+    organizationId: scope.organizationId,
+    threadId: scope.threadId,
+    actorType: 'buyer' as const,
+    actorId: customerUserId,
+    displayName: buildAssistedSellingBuyerDisplayName(customerUserId),
+    joinedAt: now,
+    createdAt: now,
+    updatedAt: now,
+  })
+  return { participant, isNew: true }
+}
