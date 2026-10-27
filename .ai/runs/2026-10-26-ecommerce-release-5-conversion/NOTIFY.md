@@ -1090,3 +1090,10 @@ payment methods listing)
   ecommerce` — 68/68 suites, 891/891 tests, ZERO regressions from the additive settings-schema
   field. `yarn build:packages` — 40/40 tasks successful (incl. `@open-mercato/core` and
   `@open-mercato/checkout`).
+
+## 2026-10-27T20:30:00Z — dispatcher: tracked note from Step 2.13
+- Step 2.13 listed available payment methods but did not build a `POST /sessions/current/payment`
+  method-SELECTION route (not in its named scope). Flagging for Step 4.1 (B.4 submit) to check: if
+  submit itself accepts the chosen payment method as a direct input, no separate selection route
+  is needed; if the spec's step machine expects the method to be SET on the session before submit
+  is called, Step 4.1 must add that route itself before building the submit sequence on top of it.
