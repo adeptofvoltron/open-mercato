@@ -63,7 +63,7 @@
 | 6 | 6.1 | All modules: integration-coverage completion per each analysis's test list (G23/A20/K17/S16/C26) | dispatch:standard | done | pending |
 | 6 | 6.1-fix | checkout: fix mislabeled `credit_refused` on a gateway payment failure + recovery worker's give-up branch never cancelling the order | inline | done | pending |
 | 6 | 6.2 | `UPGRADE_NOTES.md` — D-R5-21 behaviour change, A16, G26 | inline | done | pending |
-| 6 | 6.3 | `yarn template:sync:fix` pass (apps/mercato/src/modules.ts registration etc.) | inline | todo | — |
+| 6 | 6.3 | `yarn template:sync:fix` pass (apps/mercato/src/modules.ts registration etc.) | inline | done | pending |
 | 6 | 6.4 | Full gate (`.ai/agentic.config.json` validation.commands), fix-forward | inline | todo | — |
 
 ## Goal

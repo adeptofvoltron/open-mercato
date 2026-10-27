@@ -2774,3 +2774,14 @@ of every item in the handed-off inventory:
      guidance for callers.
 - No dedicated validator exists for this file (plain markdown, only the standard pre-commit
   i18n/template-sync hooks run on every commit).
+
+## 2026-10-28T08:15:00Z — Step 6.3 (template:sync:fix verification)
+- `yarn template:sync:fix` clean — app and template already in sync for every synced src folder
+  and root file, package dependencies clean. Each Step across the run that touched
+  `apps/mercato/src/**` (notably Step 4.3's `assisted_selling` registration) already ran this
+  check itself; this pass re-confirms the cumulative state.
+- Checked `apps/mercato/.env.example`/`packages/create-app/template/.env.example` for any new env
+  var introduced across the whole release (`git diff fc5f8d04ca..HEAD --stat` on both paths) —
+  empty diff, no new env vars anywhere. All new Release 5 configuration (per-tenant email switch,
+  approval expiry window, PO/quote terms, etc.) lives in DB-backed `ModuleConfigService`/
+  `CustomerGroupTerms` settings, never process env — nothing to add here.
