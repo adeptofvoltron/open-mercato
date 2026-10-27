@@ -662,6 +662,13 @@ const mergeCartCommand: CommandHandler<CartMergeInput, CartMergeResult> = {
     await emitCartEvent('cart.cart.merged', {
       sourceCartId: absorbedCart.id,
       targetCartId: survivorCart.id,
+      // Step 3.3 (rev 10 — S3/D-R5-32): every new-or-extended Release 5 event payload
+      // carries tenant/organization scope so a subscriber (this module's own proposal
+      // retarget subscriber, `lib/proposalRetarget.ts`, and eventually `assisted_selling`'s
+      // §8.1) can filter before it loads anything by id — additive fields on an
+      // already-shipped event id, never a removal.
+      tenantId: survivorCart.tenantId,
+      organizationId: survivorCart.organizationId,
       kind: 'basket',
       mergeLogId: mergeLog.id,
       strategy,
@@ -672,6 +679,8 @@ const mergeCartCommand: CommandHandler<CartMergeInput, CartMergeResult> = {
     if (strategy === 'replace') {
       await emitCartEvent('cart.cart.adopted', {
         cartId: survivorCart.id,
+        tenantId: survivorCart.tenantId,
+        organizationId: survivorCart.organizationId,
         customerId: survivorCart.customerId ?? null,
         customerUserId: survivorCart.customerUserId ?? null,
       })

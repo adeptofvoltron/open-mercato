@@ -128,6 +128,53 @@ export const cartLineAddInputSchema = z.object({
 export type CartLineAddInput = z.infer<typeof cartLineAddInputSchema>
 
 // ---------------------------------------------------------------------------
+// §7a proposal seam — `cart.proposal.create`'s trusted command-input shape (rev 10 — S5,
+// S13, S14, D-R5-14, §7a.2). `targetCartId`/`routeContext` stay out of this schema (the
+// latter is the branded `ResolvedCartRouteContext`, §6a.1a's "never run through a public
+// `.strict()` schema" rule) — only the structured, caller-supplied parts (`lines`,
+// `ttlSeconds`) are validated here, mirroring `cartCreateInputSchema`'s own split between
+// zod-validated fields and trusted, out-of-band ones. `quantity` is a decimal STRING,
+// matching the spec's own literal pseudocode (`quantity: string`), not `cartLineAddInputSchema`'s
+// sibling shape's divergence.
+//
+// `productId`/`variantId` are plain non-empty strings, not `uuid()` — same precedent
+// `cartMarkConvertedLineMapEntrySchema` above already set ("this is the command's own
+// internal input shape... not an HTTP body validator"): `cart.lines.add`/`.bulkAdd` apply NO
+// zod format check at all at the command layer (`commands/lines.ts` destructures
+// `CartLinesAddInput`/`CartLinesBulkAddEntry` directly), and the real guard against a
+// malformed id is the batched catalog lookup resolving to "not found" -> `product_unavailable`
+// — not the id's lexical format. A `uuid()` constraint here would also break this module's
+// own test-fixture convention (every `CatalogProduct.id` fixture across
+// `commands/__tests__/{lines,cart,merge}.test.ts` is a plain string like `'product-1'`). The
+// public `POST /proposals` HTTP body (Step 3.4) gets its OWN `.strict()` schema with `uuid()`,
+// matching `cartLineAddRequestSchema`'s existing split between the command's internal shape
+// and the route's own stricter public one.
+// ---------------------------------------------------------------------------
+
+export const CART_PROPOSAL_MIN_TTL_SECONDS = 3600
+export const CART_PROPOSAL_MAX_TTL_SECONDS = 1_209_600
+export const CART_PROPOSAL_DEFAULT_TTL_SECONDS = 259_200
+
+export const cartProposalCreateLineInputSchema = z.object({
+  productId: z.string().trim().min(1),
+  variantId: clearableStringSchema(190),
+  quantity: decimalStringSchema,
+  configuration: jsonRecordSchema.nullable().optional(),
+})
+export type CartProposalCreateLineInput = z.infer<typeof cartProposalCreateLineInputSchema>
+
+// `.min(1).max(100)` mirrors `cart.lines.bulkAdd`'s own 1..100 cap (§7a.2's pseudocode:
+// "1..100").
+export const cartProposalCreateLinesSchema = z.array(cartProposalCreateLineInputSchema).min(1).max(100)
+
+export const cartProposalCreateTtlSecondsSchema = z
+  .number()
+  .int()
+  .min(CART_PROPOSAL_MIN_TTL_SECONDS)
+  .max(CART_PROPOSAL_MAX_TTL_SECONDS)
+  .optional()
+
+// ---------------------------------------------------------------------------
 // Public HTTP request bodies for `/api/cart/current/*` (Step 4.7, §6a.1a/§8.1/§10).
 // `.strict()` per D-R4-1/6 so an unrecognized key 400s. None of these carry
 // `cartId` (derived from the resolved "current" cart, itself resolved from the

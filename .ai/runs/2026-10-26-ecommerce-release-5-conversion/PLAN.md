@@ -46,7 +46,7 @@
 | 3 | 3.1 | cart: approval gate K1–K5 (`requiresApproval`, lock refusal, `purpose: 'quote'` skip D-R5-23, guest fail-closed D-R5-12/29) | dispatch:standard | done | pending |
 | 3 | 3.1-fix | ecommerce: fix `mergeStoreSettings` missing `shipping` (TS2322/TS2741, regression from Step 2.13) | inline | done | pending |
 | 3 | 3.2 | cart: `/current/request-approval` route + lifecycle withdrawal wiring (K3/K4/K7, `awaiting_approval_since` K5) | dispatch:standard | done | pending |
-| 3 | 3.3 | cart: §7a proposal seam commands (create/withdraw/supersede/re-author, D-R5-14) | dispatch:standard | todo | — |
+| 3 | 3.3 | cart: §7a proposal seam commands (create/withdraw/supersede/re-author, D-R5-14) | dispatch:standard | done | pending |
 | 3 | 3.4 | cart: §7a proposal routes + sweeper branches (K13–K16/S13–S15) + undo-merge refusal (D-R5-25) | dispatch:standard | todo | — |
 | 3 | 3.5 | checkout: B.2 cart-backed links — trusted pay-link seeding (D-R5-19) + store/channel/currency check (C9) | dispatch:standard | todo | — |
 | 4 | 4.1 | checkout: B.4 submit sequence part 1 — preconditions, lock, `availability.reserve`, `reserveCredit`, idempotent document creation (C3/C7) | dispatch:standard | todo | — |
@@ -867,6 +867,50 @@ commit `c92470d8d5`).
   paraphrase of an earlier design — this is not a judgment call so much as the only way the
   code compiles, but recorded here since the brief's own pseudocode reads as if those two
   fields were real inputs.
+
+- Step 3.3 (§7a.5, the task brief's own "reject-command-vs-route" question): resolved in
+  favor of a real command. §7a.5's literal text names only `cart.proposal.reject`, called
+  by BOTH the buyer-facing route (Step 3.4) and every author-side ending ("withdraw,
+  supersede and re-author call `cart.proposal.reject`... There is no separate
+  `cart.proposal.withdraw`/`.supersede` command. Distinguished by a `rejectedBy: 'buyer' |
+  'author'` input field the caller supplies. Full reasoning in NOTIFY.md's Step 3.3 entry.
+- Step 3.3 (D-R5-14's re-author subscriber, placement): built in `cart`
+  (`lib/proposalRetarget.ts` + `subscribers/cart-merged-proposal-retarget.ts`) as a
+  PROVISIONAL mechanism, even though the authoritative spec (`2026-09-22-assisted-selling.md`
+  §8.1/§6.4) places this subscriber in `assisted_selling`, which does not exist as code yet
+  (this run's own Phase 4, Steps 4.3–4.5). The task brief explicitly instructed building a
+  cart-only version now ("do not attempt to call into a non-existent assisted_selling
+  module"). Flagged for whichever Step builds the real `assisted_selling` module to remove
+  or narrow this subscriber so the two mechanisms never double-process one merge.
+  Alternative considered: skip the mechanism entirely and leave it for Phase 4 — rejected
+  because the task brief's own explicit Implementation bullets named it as this Step's
+  scope, with an explicit fallback to build if `assisted_selling` is absent.
+- Step 3.3 ("supersede-on-merge" vs. the authoritative spec's "both proposals are live"):
+  the task brief's literal test sentence ("supersede-on-merge leaves exactly one live
+  proposal targeting a cart after acceptance") read, taken at face value, as "supersede
+  SIBLING proposals when one is accepted" — directly contradicted by
+  `2026-09-22-assisted-selling.md` §6.1: "Both proposals are live... neither blocks the
+  other; the buyer may accept both, either or neither." Per root AGENTS.md (the spec is
+  authoritative, the brief is the finding that produced it), did NOT build sibling
+  supersession. "Exactly one live proposal after acceptance" falls out of the ordinary
+  lifecycle instead (the accepted proposal's own status leaves `active`; the sibling is
+  never touched) — tested explicitly. Read "supersede-on-merge" and "re-author" as two
+  facets of the ONE login-merge mechanism above, not a second piece of logic. Alternative
+  considered: build an explicit "reject every other active proposal targeting this cart on
+  acceptance" rule to satisfy the brief's literal sentence — rejected as directly
+  contradicting the authoritative spec text quoted above, with no stated reason to diverge.
+- Step 3.3 (S10, `addedByActorType` on a proposal line): hard-coded to `'rep'` for any
+  authenticated `ctx.auth.sub`-bearing caller, never derived from `users.kind`. Release 5's
+  own scope decision (D-R5-15/S10: `mode: rep | off` only, no AI agent participant is ever
+  created) makes `'ai_agent'` unreachable regardless of what `cart` itself could otherwise
+  detect, and no caller in this release ever supplies one. Revisit when Phase 3 (AI actor)
+  ships.
+- Step 3.3 (`cartProposalCreateLineInputSchema`, id format): `productId`/`variantId` are
+  plain non-empty strings, not `uuid()` — same precedent `cartMarkConvertedLineMapEntrySchema`
+  (Step 2.10) already set: no public route exists yet, the real guard is the batched catalog
+  lookup collapsing to `product_unavailable`, and this module's own `CatalogProduct.id` test
+  fixtures are plain strings throughout (`'product-1'`). The public `POST /proposals` body
+  (Step 3.4) gets its own `.strict()`, `uuid()`-validated schema.
 
 ## External References
 

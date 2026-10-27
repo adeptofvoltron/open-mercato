@@ -125,8 +125,18 @@ function getCartLineIdentifiers(line: CartLine) {
  * the SAME §6a.2 whole-cart re-visibility pass as trigger 2/merge and reports through this
  * SAME `'reprice'` value — a lock-triggered rejection is indistinguishable, at this event's
  * granularity, from any other re-price-triggered one.
+ *
+ * Step 3.3 (rev 10 — S13/K13) adds `'proposal_create'` — `cart.proposal.create`'s own
+ * §6a.1b check against the TARGET buyer's scope (`commands/proposal.ts`). Additive member
+ * on an already-shipped union; every existing value is untouched.
  */
-export type CartVisibilityRejectionTrigger = 'lines.add' | 'lines.update' | 'lines.bulkAdd' | 'reprice' | 'merge'
+export type CartVisibilityRejectionTrigger =
+  | 'lines.add'
+  | 'lines.update'
+  | 'lines.bulkAdd'
+  | 'reprice'
+  | 'merge'
+  | 'proposal_create'
 
 /**
  * Emitted once per REQUEST with the count of lines this call rejected for a VISIBILITY
@@ -228,7 +238,12 @@ function tryResolvePolicyResolutionService(container: { resolve: <T = unknown>(n
   }
 }
 
-async function resolveQuantityRulesForProduct(
+// Exported (Step 3.3) — `commands/proposal.ts`'s `cart.proposal.create` prices its own
+// freshly-created lines the exact same way `cart.lines.add`/`.bulkAdd` already do, rather
+// than a parallel re-implementation. Purely additive (an `export` keyword on an existing
+// function); no behavior change — same precedent Step 2.6 set for
+// `CustomerPurchaseApprovalService.toApprovalView`.
+export async function resolveQuantityRulesForProduct(
   em: EntityManager,
   container: { resolve: <T = unknown>(name: string) => T },
   scope: CartLineScope,
@@ -254,7 +269,10 @@ async function resolveQuantityRulesForProduct(
 // Shared: pricing a line
 // ---------------------------------------------------------------------------
 
-function buildCartPricingRowFilterContext(cart: Cart): PricingContext {
+// Exported (Step 3.3) — same reuse-not-reimplement reasoning as `resolveQuantityRulesForProduct`
+// above; every function in this "Shared: pricing a line" block down to `computeLineTotals` is
+// now reusable by `commands/proposal.ts`.
+export function buildCartPricingRowFilterContext(cart: Cart): PricingContext {
   return {
     channelId: cart.salesChannelId ?? null,
     customerId: cart.customerId ?? null,
@@ -286,7 +304,7 @@ function buildBuyerPricingContext(cart: Cart, quantity: number, date: Date): Buy
  * `buildPriceRowFilter`, scoped to the requested product ids (plus any variant ids as an
  * `$or`), never one query per product.
  */
-async function fetchPriceRowsBatch(
+export async function fetchPriceRowsBatch(
   em: EntityManager,
   scope: CartLineScope,
   pricingContext: PricingContext,
@@ -306,7 +324,7 @@ async function fetchPriceRowsBatch(
   return rows as unknown as PriceRow[]
 }
 
-function groupRowsByProduct(rows: PriceRow[], variantToProduct: Map<string, string>): Map<string, PriceRow[]> {
+export function groupRowsByProduct(rows: PriceRow[], variantToProduct: Map<string, string>): Map<string, PriceRow[]> {
   const grouped = new Map<string, PriceRow[]>()
   for (const row of rows) {
     const variantId = resolvePriceVariantId(row)
@@ -319,7 +337,7 @@ function groupRowsByProduct(rows: PriceRow[], variantToProduct: Map<string, stri
   return grouped
 }
 
-async function resolveLinePricing(
+export async function resolveLinePricing(
   em: EntityManager,
   container: { resolve: <T = unknown>(name: string) => T },
   cart: Cart,
@@ -335,7 +353,7 @@ async function resolveLinePricing(
   })
 }
 
-function applyPriceSnapshot(line: CartLine, resolved: ResolvedLinePrice, pricedAt: Date): void {
+export function applyPriceSnapshot(line: CartLine, resolved: ResolvedLinePrice, pricedAt: Date): void {
   line.unitPriceNet = resolved.amountNet !== null ? String(resolved.amountNet) : null
   line.unitPriceGross = resolved.amountGross !== null ? String(resolved.amountGross) : null
   line.taxRate = resolved.taxRatePercent !== null ? String(resolved.taxRatePercent) : null
@@ -382,7 +400,7 @@ async function isWithinStoredPriceTier(
  * line's own totals snapshot is computed the same way `sales` would compute it for a real
  * document, with the tax/discount arithmetic owned entirely by `sales`.
  */
-async function computeLineTotals(
+export async function computeLineTotals(
   container: { resolve: <T = unknown>(name: string) => T },
   cart: Cart,
   params: {
@@ -670,7 +688,7 @@ async function findExistingCustomerLine(
   return (candidates as CartLine[]).find((line) => configurationsEqual(line.configuration ?? null, configuration)) ?? null
 }
 
-async function computeStartingLineNumber(em: EntityManager, scope: CartLineScope, cartId: string): Promise<number> {
+export async function computeStartingLineNumber(em: EntityManager, scope: CartLineScope, cartId: string): Promise<number> {
   const existing = await em.find(CartLine, { cartId, tenantId: scope.tenantId, organizationId: scope.organizationId })
   return existing.reduce((max, line) => Math.max(max, line.lineNumber), 0) + 1
 }
@@ -685,7 +703,7 @@ type NewLineFields = {
   metadata: Record<string, unknown> | null
 }
 
-function resolveSnapshotFields(product: CatalogProduct, variant: CatalogProductVariant | null, configuration: Record<string, unknown> | null, metadata: Record<string, unknown> | null): NewLineFields {
+export function resolveSnapshotFields(product: CatalogProduct, variant: CatalogProductVariant | null, configuration: Record<string, unknown> | null, metadata: Record<string, unknown> | null): NewLineFields {
   return {
     productId: product.id,
     variantId: variant?.id ?? null,
@@ -733,7 +751,7 @@ function resolveSnapshotFields(product: CatalogProduct, variant: CatalogProductV
  * through every later phase exactly like `buildPromotionsEffectsPhase`'s own in-place gift
  * line push/splice already depends on.
  */
-function buildCartPromotionsAndTotalsPhases(params: {
+export function buildCartPromotionsAndTotalsPhases(params: {
   em: EntityManager
   container: CommandRuntimeContext['container']
   cart: Cart
@@ -790,7 +808,7 @@ function buildCartPromotionsAndTotalsPhases(params: {
  * possibly have produced. Called AFTER the caller's own `withAtomicFlush` commits, same
  * "side effects only after the DB write lands" rule as every other emission in this file.
  */
-async function emitCartPromotionsAndTotalsSideEffects(
+export async function emitCartPromotionsAndTotalsSideEffects(
   dataEngine: DataEngine,
   cart: Cart,
   outcome: { createdGiftLines: CartLine[]; removedGiftLines: CartLine[]; promotionWarnings: CartPromotionWarning[] },

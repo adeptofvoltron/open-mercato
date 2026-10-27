@@ -1296,3 +1296,150 @@ payment methods listing)
   `CustomerPurchaseApprovalService`/`CustomerPurchaseApprovalServiceError` exports and
   frozen `customer_groups.approval.*` event payload shape were consumed, nothing in that
   module itself was touched).
+
+## 2026-10-27T02:36:00Z — Step 3.3 landed (cart: §7a proposal seam commands — create/reject, supersede/re-author on merge)
+
+**Scope.** Two commands only, per the Step's own brief: `cart.proposal.create` (§7a.2) and
+`cart.proposal.reject` (§7a.5). No HTTP route, no acceptance flow (`cart.merge { strategy:
+'manual' }`), no sweeper branches — all Step 3.4's scope (K15/S15, plus D-R5-25's undo-merge
+refusal). The re-author/supersede mechanism (D-R5-14) is built as a provisional, cart-only
+subscriber (see below) since `assisted_selling` does not exist as code yet.
+
+**Reject-command-vs-route question, resolved by re-reading the spec closely.** The task
+brief's own "WAIT, re-check" question asked whether `reject` is a route-level concern or a
+real command. The spec's §7a.5 answers directly: "The buyer rejects through `POST
+/proposals/:proposalId/reject`... The author's side ends a proposal in-process:
+`assisted_selling` withdraw, supersede and re-author call `cart.proposal.reject`..." — there is
+**no** separate `cart.proposal.withdraw`/`.supersede` command anywhere in the spec. Every
+author-side ending of a proposal IS a call to `cart.proposal.reject`, distinguished only by a
+`rejectedBy: 'buyer' | 'author'` input field the CALLER supplies (never inferred from a request
+body): the buyer-facing route (Step 3.4) passes `'buyer'`; every author-side caller (the
+subscriber below, and eventually `assisted_selling`'s own withdraw/supersede/reauthor routes)
+passes `'author'`. So `cart.proposal.reject` is built now, as a real command, exactly as the
+task's implementation bullets originally asked — the "withdraw" and "supersede" language in
+the brief's own bullet list map onto this ONE command, not three.
+
+**The re-author/supersede subscriber lives in `cart` as a provisional mechanism, NOT
+`assisted_selling` — and this is a deliberate, documented divergence from the authoritative
+spec's own placement.** `.ai/specs/2026-09-22-assisted-selling.md` §8.1/§6.4 states plainly
+that the login-merge re-author/supersede subscriber is `assisted_selling`'s own code ("a
+`kind = 'basket'` subscriber on `cart.cart.merged`... re-authored as its original author...
+through `buildTrustedCommandContext`"). That module is this run's own Phase 4 (Steps
+4.3–4.5) and does not exist yet. The Step 3.3 task brief explicitly instructed building this
+mechanism NOW anyway, using only what `cart` itself can see ("re-run CART's own
+visibility/pricing/line-add logic equivalently... do not attempt to call into a non-existent
+assisted_selling module"). Built as `lib/proposalRetarget.ts` +
+`subscribers/cart-merged-proposal-retarget.ts` (persistent, event `cart.cart.merged`). It does
+NOT touch anything `assisted_selling` owns (no thread, no `superseded_by_proposal_id`, no
+`live_proposal_count`) — only `cart`'s own `Cart`/`CartLine` rows and its own two new commands.
+When Phase 4 builds the real `assisted_selling` module, this subscriber should most likely be
+REMOVED (or narrowed to a no-op) in favor of that module's own, spec-authoritative one — flagged
+explicitly for whichever Step does that, so the two mechanisms never double-process the same
+merge.
+
+**"Supersede-on-merge" and "re-author" are ONE mechanism here, not two — and the task brief's
+own literal test requirement ("supersede-on-merge leaves exactly one live proposal targeting a
+cart after acceptance") was read against the authoritative spec rather than followed literally
+for its "after ACCEPTANCE" framing.** Re-checked `.ai/specs/2026-09-22-assisted-selling.md`
+directly: "Both proposals are live. They are separate carts and separate rows; neither blocks
+the other; the buyer may accept both, either or neither." (§6.1) — sibling proposals targeting
+the SAME basket are explicitly **never** superseded by one another's acceptance. So there is no
+"supersede siblings when one is accepted" logic to build, and building it would contradict the
+spec directly. What IS built, and satisfies the literal test sentence under its most natural
+reading (two proposals live, one is accepted, exactly one remains live afterward): acceptance
+itself (Step 3.4's `cart.merge`) transitions the accepted proposal's own `status` out of
+`active` into a terminal one — the sibling's `status` is simply never touched by anything in
+this Step, so "exactly one live proposal remains" falls out of the ordinary lifecycle, not a
+new cross-proposal rule. Added a regression test (`commands/__tests__/proposal.test.ts`,
+"supersede-on-merge...") that simulates this exact scenario directly (two proposals targeting
+one cart, one manually marked `merged` as Step 3.4's future acceptance would do) and asserts the
+sibling is both present and untouched. The "Supersede-on-merge"/"re-author" bullets in the task
+brief are, on this reading, two facets of the SAME login-merge mechanism (`lib/
+proposalRetarget.ts`): the fallback branch IS the supersede, the success branch is the
+re-author-then-supersede-the-old-one. Flagged as a genuine scope-interpretation call, not a
+silent skip.
+
+**Re-author mechanics (D-R5-14).** `handleCartMergedForProposalRetarget` (`lib/
+proposalRetarget.ts`) finds every `kind: 'proposal'`, `status: 'active'` cart whose
+`proposedToCartId` names the cart that `cart.cart.merged`'s `sourceCartId` says just got
+absorbed, and for each one: reads the author off the proposal's own `CartLine.addedByActorType`/
+`_id` (§4.1 — `Cart` has no `authored_by_*` column); if the author is not `'rep'` (Release 5
+never writes `'ai_agent'`, S10) or has no id, supersedes immediately (no re-author attempted);
+otherwise calls `cart.proposal.create` against the NEW target under
+`buildTrustedCommandContext({ actorType: 'user', actorId: <author>, reason:
+'cart.proposal.reauthor' })` (Step 1.1's helper) with the old proposal's own lines and a
+TTL clamped to its remaining time (bounded to the same 3600–1,209,600s window); on success OR
+on a caught failure (the create call's own `cart.proposals.author` check refuses — the only
+eligibility signal `cart` can check without `assisted_selling`'s store-mode concept), the OLD
+proposal is rejected (`cart.proposal.reject`, `rejectedBy: 'author'`) under a bare SYSTEM
+context (no re-check of the ACL feature a second time — the create call already proved or
+disproved it). Both branches tested explicitly in `lib/__tests__/proposalRetarget.test.ts`
+(re-author-succeeds, ineligible-actor-type, create-throws-403), plus a no-pending-proposals
+no-op, a missing-scope no-op (S3/D-R5-32), and two-siblings-processed-independently.
+
+**Known gap, documented not closed:** a crash between a successful `cart.proposal.create` and
+the matching `cart.proposal.reject` leaves the OLD proposal still `active`, so a redelivery of
+the same `cart.cart.merged` event can re-author a SECOND time before finally rejecting the
+first old row. No idempotency key exists at this layer (that is `assisted_selling`'s own S23
+concern, keyed on its own `AssistedSellingProposal.idempotency_key`, not available to this
+provisional cart-only mechanism). Acceptable for Release 5 per the same risk class this run's
+own precedent already accepts elsewhere (assisted-selling's own S23 finding: "a
+double-submitted authoring call creates two proposal carts", bounded, not eliminated).
+
+**`cart.cart.merged`/`.adopted` gained `tenantId`/`organizationId` (additive, S3/D-R5-32)** —
+both were missing them entirely (confirmed by reading `commands/merge.ts` directly); the new
+subscriber needs them to filter before loading anything by id, and D-R5-32 already calls for
+this exact fix on every Release 5 event payload. Existing `expect.objectContaining(...)`
+assertions in `commands/__tests__/merge.test.ts` are unaffected (additive fields never break a
+partial-match assertion).
+
+**Reused, never duplicated, the existing per-line pricing/visibility machinery.** Exported
+(additive `export` keyword, zero behavior change — same precedent Step 2.6 set for
+`CustomerPurchaseApprovalService.toApprovalView`) eleven previously-private helpers from
+`commands/lines.ts` (`buildCartPricingRowFilterContext`, `fetchPriceRowsBatch`,
+`groupRowsByProduct`, `resolveLinePricing`, `applyPriceSnapshot`, `computeLineTotals`,
+`resolveSnapshotFields`, `computeStartingLineNumber`, `resolveQuantityRulesForProduct`,
+`buildCartPromotionsAndTotalsPhases`, `emitCartPromotionsAndTotalsSideEffects`) rather than
+re-implementing a second pricing/totals path in `commands/proposal.ts`. `cart.proposal.create`
+could NOT reuse `cart.lines.bulkAdd` wholesale the way a first instinct suggests — that
+command's own `loadMutableCart` filters `kind: 'basket'` unconditionally, which a brand-new
+`kind: 'proposal'` cart (not yet persisted at line-build time) can never satisfy — so it builds
+its own line loop directly on the freshly-created `Cart` entity, calling the SAME exported
+pricing/quantity-rule helpers bulkAdd itself calls.
+
+**`addedByActorType` is always `'rep'` in Release 5.** The spec's own caller list for `POST
+/proposals` names "a staff `auth.User`, or an AI agent principal (`users.kind = 'agent'`)", but
+S10 (assisted-selling) restricts Release 5 to `mode: rep | off` with NO AI agent participant
+ever created — so `'ai_agent'` is unreachable in this release regardless of what `cart` itself
+might otherwise support. `cart.proposal.create` hard-codes `'rep'` for any authenticated
+`ctx.auth.sub`-bearing caller rather than trying to detect `users.kind` (a query this command
+has no documented need for yet, and no caller in this release ever supplies an agent
+principal). Revisit if/when Phase 3 (AI actor) actually ships.
+
+**`cartProposalCreateLineInputSchema`'s `productId`/`variantId` are plain non-empty strings,
+not `uuid()`** — same precedent `cartMarkConvertedLineMapEntrySchema` already set two Steps ago
+("this is the command's own internal input shape... not an HTTP body validator"): no public
+route exists yet, the real guard is the batched catalog lookup resolving to
+`product_unavailable`, and every `CatalogProduct.id` fixture across this module's own test
+suite (`lines`/`cart`/`merge`.test.ts) is a plain string like `'product-1'`, never a real UUID.
+The public `POST /proposals` body (Step 3.4) gets its own `.strict()`, `uuid()`-validated
+schema, matching `cartLineAddRequestSchema`'s existing split.
+
+**Files touched:**
+- `commands/proposal.ts` (new) — `cart.proposal.create`, `cart.proposal.reject`.
+- `commands/lines.ts` — eleven `export` additions (listed above), plus `'proposal_create'`
+  added to `CartVisibilityRejectionTrigger` (additive enum member, S13/K13).
+- `commands/merge.ts` — `tenantId`/`organizationId` added to `cart.cart.merged`/`.adopted`
+  payloads (additive, S3/D-R5-32).
+- `lib/proposalRetarget.ts` (new) — the re-author/supersede mechanism.
+- `subscribers/cart-merged-proposal-retarget.ts` (new) — thin wiring.
+- `data/validators.ts` — `cartProposalCreateLineInputSchema`/`cartProposalCreateLinesSchema`/
+  `cartProposalCreateTtlSecondsSchema` + the three TTL bound constants.
+- Tests: `commands/__tests__/proposal.test.ts` (new, 18 cases), `lib/__tests__/
+  proposalRetarget.test.ts` (new, 7 cases).
+
+**Checks:** `yarn workspace @open-mercato/core typecheck` clean (0 errors). Full
+`src/modules/cart` suite: 28/28 suites, 379/379 tests (25 new), zero regressions. Every
+pre-existing basket-only command (`cart.get`, `cart.lines.*`, `cart.merge`, `cart.lock`, the
+sweepers) is untouched and still filters `kind: 'basket'` — confirmed by grep and by this
+Step's own `cart.get` regression test.
