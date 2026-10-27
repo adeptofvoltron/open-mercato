@@ -2589,3 +2589,17 @@ session-route identity binding audit D-R5-33, opens the final Phase 5 pair)
   consumer tying `assisted_selling`/`cart`/`checkout` together via the converted-cart event,
   per the task's own framing). `yarn i18n:check-hardcoded` — zero `assisted_selling`/`cart`
   findings (advisory gate either way).
+
+## 2026-10-28T06:45:00Z — checkpoint 11 (Steps 5.1–5.4, closes Phase 5)
+- Range: `db87581207`..`a17a1c94ba`. Summary: checkout B.5 B2B (quote branch, PO, min_order_value,
+  spec-corrected fail-open currency rule); approval-resume subscriber + D-R5-33 audit (no gap
+  found); assisted_selling rep console; Phase 4 attribution.
+- Checks: forced full typecheck (40/40, 0 cached) pass; core sweeps (75/77 + 127/128 suites, both
+  expected-skip counts resolved separately below); full checkout suite (55/55, 462/462).
+- MAJOR FINDING: discovered a real local Postgres (Homebrew @17) running on 127.0.0.1:5432.
+  Created two disposable throwaway DBs, re-ran all three gated real-Postgres concurrency suites
+  (credit/availability/approval) — all passed (3/3 suites, 17/17 tests) — then dropped both DBs.
+  This closes the "accepted risk, no live Postgres" caveat carried since Step 1.6. New standard
+  practice: re-verify each new .pg.test.ts at its own checkpoint from now on.
+- Phase 5 is complete. All 4 planned Steps landed; no rescues needed this phase. The release's
+  entire main implementation scope (Phases 1-5, 44 Steps total incl. fix-forwards) is now built.
