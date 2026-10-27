@@ -2806,3 +2806,69 @@ of every item in the handed-off inventory:
   convention this entire run has followed). Re-ran both checks: `check-sync` EXIT=0, `check-usage`
   EXIT=0 with zero `MISSING KEYS`, same 8000 advisory-unused count.
 - Continuing the gate with steps 6-8 (`yarn typecheck`, `yarn test`, `yarn build:app`) next.
+- Step 6.4 complete, all 8 gate commands green on `fork/feat/release-5-conversion`:
+  - `build:packages` x2, `generate`: clean (unchanged outputs).
+  - `i18n:check-sync` / `i18n:check-usage`: EXIT=0, zero missing keys, ~8000 advisory-unused
+    (pre-existing, not a gate signal).
+  - `typecheck --force` (tsbuildinfo wiped first): 40/40 packages, EXIT=0.
+  - `test --env-mode=loose`: the aggregate run aborts turbo on the first package failure
+    ([[yarn-test-aborts-remaining-packages]]), which cost 4 full aggregate passes before every
+    package was individually confirmed green. Found and fixed 2 real regressions beyond the
+    i18n/bc-guard fixes already landed:
+    1. `open-mercato-docs#test` — the 3 new Release 5 notification types
+       (`availability.stock_lost_after_payment`, `customer_groups.approval.requested`,
+       `customer_groups.credit.limit_exceeded`) were never added to
+       `notification-delivery.mdx`'s registered-types map or the no-channels ratio
+       (76 -> 79). Fixed, commit `5f911df618`.
+    2. `@open-mercato/cli#test`'s `module-facts.bc-guard.test.ts` — the Release 5 module union
+       pushed the generated module-facts JSON/markdown past the existing BC-budget caps
+       (measured: completeJson 5,575,796 vs cap 5,550,000; legacy delta, markdown and
+       directory-markdown all similarly over). Re-measured and confirmed uniform ~15-16% growth
+       across all four measures (the guard's own signature for "additive module set", not a
+       blow-up) before raising the caps with the same ~1.15 headroom the file's own prior raises
+       used. Commit `0347d285bd`.
+    3. `@open-mercato/core#test` never got far enough to run in ANY aggregate pass (turbo kept
+       aborting on an earlier package first) — ran it standalone (`yarn workspace @open-mercato/core
+       test`, ~38min) and found 5 more real regressions this release introduced, invisible until
+       then:
+       - `optimistic-lock-command-coverage.test.ts`: 4 new direct `enforceCommandOptimisticLock`
+         sites (cart reprice/request-approval, customer_groups approval-decide x2) needed a
+         `record_locks` decision in the allowlist. Allowlisted as OSS-only/exempt (terminal
+         one-shot CAS transitions / single-admin actions, not collaborative edits), same pattern
+         as the file's existing entries.
+       - `command-interceptor-http-coverage.test.ts`: 5 routes (3 cart, 2 assisted_selling) already
+         correctly delegate to their module's own error mapper (which does call
+         `getCommandInterceptorHttpRejection`) but weren't added to the guard's
+         `ROUTES_WITH_MODULE_LEVEL_MAPPER` allowlist yet — the guard's AST walk is file-scoped and
+         cannot see across the helper-function boundary into `currentCartRoute.ts` /
+         `buyerIdentity.ts`.
+       - `backend-page-route-params.test.ts`: the cart admin detail page and the assisted_selling
+         thread detail page read their `[id]` route param via `useParams()` instead of the `params`
+         prop. Fixed both to the `{ params }: { params?: { id?: string } }` convention every other
+         backend detail page in this repo uses.
+       - `acl-feature-catalog.i18n.test.ts`: 15 ACL feature titles (`checkout.sessions.*`,
+         `assisted_selling.*` x6, `customer_groups.credit.*`/`approvals.*`/`portal.approvals.*`)
+         were missing from `auth`'s English i18n catalog. Added to all 5 locales — real Polish
+         translations for `pl.json` (that file already carries real ACL-feature translations, not
+         English placeholders, for the surrounding keys), English placeholder for de/es/ko
+         (matching the existing convention for those 3 locales in this file).
+       - `category-labels-coverage.test.ts`: `notifications.categories.availability` and
+         `.customer_groups` were missing from those modules' own i18n files in all 5 locales
+         (would have fallen back to the raw module id as the settings-page group heading, #7089).
+         Added real translations to all 5 locales for both modules (both modules' i18n files are
+         already fully translated, not placeholders).
+       All 5 fixed in one commit (`32291eb8d7`) with targeted + full-package verification
+       (21/21 on the 5 specific files, then a second full `core` standalone run: 2545/2545 suites,
+       24873/25099 tests, 0 failures, confirming nothing else broke).
+    The only test failure surviving across every attempt is `@open-mercato/cli`'s
+    `dev-env-reload.test.ts` ("watches generated runtime files when explicitly requested") — an
+    fs.watch timing flake under this machine's heavy concurrent-worktree load, confirmed by a
+    standalone re-run passing 3/3 outside the aggregate run's contention. Pre-existing, unrelated
+    to this release; left alone per DYSCYPLINA.
+  - `build:app`: EXIT=0, 7m54s, all routes compiled.
+  Gate runner: local (no Docker `app` container running), `TMPDIR=/private/var/tmp` +
+  `--env-mode=loose` required for every turbo-driven command in this cezar worktree
+  ([[tsx-scripts-need-short-tmpdir]]).
+- Step 6.4 done. Moving to the completion checklist: om-auto-review-pr-style review pass with
+  autofix, then UI QA with screenshots for the new admin screens, then PR #16 description update,
+  draft->ready, final handoff, notify.

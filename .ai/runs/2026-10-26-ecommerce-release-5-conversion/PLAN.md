@@ -64,7 +64,7 @@
 | 6 | 6.1-fix | checkout: fix mislabeled `credit_refused` on a gateway payment failure + recovery worker's give-up branch never cancelling the order | inline | done | pending |
 | 6 | 6.2 | `UPGRADE_NOTES.md` — D-R5-21 behaviour change, A16, G26 | inline | done | pending |
 | 6 | 6.3 | `yarn template:sync:fix` pass (apps/mercato/src/modules.ts registration etc.) | inline | done | pending |
-| 6 | 6.4 | Full gate (`.ai/agentic.config.json` validation.commands), fix-forward | inline | todo | — |
+| 6 | 6.4 | Full gate (`.ai/agentic.config.json` validation.commands), fix-forward | inline | done | f955c009a6,5f911df618,0347d285bd,32291eb8d7 |
 
 ## Goal
 
