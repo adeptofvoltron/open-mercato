@@ -31,15 +31,14 @@ UI browser verification pass, then Phase 6 (6.1–6.4).
   instead of deferring to the final gate.**
 
 ## Next concrete action
-- Given real Postgres is now confirmed available, do the long-deferred UI browser verification
-  pass (carried since Checkpoint 6) across every admin surface this release shipped: credit
-  panel/ledger/create/adjust dialogs (`customer_groups`), cart admin list/detail/reprice (`cart`),
-  the assisted_selling rep console (inbox/thread/proposal builder), and the attributions report.
-  This needs: migrations applied to a disposable QA database, the dev server started, a seeded
-  tenant/org/admin user, then a real browser pass with screenshots per the final completion
-  checklist's requirement ("QA UI ze screenshotami dla nowych ekranów admina").
-- Then Phase 6: Step 6.1 (integration-coverage completion), 6.2 (`UPGRADE_NOTES.md`), 6.3
-  (`yarn template:sync:fix` verification), 6.4 (the full `.ai/agentic.config.json` gate).
+- Proceed to Phase 6 in the order the task's own completion checklist names: Step 6.1
+  (integration-coverage completion), 6.2 (`UPGRADE_NOTES.md`), 6.3 (`yarn template:sync:fix`
+  verification), 6.4 (the full `.ai/agentic.config.json` gate) — THEN the code review
+  (`om-auto-review-pr`-style pass) — THEN, only after both, the UI browser verification pass
+  with screenshots (credit panel, cart admin, assisted_selling console, attributions report),
+  now feasible since a local Postgres is confirmed available. An earlier note in this file
+  suggested doing the UI pass before Phase 6 — corrected: the checklist's own order is gate →
+  review → QA UI, follow that.
 
 ## Blockers / open questions
 - none
