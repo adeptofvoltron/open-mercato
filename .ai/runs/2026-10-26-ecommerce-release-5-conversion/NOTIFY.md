@@ -1695,3 +1695,13 @@ seeding D-R5-19 + store/channel/currency mismatch check C9)
   non-regression test). `eslint` clean (0 errors; 1 pre-existing anonymous-default-export
   style warning on `checkout/data/entities.ts`, unrelated to this Step's own additions) on
   every changed/new file.
+
+## 2026-10-28T00:00:00Z — checkpoint 8 (Step 3.5, closes Phase 3)
+- Range: `5bcf30e047` (single Step, phase-close trigger). Summary: checkout B.2 trusted pay-link
+  cart seeding (D-R5-19) + reusable C9 consistency guard, ready for Step 4.1.
+- Checks: forced full typecheck with tsbuildinfo wiped (40/40, 0 cached) pass; core sweep
+  (cart+customer_groups+ecommerce, 142/144 suites, 1792/1800 tests, 2 expected gated skips); full
+  checkout suite (49/49 suites, 353/353 tests, incl. re-verified C10 Phase-A guard).
+- Decisions/problems: none blocking. Two non-blocking gaps logged (CheckoutLinkCartTemplate admin
+  write route; catalog-only template lines) — neither blocks Phase 4.
+- Phase 3 is complete. All 5 Steps landed plus one fix-forward; no rescues needed this phase.
