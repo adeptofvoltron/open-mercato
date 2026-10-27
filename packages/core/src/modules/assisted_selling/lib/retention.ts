@@ -2,14 +2,13 @@ import type { EntityManager } from '@mikro-orm/postgresql'
 import { AssistedSellingMessage, AssistedSellingParticipant, AssistedSellingProposal, AssistedSellingThread } from '../data/entities'
 
 // Step 4.5 (§5.10, S7). "A route that stores text about a buyer must ship with retention and
-// erasure." This Step ships the three EVENT-DRIVEN erasure triggers only (`cart.cart.purged`,
+// erasure." This Step shipped the three EVENT-DRIVEN erasure triggers only (`cart.cart.purged`,
 // `customer_accounts.user.deleted`, `auth.user.deleted`) — the two TIME-based sweepers
 // (`assisted-selling-idle-close`, `assisted-selling-retention`, keyed on
-// `idle_close_days`/`conversation_retention_days`) are out of this Step's own scope (see
-// NOTIFY.md's Step 4.5 entry) and are deferred to a later Step. `eraseThread` below is the
-// ONE erase routine §5.10 names for both the basket-purge trigger and (when a later Step adds
-// it) the retention sweeper, so the two triggers already in this Step never drift from the
-// one a future Step adds.
+// `idle_close_days`/`conversation_retention_days`) were deferred to a later Step (see
+// NOTIFY.md's Step 4.5 entry). Step 6.1 closes that gap: `lib/sweepers.ts#sweepRetention`
+// calls `eraseAssistedSellingThread` below — the SAME erase routine §5.10 names for every
+// trigger, event-driven or time-based — so none of the four ever drifts from the others.
 
 /**
  * §5.10's "closed and erased immediately" / "the same routine" for the three erasure

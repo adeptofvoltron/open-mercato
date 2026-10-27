@@ -14,8 +14,8 @@ import { createModuleEvents } from '@open-mercato/shared/modules/events'
 //
 // Step 5.3 adds `.participant.left` — the console's own `POST /threads/:id/join`'s
 // counterpart (`/leave`), the one remaining id §6.8's own table names that Step 4.4 had not
-// yet built a writer for. `.thread.closed` stays deferred — the §5.10 idle-close sweeper
-// does not ship in this run (PLAN.md's Step 4.5 decision).
+// yet built a writer for. `.thread.closed` stayed deferred at that point — the §5.10
+// idle-close sweeper had not shipped yet (PLAN.md's Step 4.5 decision).
 //
 // Step 5.4 adds `.attribution.degraded` (§6.7/§6.8) — the `cart.cart.converted` subscriber's
 // own operator-facing safety-net signal, emitted when a proposal-touched conversion arrives
@@ -23,11 +23,17 @@ import { createModuleEvents } from '@open-mercato/shared/modules/events'
 // text: "not broadcast to either [bridge]: it is an operator signal, the same reasoning
 // `cart.line.visibility_rejected` already applies."
 //
+// Step 6.1 adds `.thread.closed` (§5.10, §6.8, S7) — the idle-close sweeper's own emission
+// (`lib/sweepers.ts#sweepIdleThreads`), the one remaining thread-lifecycle id Step 4.4 itself
+// deferred. `clientBroadcast: true`, same as every other thread/participant/message/proposal
+// event, so the rep console's own open thread (if any) reflects the close without polling.
+//
 // `clientBroadcast: true` on every one of the thread/participant/message/proposal events
 // (§6.8: "on thread, participant, message and proposal events so the rep console updates
 // without polling").
 const events = [
   { id: 'assisted_selling.thread.opened', label: 'Assisted Selling Thread Opened', entity: 'thread', category: 'lifecycle', clientBroadcast: true },
+  { id: 'assisted_selling.thread.closed', label: 'Assisted Selling Thread Closed', entity: 'thread', category: 'lifecycle', clientBroadcast: true },
   { id: 'assisted_selling.participant.joined', label: 'Assisted Selling Participant Joined', entity: 'participant', category: 'lifecycle', clientBroadcast: true },
   { id: 'assisted_selling.participant.left', label: 'Assisted Selling Participant Left', entity: 'participant', category: 'lifecycle', clientBroadcast: true },
   { id: 'assisted_selling.message.posted', label: 'Assisted Selling Message Posted', entity: 'message', category: 'crud', clientBroadcast: true },
