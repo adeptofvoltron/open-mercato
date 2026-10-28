@@ -674,7 +674,18 @@ const submitSessionCommand: CommandHandler<CheckoutSessionSubmitCommandInput, Ch
                 ]
               : []),
           ],
-          metadata: { sourceModule: 'checkout', checkoutSessionId: session.id },
+          // D-R5-23: `purpose: 'quote'` skipped `cart.lock`'s own approval gate (K2) —
+          // `lockResult.cart` carries that gate's own fresh, post-reprice verdict, computed
+          // moments ago by the SAME `cart.lock` call this command just dispatched above.
+          // Snapshotting it here (FK-id + snapshot, `packages/core/AGENTS.md` § Cross-Module
+          // Coupling) lets `sales/api/quotes/accept` re-run the gate before converting an
+          // accepted quote to an order — the "approval returns at quote acceptance" half of
+          // D-R5-23 that this quote-creation step is the only place positioned to supply.
+          metadata: {
+            sourceModule: 'checkout',
+            checkoutSessionId: session.id,
+            pendingApproval: { required: lockResult.cart.requiresApproval, approvalId: lockResult.cart.approvalId },
+          },
         },
         ctx: trustedCtx,
       })

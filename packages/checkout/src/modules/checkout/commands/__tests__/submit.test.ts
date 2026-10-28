@@ -808,6 +808,23 @@ describe('checkout.session.submit (B.5, §8/C15-C17, D-R5-20/23/26/28 — Step 5
     expect(result.salesOrderId).toBeNull()
   })
 
+  it('the quote branch snapshots cart.lock\'s own approval-gate verdict onto the quote so sales/api/quotes/accept can re-run it (D-R5-23)', async () => {
+    const h = buildHarness({ terms: makeTerms({ allowQuoteRequests: true }) })
+    h.cartService.lock.mockResolvedValue({
+      cart: { status: 'locked', requiresApproval: true, approvalId: 'approval-xyz' },
+      priceChanges: [],
+      extended: false,
+    })
+
+    await getHandler().execute({ ...BASE_INPUT, paymentMethodCode: 'request_quote' }, h.ctx)
+
+    expect(h.commandBusExecute).toHaveBeenCalledWith('sales.quotes.create', expect.objectContaining({
+      input: expect.objectContaining({
+        metadata: expect.objectContaining({ pendingApproval: { required: true, approvalId: 'approval-xyz' } }),
+      }),
+    }))
+  })
+
   it('the quote branch never calls the payment gateway', async () => {
     const h = buildHarness({ terms: makeTerms({ allowQuoteRequests: true }) })
 
