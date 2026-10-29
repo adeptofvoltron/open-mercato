@@ -161,4 +161,32 @@ describe('sales.quotes.create — externalReference/customerReference (checkout 
     const quoteRow = created.find((row) => 'quoteNumber' in row)
     expect(quoteRow).toMatchObject({ externalReference: null, customerReference: null })
   })
+
+  // Regression for PR #16 round-2 QA bug 12: checkout's document creation
+  // (checkout/commands/submit.ts) spreads a SalesLineSnapshot straight into this
+  // command's `lines` input. The snapshot type declares productVariantId /
+  // configuration / quantityUnit as `| null`, and toCartTotalsLineSnapshot sets
+  // them explicitly rather than omitting them — this must go through the REAL
+  // command handler (not a mocked commandBus), since the bug was the real
+  // `quoteCreateSchema.parse()` call inside it rejecting `null`.
+  it('accepts a checkout-shaped line snapshot with explicit nulls for productVariantId/configuration/quantityUnit', async () => {
+    const { ctx } = buildHarness()
+
+    const result = await getHandler('sales.quotes.create').execute(
+      buildInput({
+        lines: [
+          {
+            ...line,
+            productId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+            productVariantId: null,
+            configuration: null,
+            quantityUnit: null,
+          },
+        ],
+      }) as never,
+      ctx,
+    ) as { quoteId: string }
+
+    expect(result.quoteId).toBeTruthy()
+  })
 })
