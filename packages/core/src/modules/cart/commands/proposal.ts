@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto'
 import { registerCommand } from '@open-mercato/shared/lib/commands'
 import type { CommandBus, CommandHandler, CommandRuntimeContext } from '@open-mercato/shared/lib/commands'
 import { emitCrudSideEffects } from '@open-mercato/shared/lib/commands/helpers'
@@ -337,7 +338,13 @@ const createProposalCommand: CommandHandler<CartProposalCreateInput, CartProposa
     const { tokenHash } = generateCartToken()
     // §7a.1: "A proposal cart holds a `token_hash` only to satisfy the unique column; it is
     // never returned by any route, command result or event" — the plaintext is discarded.
+    // `Cart.id` is a DB-side `gen_random_uuid()` default (never assigned client-side by
+    // `em.create`), but the lines built below need `proposalCart.id` as their `cartId` FK
+    // before this cart is ever flushed (both are persisted together in the single
+    // `withAtomicFlush` transaction further down). Assign it explicitly so it exists now —
+    // same house pattern as `warranty_claims/commands/claims.ts`'s parent+child creates.
     const proposalCart = em.create(Cart, {
+      id: randomUUID(),
       organizationId: target.organizationId,
       tenantId: target.tenantId,
       tokenHash,
