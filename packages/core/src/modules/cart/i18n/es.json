@@ -43,6 +43,7 @@
   "cart.admin.list.filters.status": "Estado",
   "cart.admin.list.pageTitle": "Carritos",
   "cart.admin.list.table.approval": "Aprobación",
+  "cart.admin.list.table.approvalResolved": "Aprobación resuelta",
   "cart.admin.list.table.channel": "Canal",
   "cart.admin.list.table.customer": "Cliente",
   "cart.admin.list.table.empty": "Ningún carrito coincide con estos filtros.",

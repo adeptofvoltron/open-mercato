@@ -43,6 +43,7 @@
   "cart.admin.list.filters.status": "Status",
   "cart.admin.list.pageTitle": "Koszyki",
   "cart.admin.list.table.approval": "Zatwierdzenie",
+  "cart.admin.list.table.approvalResolved": "Zatwierdzenie zakończone",
   "cart.admin.list.table.channel": "Kanał",
   "cart.admin.list.table.customer": "Klient",
   "cart.admin.list.table.empty": "Brak koszyków spełniających te filtry.",

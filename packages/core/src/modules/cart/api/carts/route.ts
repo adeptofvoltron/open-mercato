@@ -41,6 +41,7 @@ const CART_ADMIN_LIST_FIELDS = [
   'currency_code',
   'grand_total_gross_amount',
   'requires_approval',
+  'awaiting_approval_since',
   'approval_id',
   'proposed_to_cart_id',
   'last_activity_at',

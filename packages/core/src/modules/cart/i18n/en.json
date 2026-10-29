@@ -43,6 +43,7 @@
   "cart.admin.list.filters.status": "Status",
   "cart.admin.list.pageTitle": "Carts",
   "cart.admin.list.table.approval": "Approval",
+  "cart.admin.list.table.approvalResolved": "Approval resolved",
   "cart.admin.list.table.channel": "Channel",
   "cart.admin.list.table.customer": "Customer",
   "cart.admin.list.table.empty": "No carts match these filters.",

@@ -43,6 +43,7 @@
   "cart.admin.list.filters.status": "상태",
   "cart.admin.list.pageTitle": "장바구니",
   "cart.admin.list.table.approval": "승인",
+  "cart.admin.list.table.approvalResolved": "승인 완료",
   "cart.admin.list.table.channel": "채널",
   "cart.admin.list.table.customer": "고객",
   "cart.admin.list.table.empty": "이 필터와 일치하는 장바구니가 없습니다.",

@@ -42,6 +42,12 @@ type CartAdminRow = {
   currencyCode: string
   grandTotalGrossAmount: number | null
   requiresApproval: boolean
+  // Non-null while a request is awaiting a decision; cleared to null by
+  // `lib/approvalDecidedSubscriber.ts` on every terminal outcome (approved/rejected/
+  // expired/withdrawn). `requiresApproval` alone never clears (§9a.4/§9a.5 — it is "this
+  // basket crossed the threshold," not "still pending"), so it cannot distinguish a
+  // resolved approval from a pending one on its own.
+  awaitingApprovalSince: string | null
   lineCount: number
   lastActivityAt: string | null
   expiresAt: string | null
@@ -83,6 +89,7 @@ function mapApiCart(item: Record<string, unknown>): CartAdminRow {
     currencyCode: readString(item, 'currencyCode', 'currency_code') ?? '',
     grandTotalGrossAmount: readNumber(item, 'grandTotalGrossAmount', 'grand_total_gross_amount'),
     requiresApproval: item.requiresApproval === true || item.requires_approval === true,
+    awaitingApprovalSince: readString(item, 'awaitingApprovalSince', 'awaiting_approval_since'),
     lineCount: typeof item.lineCount === 'number' ? item.lineCount : 0,
     lastActivityAt: readString(item, 'lastActivityAt', 'last_activity_at'),
     expiresAt: readString(item, 'expiresAt', 'expires_at'),
@@ -118,6 +125,7 @@ export default function CartAdminListPage() {
         approval: t('cart.admin.list.table.approval', 'Approval'),
         lastActivity: t('cart.admin.list.table.lastActivity', 'Last activity'),
         expiresAt: t('cart.admin.list.table.expiresAt', 'Expires'),
+        approvalResolved: t('cart.admin.list.table.approvalResolved', 'Approval resolved'),
         empty: t('cart.admin.list.table.empty', 'No carts match these filters.'),
       },
       filters: {
@@ -287,14 +295,22 @@ export default function CartAdminListPage() {
         header: labels.table.approval,
         enableSorting: false,
         meta: { priority: 4 },
-        cell: ({ row }) =>
-          row.original.requiresApproval ? (
+        cell: ({ row }) => {
+          if (!row.original.requiresApproval) {
+            return <span className="text-xs text-muted-foreground/70">—</span>
+          }
+          // `requiresApproval` alone never clears once set — `awaitingApprovalSince` is
+          // what actually tracks "still pending a decision" (see the row type's comment).
+          return row.original.awaitingApprovalSince ? (
             <StatusBadge variant="warning" dot>
               {labels.filters.requiresApproval}
             </StatusBadge>
           ) : (
-            <span className="text-xs text-muted-foreground/70">—</span>
-          ),
+            <StatusBadge variant="success" dot>
+              {labels.table.approvalResolved}
+            </StatusBadge>
+          )
+        },
       },
       {
         accessorKey: 'lastActivityAt',

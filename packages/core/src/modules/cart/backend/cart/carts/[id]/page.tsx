@@ -31,7 +31,10 @@ type CartLineRow = {
   name: string
   quantity: string
   unitPriceGross: string | null
-  lineTotals: { grandTotalGrossAmount?: number } | null
+  // A line's `lineTotals` is `SalesLineCalculationResult` (`salesCalculationService
+  // .calculateLine`'s own shape, see `cart/lib/reprice.ts#computeLineTotals`) — the
+  // cart/document-level aggregate's `grandTotalGrossAmount` field does not exist here.
+  lineTotals: { grossAmount?: number } | null
   addedByActorType: string
   flagState: string | null
 }
@@ -49,6 +52,13 @@ type MergeLogRow = {
   createdAt: string
   mergedByActorType: string
   proposalCartId: string | null
+}
+
+// `quantity` is a `numeric(16, 4)` column, so the API always sends it as a 4-decimal
+// string (e.g. "2.0000") — trimmed to how many decimals the value actually needs.
+function formatLineQuantity(value: string): string {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed.toLocaleString(undefined, { maximumFractionDigits: 4 }) : value
 }
 
 type WarningRow = { code: string; lineId?: string; message: string }
@@ -282,9 +292,9 @@ export default function CartAdminDetailPage({ params }: { params?: { id?: string
                   {cart.lines.map((line) => (
                     <tr key={line.id} className="border-b border-border last:border-0">
                       <td className="px-3 py-2 text-foreground">{line.name}</td>
-                      <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">{line.quantity}</td>
+                      <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">{formatLineQuantity(line.quantity)}</td>
                       <td className="px-3 py-2 text-right tabular-nums text-foreground">
-                        {formatCurrency(line.lineTotals?.grandTotalGrossAmount ?? null, cart.currencyCode) ?? '—'}
+                        {formatCurrency(line.lineTotals?.grossAmount ?? null, cart.currencyCode) ?? '—'}
                       </td>
                     </tr>
                   ))}

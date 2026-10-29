@@ -43,6 +43,7 @@
   "cart.admin.list.filters.status": "Status",
   "cart.admin.list.pageTitle": "Warenkörbe",
   "cart.admin.list.table.approval": "Genehmigung",
+  "cart.admin.list.table.approvalResolved": "Genehmigung abgeschlossen",
   "cart.admin.list.table.channel": "Kanal",
   "cart.admin.list.table.customer": "Kunde",
   "cart.admin.list.table.empty": "Keine Warenkörbe entsprechen diesen Filtern.",
