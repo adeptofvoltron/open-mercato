@@ -121,7 +121,35 @@ describe('listCheckoutPaymentMethods (§5.5, B.5 half: on_account/request_quote)
     const result = await listCheckoutPaymentMethods(container, SCOPE, { currencyCode: 'USD', linkGatewayProviderKey: null, buyer: BUYER })
 
     expect(result).toEqual([{ kind: 'on_account' }])
-    expect(checkCredit).toHaveBeenCalledWith({ scope: SCOPE, buyer: { customerId: BUYER.customerId }, currencyCode: 'USD', amount: '0' })
+    // `customerIds` (the buyer's full identity), never the bare `customerId`, must reach
+    // `checkCredit` — only `customerIds` drives `resolveBuyerCustomerId`'s company-first
+    // resolution (`customerCreditService.ts`), and a credit account is held by the
+    // COMPANY, not the person. See the dedicated regression test below for the case this
+    // fixture's `customerIds === [customerId]` shape cannot distinguish on its own.
+    expect(checkCredit).toHaveBeenCalledWith({ scope: SCOPE, buyer: { customerIds: BUYER.customerIds }, currencyCode: 'USD', amount: '0' })
+  })
+
+  // Regression: `BUYER` above has `customerIds === [customerId]`, so it cannot tell
+  // apart "passed the bare customerId" from "passed customerIds" — both resolve to the
+  // same single id. A buyer whose full identity includes a DIFFERENT (company) id makes
+  // the distinction concrete: `submit.ts`'s own `reserveCredit` call always passes
+  // `customerIds`, and this listing must agree, or `on_account` can be missing here
+  // while submit still accepts it (the bug this test guards against).
+  it('passes the full customerIds identity to checkCredit, not just the person-only customerId', async () => {
+    const buyer = { customerId: 'person-1', customerIds: ['person-1', 'company-1'] }
+    const resolveTerms = jest.fn(async () => ({ allowPurchaseOnAccount: true, allowQuoteRequests: false }))
+    const checkCredit = jest.fn(async () => ({ allowed: true, reason: 'ok' }))
+    const container = makeContainer(null, { customerGroupsService: { resolveTerms }, customerCreditService: { checkCredit } })
+
+    const result = await listCheckoutPaymentMethods(container, SCOPE, { currencyCode: 'USD', linkGatewayProviderKey: null, buyer })
+
+    expect(result).toEqual([{ kind: 'on_account' }])
+    expect(checkCredit).toHaveBeenCalledWith({
+      scope: SCOPE,
+      buyer: { customerIds: ['person-1', 'company-1'] },
+      currencyCode: 'USD',
+      amount: '0',
+    })
   })
 
   it.each(['no_account', 'on_hold', 'not_permitted'] as const)(

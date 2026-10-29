@@ -81,7 +81,16 @@ export async function listCheckoutPaymentMethods(
     if (terms?.allowPurchaseOnAccount) {
       const creditService = tryResolve<CustomerCreditService>(container, 'customerCreditService')
       if (creditService) {
-        const creditBuyer = buyer!.customerId != null ? { customerId: buyer!.customerId } : { customerIds: buyer!.customerIds }
+        // `customerIds` (the buyer's full identity — person AND company) must be
+        // preferred whenever available, never the single person-only `customerId`: a
+        // credit account is held by the COMPANY, and only the `customerIds` form drives
+        // `resolveBuyerCustomerId`'s company-first resolution
+        // (`customerCreditService.ts`) — a bare `customerId` is returned verbatim with no
+        // resolution at all. `submit.ts`'s own `reserveCredit` call already follows this
+        // convention (`buyer: { customerIds: cartPeer.customerIds }` unconditionally);
+        // this listing must agree, or `on_account` can be missing here while submit still
+        // accepts it.
+        const creditBuyer = buyer!.customerIds.length > 0 ? { customerIds: buyer!.customerIds } : { customerId: buyer!.customerId! }
         // §5.5: "an account in the cart currency that is not on hold" — the amount is
         // irrelevant to THIS gate (a `limit_exceeded` reason, from a non-zero amount,
         // never excludes the method from the listing per the response's own three-reason
