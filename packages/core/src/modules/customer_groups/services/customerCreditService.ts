@@ -167,10 +167,24 @@ export type AdjustCreditInput = {
 
 export type AdjustCreditResult = { entry: CreditEntryView }
 
+export type GetAccountExposureInput = { creditAccountId: string; scope: CommerceScope }
+
+export type AccountExposureView = { exposure: DecimalString; available: DecimalString | null }
+
 export interface CustomerCreditService {
   // Read-only, no lock. A hint for the UI and checkout's payment-method list, never a
   // guarantee — only `reserveCredit` decides under the lock (§6.3).
   checkCredit(input: CheckCreditInput): Promise<CreditCheck>
+
+  // Read-only, no lock, no `allowPurchaseOnAccount` short-circuit — unlike `checkCredit`,
+  // which answers "can a purchase happen right now" and intentionally reports
+  // `exposure: null` when the group's current terms disallow it (§6.5 reason order).
+  // This answers a narrower, display-only question for an ALREADY-KNOWN account: "what
+  // is its real ledger exposure", for admin screens that must show the number regardless
+  // of whether on-account purchasing happens to be enabled today (e.g. a historical
+  // account whose group's terms later changed). Returns `available: null` only when the
+  // account carries no credit limit yet.
+  getAccountExposure(input: GetAccountExposureInput): Promise<AccountExposureView>
 
   // Row lock on the credit account (§6.3); re-checks under the lock and appends the
   // reserve entry. `amount` is the caller's full payable total.
@@ -416,6 +430,18 @@ export class DefaultCustomerCreditService implements CustomerCreditService {
       { tenantId: scope.tenantId, organizationId: scope.organizationId, customerId, currencyCode, deletedAt: null },
       options.lockMode ? { lockMode: options.lockMode } : undefined,
     )
+  }
+
+  async getAccountExposure(input: GetAccountExposureInput): Promise<AccountExposureView> {
+    const { creditAccountId, scope } = input
+    const account = await this.em.findOne(CustomerCreditAccount, {
+      id: creditAccountId,
+      tenantId: scope.tenantId,
+      organizationId: scope.organizationId,
+    })
+    const exposure = await this.sumExposure(creditAccountId, scope)
+    const available = account?.creditLimit != null ? addDecimalStrings(account.creditLimit, negateDecimalString(exposure)) : null
+    return { exposure, available }
   }
 
   async checkCredit(input: CheckCreditInput): Promise<CreditCheck> {

@@ -220,14 +220,15 @@ export const customerCreditAccountCrud = makeCrudRoute<
     },
     // Exposure/available are never stored columns (§5.5: exposure is `SUM(amount)` over
     // the ledger, recomputed under the account's row lock on every write) — reusing the
-    // ALREADY-LOCK-CORRECT `customerCreditService.checkCredit` here keeps this admin
-    // view consistent with Step 1.6 without duplicating its money math (root AGENTS.md:
-    // reuse the service, don't fork its logic). `transformItem` cannot do this (it is
-    // synchronous); `afterList` runs once per request and can await the service per row.
-    // One known display gap, accepted rather than special-cased: when the resolved
-    // terms currently disallow purchase-on-account, `checkCredit` short-circuits before
-    // summing the ledger and reports `exposure: null` even though the account's true
-    // exposure may be nonzero — a historical account whose group's terms later changed.
+    // service's money math here keeps this admin view consistent with Step 1.6 without
+    // duplicating it (root AGENTS.md: reuse the service, don't fork its logic).
+    // `transformItem` cannot do this (it is synchronous); `afterList` runs once per
+    // request and can await the service per row. Uses `getAccountExposure` (the row's own
+    // known `id`), never `checkCredit` (buyer/purchase-permission gated) — this is a
+    // display read for an account that already exists, not a purchase-authorization
+    // decision, so it must show the account's real exposure even when the group's
+    // CURRENT terms disallow on-account purchasing (e.g. a historical account whose
+    // group's terms later changed) rather than reporting `exposure: null`.
   },
   create: {
     schema: customerCreditAccountCreateRequestSchema,
@@ -317,18 +318,15 @@ export const customerCreditAccountCrud = makeCrudRoute<
       const creditService = ctx.container.resolve('customerCreditService') as CustomerCreditService
       for (const item of items) {
         const row = item as Record<string, unknown>
-        const customerId = typeof row.customer_id === 'string' ? row.customer_id : null
-        const currencyCode = typeof row.currency_code === 'string' ? row.currency_code : null
+        const creditAccountId = typeof row.id === 'string' ? row.id : null
         const organizationId = typeof row.organization_id === 'string' ? row.organization_id : null
-        if (!customerId || !currencyCode || !organizationId) continue
-        const check = await creditService.checkCredit({
+        if (!creditAccountId || !organizationId) continue
+        const { exposure, available } = await creditService.getAccountExposure({
+          creditAccountId,
           scope: { tenantId, organizationId },
-          buyer: { customerId },
-          currencyCode,
-          amount: '0',
         })
-        row.exposure = check.exposure
-        row.available = check.available
+        row.exposure = exposure
+        row.available = available
       }
     },
   },

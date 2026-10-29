@@ -251,6 +251,74 @@ describe('customerCreditService', () => {
     })
   })
 
+  describe('getAccountExposure', () => {
+    // The regression this method exists to fix: `checkCredit` short-circuits to
+    // `exposure: null` whenever the group's CURRENT terms disallow on-account purchasing
+    // (`not_permitted` wins first, §6.5) — a display read for an account that already
+    // exists must not hide its real ledger exposure behind that purchase-authorization
+    // policy check.
+    test('reports real exposure/available even when the group currently disallows on-account purchasing', async () => {
+      const { em, tables } = createFakeEm()
+      const account = seedAccount(tables, { creditLimit: '500.00' })
+      const service = buildService(em, allowTerms(false))
+
+      await service.adjustCredit({
+        scope: SCOPE,
+        buyer: { customerId: CUSTOMER_ID },
+        currencyCode: CURRENCY,
+        amount: '-250.00',
+        note: 'Opening balance',
+        idempotencyKey: 'adjust-1',
+      })
+      await service.adjustCredit({
+        scope: SCOPE,
+        buyer: { customerId: CUSTOMER_ID },
+        currencyCode: CURRENCY,
+        amount: '100.00',
+        note: 'Partial reversal',
+        idempotencyKey: 'adjust-2',
+      })
+
+      // Confirms the policy gate is really in effect for this scope, same as the
+      // `not_permitted` test above — so the next assertion is a genuine contrast, not a
+      // setup mistake.
+      const gated = await service.checkCredit({
+        scope: SCOPE,
+        buyer: { customerId: CUSTOMER_ID },
+        currencyCode: CURRENCY,
+        amount: '0.00',
+      })
+      expect(gated.reason).toBe('not_permitted')
+      expect(gated.exposure).toBeNull()
+
+      const exposure = await service.getAccountExposure({ creditAccountId: account.id, scope: SCOPE })
+      expect(exposure.exposure).toBe('-150.00')
+      expect(exposure.available).toBe('650.00')
+    })
+
+    test('reports available: null for an account with no credit limit set', async () => {
+      const { em, tables } = createFakeEm()
+      const account = seedAccount(tables, { creditLimit: null as unknown as string })
+      const service = buildService(em, allowTerms(true))
+
+      const exposure = await service.getAccountExposure({ creditAccountId: account.id, scope: SCOPE })
+      expect(exposure.exposure).toBe('0.00')
+      expect(exposure.available).toBeNull()
+    })
+
+    test('a different tenant never sees this account (G2)', async () => {
+      const { em, tables } = createFakeEm()
+      const account = seedAccount(tables, { creditLimit: '500.00' })
+      const service = buildService(em, allowTerms(true))
+
+      const exposure = await service.getAccountExposure({
+        creditAccountId: account.id,
+        scope: { tenantId: 'tenant-2', organizationId: ORG },
+      })
+      expect(exposure.available).toBeNull()
+    })
+  })
+
   describe('reserveCredit', () => {
     test('appends a reserve entry with balanceAfter computed under the lock', async () => {
       const { em, tables } = createFakeEm()

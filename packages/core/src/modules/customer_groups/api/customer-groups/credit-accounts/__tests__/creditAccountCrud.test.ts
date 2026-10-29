@@ -120,47 +120,57 @@ describe('customer credit account CRUD route', () => {
   })
 
   describe('hooks.afterList (display-only exposure/available)', () => {
-    it('merges exposure/available per row via customerCreditService.checkCredit', async () => {
-      const checkCredit = jest.fn(async () => ({
-        allowed: true,
-        reason: 'ok',
-        customerId: CUSTOMER_ID,
-        creditAccountId: ACCOUNT_ID,
-        creditLimit: '1000.00',
-        exposure: '250.00',
-        available: '750.00',
-        currencyCode: 'USD',
-      }))
-      const ctx = createCtx({ customerCreditService: { checkCredit } })
+    // Uses `getAccountExposure` (the row's own known account id), never `checkCredit` —
+    // `checkCredit` is purchase-permission-gated (`allowPurchaseOnAccount`) and reports
+    // `exposure: null` whenever the group's CURRENT terms disallow on-account purchasing,
+    // even for an account with real, nonzero ledger history. A display read for an
+    // account that already exists must show its real exposure regardless of today's
+    // purchase policy.
+    it('merges exposure/available per row via customerCreditService.getAccountExposure', async () => {
+      const getAccountExposure = jest.fn(async () => ({ exposure: '250.00', available: '750.00' }))
+      const ctx = createCtx({ customerCreditService: { getAccountExposure } })
       const payload = {
         items: [
           { id: ACCOUNT_ID, organization_id: ORG_ID, customer_id: CUSTOMER_ID, currency_code: 'USD' },
         ],
       }
       await opts.hooks!.afterList!(payload, { ...ctx, query: {} })
-      expect(checkCredit).toHaveBeenCalledWith({
+      expect(getAccountExposure).toHaveBeenCalledWith({
+        creditAccountId: ACCOUNT_ID,
         scope: { tenantId: TENANT_ID, organizationId: ORG_ID },
-        buyer: { customerId: CUSTOMER_ID },
-        currencyCode: 'USD',
-        amount: '0',
       })
       expect(payload.items[0]).toMatchObject({ exposure: '250.00', available: '750.00' })
     })
 
-    it('skips rows missing the fields checkCredit needs, without throwing', async () => {
-      const checkCredit = jest.fn()
-      const ctx = createCtx({ customerCreditService: { checkCredit } })
+    it('skips rows missing the fields getAccountExposure needs, without throwing', async () => {
+      const getAccountExposure = jest.fn()
+      const ctx = createCtx({ customerCreditService: { getAccountExposure } })
       const payload = { items: [{ id: ACCOUNT_ID }] }
       await expect(opts.hooks!.afterList!(payload, { ...ctx, query: {} })).resolves.toBeUndefined()
-      expect(checkCredit).not.toHaveBeenCalled()
+      expect(getAccountExposure).not.toHaveBeenCalled()
     })
 
     it('is a no-op for an empty item list', async () => {
-      const checkCredit = jest.fn()
-      const ctx = createCtx({ customerCreditService: { checkCredit } })
+      const getAccountExposure = jest.fn()
+      const ctx = createCtx({ customerCreditService: { getAccountExposure } })
       const payload = { items: [] as unknown[] }
       await opts.hooks!.afterList!(payload, { ...ctx, query: {} })
-      expect(checkCredit).not.toHaveBeenCalled()
+      expect(getAccountExposure).not.toHaveBeenCalled()
+    })
+
+    // The regression this display-vs-authorization split fixes: a company whose
+    // group currently disallows on-account purchasing still has its account's real
+    // ledger exposure shown, not `null`/"—".
+    it('still reports real exposure when the group currently disallows on-account purchasing', async () => {
+      const getAccountExposure = jest.fn(async () => ({ exposure: '150.00', available: null }))
+      const ctx = createCtx({ customerCreditService: { getAccountExposure } })
+      const payload = {
+        items: [
+          { id: ACCOUNT_ID, organization_id: ORG_ID, customer_id: CUSTOMER_ID, currency_code: 'USD' },
+        ],
+      }
+      await opts.hooks!.afterList!(payload, { ...ctx, query: {} })
+      expect(payload.items[0]).toMatchObject({ exposure: '150.00', available: null })
     })
   })
 })
