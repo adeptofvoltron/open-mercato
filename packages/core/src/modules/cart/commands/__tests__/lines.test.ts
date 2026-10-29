@@ -311,8 +311,8 @@ describe('cart.lines.add', () => {
     expect(result.status).toBe('added')
     if (result.status !== 'added') throw new Error('expected added')
     expect(result.line.quantity).toBe('2')
-    expect(result.line.unitPriceNet).toBe('10')
-    expect(result.line.unitPriceGross).toBe('12')
+    expect(result.line.unitPriceNet).toBe('10.0000')
+    expect(result.line.unitPriceGross).toBe('12.0000')
     expect(result.line.priceRowId).toBe('price-row-1')
     expect(result.line.origin).toBe('customer')
     expect(result.line.name).toBe('Widget')
@@ -546,7 +546,7 @@ describe('cart.lines.add', () => {
 
       expect(result.status).toBe('added')
       if (result.status !== 'added') throw new Error('expected added')
-      expect(result.line.unitPriceGross).toBe('49')
+      expect(result.line.unitPriceGross).toBe('49.0000')
       expect(result.line.unitPriceNet).toBeNull()
       expect(result.line.priceRowId).toBeNull()
       expect(seededCartLines[0].unitPriceOverride).toEqual({ amount: '49.00', basis: 'gross' })
@@ -714,9 +714,9 @@ describe('cart.lines.update', () => {
         lineId: 'line-1',
         productId: 'product-1',
         oldUnitPriceNet: '10',
-        newUnitPriceNet: '8',
+        newUnitPriceNet: '8.0000',
         oldUnitPriceGross: '12',
-        newUnitPriceGross: '9.6',
+        newUnitPriceGross: '9.6000',
         reason: 'tier_change',
       },
     ])

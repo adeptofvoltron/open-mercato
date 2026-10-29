@@ -58,7 +58,7 @@ import {
 import type { CartVisibilityLineRef, ResolvedAssortmentScope } from '../lib/visibility'
 import { shouldEnforceAssortmentScope } from '../lib/routeContext'
 import type { ResolvedCartRouteContext } from '../lib/routeContext'
-import { buildRecomputeCartTotalsPhase } from '../lib/reprice'
+import { buildRecomputeCartTotalsPhase, formatDecimalAmount } from '../lib/reprice'
 import type { CartPriceChange } from '../lib/reprice'
 import { buildPromotionsEffectsPhase } from '../lib/promotionContext'
 import type { CartPromotionWarning } from '../lib/promotionContext'
@@ -383,10 +383,15 @@ function assertUnitPriceOverrideAllowed(ctx: CommandRuntimeContext, cart: Cart):
   }
 }
 
+// `unit_price_net`/`unit_price_gross`/`tax_rate` are `numeric(_, 4)` columns, so a value
+// read back from Postgres always carries 4 decimal places (e.g. "48.7800"). `String(...)`
+// on a plain number does not (`String(48.78)` is "48.78"), so every `oldX !== newX`
+// comparison against a freshly-applied snapshot below reported a price change even when
+// the price never moved. Format to the column's own scale so both sides compare evenly.
 export function applyPriceSnapshot(line: CartLine, resolved: ResolvedLinePrice, pricedAt: Date): void {
-  line.unitPriceNet = resolved.amountNet !== null ? String(resolved.amountNet) : null
-  line.unitPriceGross = resolved.amountGross !== null ? String(resolved.amountGross) : null
-  line.taxRate = resolved.taxRatePercent !== null ? String(resolved.taxRatePercent) : null
+  line.unitPriceNet = formatDecimalAmount(resolved.amountNet)
+  line.unitPriceGross = formatDecimalAmount(resolved.amountGross)
+  line.taxRate = formatDecimalAmount(resolved.taxRatePercent)
   line.priceKindId = resolved.priceRow ? resolvePriceKindId(resolved.priceRow) : null
   line.priceRowId = resolved.priceRow?.id ?? null
   line.priceTierMinQuantity = resolved.currentTier?.minQuantity ?? null

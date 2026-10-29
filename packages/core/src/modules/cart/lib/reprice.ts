@@ -138,10 +138,21 @@ async function fetchLinePriceRows(
   return filterRowsForVariant(rows as unknown as PriceRow[], variantId)
 }
 
+// `unit_price_net`/`unit_price_gross`/`tax_rate` are all `numeric(_, 4)` columns, so a
+// value freshly read back from Postgres always carries 4 decimal places (e.g. "48.7800").
+// `String(aPlainNumber)` does not — `String(48.78)` is "48.78" — so comparing an
+// as-stored old value against a `String(...)`-formatted new one via `!==` (as
+// `buildCartLineRepricePhases` below and `commands/lines.ts` both do) reports a price
+// change on every reprice even when the price never moved. Format to the column's own
+// scale so both sides compare on equal footing.
+export function formatDecimalAmount(value: number | null): string | null {
+  return value !== null ? value.toFixed(4) : null
+}
+
 function applyPriceSnapshot(line: CartLine, resolved: ResolvedLinePrice, pricedAt: Date): void {
-  line.unitPriceNet = resolved.amountNet !== null ? String(resolved.amountNet) : null
-  line.unitPriceGross = resolved.amountGross !== null ? String(resolved.amountGross) : null
-  line.taxRate = resolved.taxRatePercent !== null ? String(resolved.taxRatePercent) : null
+  line.unitPriceNet = formatDecimalAmount(resolved.amountNet)
+  line.unitPriceGross = formatDecimalAmount(resolved.amountGross)
+  line.taxRate = formatDecimalAmount(resolved.taxRatePercent)
   line.priceKindId = resolved.priceRow ? resolvePriceKindId(resolved.priceRow) : null
   line.priceRowId = resolved.priceRow?.id ?? null
   line.priceTierMinQuantity = resolved.currentTier?.minQuantity ?? null

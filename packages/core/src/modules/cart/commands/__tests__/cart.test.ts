@@ -1084,8 +1084,8 @@ describe('cart.reprice', () => {
       grandTotalNetAmount: 0,
       grandTotalGrossAmount: 0,
     })
-    expect(seededCartLines[0].unitPriceNet).toBe('8')
-    expect(seededCartLines[1].unitPriceNet).toBe('8')
+    expect(seededCartLines[0].unitPriceNet).toBe('8.0000')
+    expect(seededCartLines[1].unitPriceNet).toBe('8.0000')
     expect(result.priceChanges).toHaveLength(2)
     expect(result.cart.lastPriceChangeAt).toBeInstanceOf(Date)
     expect(em.begin).toHaveBeenCalledTimes(1)
@@ -1231,7 +1231,20 @@ describe('cart.reprice', () => {
   })
 
   it('does not disclose a priceChange or stamp lastPriceChangeAt when the resolved price is unchanged', async () => {
-    const cart = seedCartWithLines()
+    // `unit_price_net`/`unit_price_gross` are `numeric(_, 4)` columns — a real row read back
+    // from Postgres always carries 4 decimal places ('10.0000'), never the bare '10' the
+    // shared fixture default uses elsewhere. Overridden here so this test genuinely proves
+    // "no real price movement" rather than relying on the default fixture's un-padded string
+    // happening to equal `String(10)` — the exact format mismatch that let the price-changed
+    // false positive this test guards against go undetected.
+    const cart = seedCartWithLines({}, [
+      {
+        id: 'line-1', cartId: 'cart-1', tenantId: TENANT_ID, organizationId: ORG_ID, productId: 'product-1', variantId: null,
+        name: 'Widget', quantity: '2', quantityUnit: null, unitPriceNet: '10.0000', unitPriceGross: '12.0000', taxRate: '20',
+        priceKindId: null, priceRowId: 'price-row-1', priceTierMinQuantity: 1, pricedAt: new Date('2026-01-01T00:00:00.000Z'),
+        lineTotals: {}, discountTotalNet: null, configuration: null, deletedAt: null,
+      },
+    ])
     const handler = commandRegistry.get<CartRepriceInput, CartRepriceResult>('cart.reprice')
     const { em } = makeEm()
     const dataEngine = makeDataEngine()
