@@ -2,6 +2,7 @@ import { z } from 'zod'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import { makeCrudRoute } from '@open-mercato/shared/lib/crud/factory'
 import { parseBooleanToken } from '@open-mercato/shared/lib/boolean'
+import { findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import { E } from '#generated/entities.ids.generated'
 import { Cart, CartLine } from '../../data/entities'
@@ -131,12 +132,12 @@ export const cartAdminListCrud = makeCrudRoute<never, never, CartAdminListQuery>
         typeof item.customerId === 'string' ? item.customerId : (typeof item.customer_id === 'string' ? item.customer_id : null)
       const customerIds = items.map(readCustomerId).filter((id): id is string => !!id)
       if (!customerIds.length) return
-      const customers = await em.find(CustomerEntity, {
+      const customers = await findWithDecryption(em, CustomerEntity, {
         id: { $in: customerIds },
         tenantId,
         ...(organizationId ? { organizationId } : {}),
         deletedAt: null,
-      }, { fields: ['id', 'displayName'] as const })
+      }, { fields: ['id', 'displayName'] as const }, { tenantId, organizationId })
       const nameByCustomerId = new Map(customers.map((customer) => [customer.id, customer.displayName]))
       for (const item of items) {
         const customerId = readCustomerId(item)

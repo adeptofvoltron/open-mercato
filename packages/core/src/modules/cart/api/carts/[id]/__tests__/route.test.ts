@@ -148,6 +148,21 @@ describe('admin cart detail route', () => {
     expect(body.cart.channel).toBe('storefront')
   })
 
+  it('resolves the customer display name through the decrypting, org-scoped lookup', async () => {
+    const customerId = '55555555-5555-4555-8555-555555555555'
+    seededCart = makeCartRow({ customerId })
+    mockFindOneWithDecryption.mockImplementation(async (_em, _entity, where) => {
+      if (where.id === customerId) return { id: customerId, displayName: 'Acme Sp. z o.o.' }
+      return seededCart
+    })
+    const response = await callGet()
+    const body = await response.json()
+    expect(body.cart.customerName).toBe('Acme Sp. z o.o.')
+    const customerCall = mockFindOneWithDecryption.mock.calls.find((call) => (call[2] as Record<string, unknown>).id === customerId)
+    expect(customerCall?.[2]).toMatchObject({ tenantId: TENANT_ID, organizationId: ORG_ID })
+    expect(customerCall?.[4]).toMatchObject({ tenantId: TENANT_ID, organizationId: ORG_ID })
+  })
+
   it('reads the approval live when customer_groups’ approval service is registered', async () => {
     seededCart = makeCartRow({ approvalId: 'approval-1' })
     mockApprovalService = {

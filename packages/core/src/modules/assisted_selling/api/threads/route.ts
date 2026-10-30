@@ -8,6 +8,7 @@ import { resolveOrganizationScopeForRequest } from '@open-mercato/core/modules/d
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
 import { CrudHttpError, isCrudHttpError, translateCrudErrorBody } from '@open-mercato/shared/lib/crud/errors'
 import { getCommandInterceptorHttpRejection } from '@open-mercato/shared/lib/commands/errors'
+import { findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 import { readJsonSafe } from '@open-mercato/shared/lib/http/readJsonSafe'
 import { createLogger } from '@open-mercato/shared/lib/logger'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
@@ -92,7 +93,13 @@ export async function GET(req: Request) {
     const assignedActorIds = Array.from(new Set(rows.map((thread) => thread.assignedActorId).filter((id): id is string => !!id)))
     const [customers, assignees] = await Promise.all([
       customerIds.length
-        ? em.find(CustomerEntity, { id: { $in: customerIds }, tenantId, deletedAt: null }, { fields: ['id', 'displayName'] as const })
+        ? findWithDecryption(
+            em,
+            CustomerEntity,
+            { id: { $in: customerIds }, tenantId, ...(Array.isArray(organizationIds) ? { organizationId: { $in: organizationIds } } : {}), deletedAt: null },
+            { fields: ['id', 'displayName'] as const },
+            { tenantId },
+          )
         : Promise.resolve([]),
       assignedActorIds.length
         ? em.find(User, { id: { $in: assignedActorIds } }, { fields: ['id', 'name', 'email'] as const })

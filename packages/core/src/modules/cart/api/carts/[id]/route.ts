@@ -99,7 +99,13 @@ export async function GET(req: Request, context: RouteContext) {
     // FK-id + fetch-separately (never a direct ORM relation, AGENTS.md § Architecture) —
     // the admin detail otherwise shows the raw `customer_id` verbatim.
     const customer = cart.customerId
-      ? await em.findOne(CustomerEntity, { id: cart.customerId, tenantId: cart.tenantId, deletedAt: null }, { fields: ['id', 'displayName'] as const })
+      ? await findOneWithDecryption(
+        em,
+        CustomerEntity,
+        { id: cart.customerId, tenantId: cart.tenantId, organizationId: cart.organizationId, deletedAt: null },
+        { fields: ['id', 'displayName'] as const },
+        { tenantId: cart.tenantId, organizationId: cart.organizationId },
+      )
       : null
 
     return NextResponse.json({
