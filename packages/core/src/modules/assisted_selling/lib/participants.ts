@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import { User } from '@open-mercato/core/modules/auth/data/entities'
+import { findOneWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 import { AssistedSellingParticipant } from '../data/entities'
 
 // Step 4.4. Shared by `commands/threads.ts` (the opening rep participant) and
@@ -35,7 +36,10 @@ export async function resolveOrBuildRepParticipant(
   })
   if (existing) return { participant: existing, isNew: false }
 
-  const user = await em.findOne(User, { id: actorId })
+  // `User.name` is encrypted (auth:user) — this snapshot is written once into
+  // `AssistedSellingParticipant.displayName` (itself encrypted) and never re-derived, so a
+  // plain `em.findOne` here would permanently bake the ciphertext in as the "name".
+  const user = await findOneWithDecryption(em, User, { id: actorId }, {}, { tenantId: scope.tenantId, organizationId: scope.organizationId })
   const displayName = resolveDisplayName(user, actorId)
   const now = new Date()
   const participant = em.create(AssistedSellingParticipant, {

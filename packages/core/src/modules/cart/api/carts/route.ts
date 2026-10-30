@@ -7,6 +7,7 @@ import { E } from '#generated/entities.ids.generated'
 import { Cart, CartLine } from '../../data/entities'
 import { cartAdminListQuerySchema, type CartAdminListQuery } from '../../data/validators'
 import { CustomerEntity } from '@open-mercato/core/modules/customers/data/entities'
+import { findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 
 export { cartAdminListQuerySchema }
 
@@ -131,12 +132,18 @@ export const cartAdminListCrud = makeCrudRoute<never, never, CartAdminListQuery>
         typeof item.customerId === 'string' ? item.customerId : (typeof item.customer_id === 'string' ? item.customer_id : null)
       const customerIds = items.map(readCustomerId).filter((id): id is string => !!id)
       if (!customerIds.length) return
-      const customers = await em.find(CustomerEntity, {
-        id: { $in: customerIds },
-        tenantId,
-        ...(organizationId ? { organizationId } : {}),
-        deletedAt: null,
-      }, { fields: ['id', 'displayName'] as const })
+      const customers = await findWithDecryption(
+        em,
+        CustomerEntity,
+        {
+          id: { $in: customerIds },
+          tenantId,
+          ...(organizationId ? { organizationId } : {}),
+          deletedAt: null,
+        },
+        { fields: ['id', 'displayName', 'organizationId'] as const },
+        { tenantId, organizationId },
+      )
       const nameByCustomerId = new Map(customers.map((customer) => [customer.id, customer.displayName]))
       for (const item of items) {
         const customerId = readCustomerId(item)
