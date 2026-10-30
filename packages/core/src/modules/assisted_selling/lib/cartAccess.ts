@@ -83,6 +83,8 @@ export type AssistedSellingAttributionLine = {
   netAmount: string
   grossAmount: string
   proposalCartId: string | null
+  proposalContributions?: Array<{ proposalCartId: string; quantity: string }>
+  quantity?: string
 }
 
 export type AssistedSellingAttributionCartDetail = {

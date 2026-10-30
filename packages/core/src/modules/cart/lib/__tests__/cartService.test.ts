@@ -283,12 +283,14 @@ describe('CartServiceImpl.getAttributionLines (Step 5.4, §5.5/§6.7, S18)', () 
           id: 'line-buyer',
           addedByActorType: 'buyer',
           addedByActorId: 'customer-user-1',
+          quantity: '1',
           lineTotals: { netAmount: 10, grossAmount: 12.3 },
         },
         {
           id: 'line-rep',
           addedByActorType: 'rep',
           addedByActorId: 'rep-1',
+          quantity: '2',
           lineTotals: { netAmount: 20, grossAmount: 24.6 },
         },
       ])
@@ -307,9 +309,41 @@ describe('CartServiceImpl.getAttributionLines (Step 5.4, §5.5/§6.7, S18)', () 
     expect(result).toEqual({
       currencyCode: 'USD',
       lines: [
-        { id: 'line-buyer', addedByActorType: 'buyer', addedByActorId: 'customer-user-1', netAmount: '10.0000', grossAmount: '12.3000', proposalCartId: null },
-        { id: 'line-rep', addedByActorType: 'rep', addedByActorId: 'rep-1', netAmount: '20.0000', grossAmount: '24.6000', proposalCartId: 'proposal-cart-1' },
+        { id: 'line-buyer', addedByActorType: 'buyer', addedByActorId: 'customer-user-1', netAmount: '10.0000', grossAmount: '12.3000', proposalCartId: null, proposalContributions: [], quantity: '1' },
+        { id: 'line-rep', addedByActorType: 'rep', addedByActorId: 'rep-1', netAmount: '20.0000', grossAmount: '24.6000', proposalCartId: 'proposal-cart-1', proposalContributions: [{ proposalCartId: 'proposal-cart-1', quantity: '2' }], quantity: '2' },
       ],
+    })
+  })
+  it('splits the units a proposal summed into a line the buyer already held, from the merge log\'s previous quantity', async () => {
+    mockFindOneWithDecryption.mockResolvedValueOnce({ id: 'cart-1', tenantId: 'tenant-1', organizationId: 'org-1', currencyCode: 'PLN' })
+    mockFindWithDecryption
+      .mockResolvedValueOnce([
+        {
+          id: 'line-shared',
+          addedByActorType: 'buyer',
+          addedByActorId: 'customer-user-1',
+          quantity: '5',
+          lineTotals: { netAmount: 250, grossAmount: 300 },
+        },
+      ])
+      .mockResolvedValueOnce([
+        {
+          targetCartId: 'cart-1',
+          proposalCartId: 'proposal-cart-1',
+          createdAt: new Date('2026-10-30T10:00:00Z'),
+          outcome: [{ sourceLineId: 'source-line-1', targetLineId: 'line-shared', disposition: 'summed', previousTargetQuantity: '2' }],
+        },
+      ])
+    const { container } = makeContainer()
+    const service = new CartServiceImpl(container)
+
+    const result = await service.getAttributionLines({ tenantId: 'tenant-1', organizationId: 'org-1', cartId: 'cart-1' })
+
+    expect(result?.lines[0]).toMatchObject({
+      id: 'line-shared',
+      quantity: '5',
+      proposalCartId: 'proposal-cart-1',
+      proposalContributions: [{ proposalCartId: 'proposal-cart-1', quantity: '3' }],
     })
   })
 })

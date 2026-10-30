@@ -368,7 +368,7 @@
           "keyName": "assisted_selling_attributions_order_line_unique_idx",
           "primary": false,
           "unique": false,
-          "expression": "create unique index \"assisted_selling_attributions_order_line_unique_idx\" on \"assisted_selling_attributions\" (\"tenant_id\", \"sales_order_line_id\") where \"sales_order_line_id\" is not null"
+          "expression": "create unique index \"assisted_selling_attributions_order_line_unique_idx\" on \"assisted_selling_attributions\" (\"tenant_id\", \"sales_order_line_id\", \"proposal_id\") nulls not distinct where \"sales_order_line_id\" is not null"
         },
         {
           "columnNames": [],
@@ -377,7 +377,7 @@
           "keyName": "assisted_selling_attributions_quote_line_unique_idx",
           "primary": false,
           "unique": false,
-          "expression": "create unique index \"assisted_selling_attributions_quote_line_unique_idx\" on \"assisted_selling_attributions\" (\"tenant_id\", \"sales_quote_line_id\") where \"sales_quote_line_id\" is not null"
+          "expression": "create unique index \"assisted_selling_attributions_quote_line_unique_idx\" on \"assisted_selling_attributions\" (\"tenant_id\", \"sales_quote_line_id\", \"proposal_id\") nulls not distinct where \"sales_quote_line_id\" is not null"
         }
       ],
       "checks": [],

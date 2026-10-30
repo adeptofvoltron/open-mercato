@@ -4,6 +4,7 @@ import { AssistedSellingAttribution, AssistedSellingProposal } from '../data/ent
 import type { AssistedSellingAttributionActorType } from '../data/entities'
 import { emitAssistedSellingEvent } from '../events'
 import { resolveCartService } from './cartAccess'
+import type { AssistedSellingAttributionLine } from './cartAccess'
 
 const logger = createLogger('assisted_selling').child({ component: 'attribution' })
 
@@ -77,6 +78,60 @@ function formatAmount(value: number): string {
   return (Math.round((value + Number.EPSILON) * 10000) / 10000).toFixed(4)
 }
 
+type AttributionShare = {
+  actorType: AssistedSellingAttributionActorType
+  actorId: string | null
+  threadId: string | null
+  proposalId: string | null
+  net: string
+  gross: string
+}
+
+/**
+ * §6.7: a proposal line that summed into a line the buyer already held cannot stay a
+ * line of its own (`cart_lines_unique_line_key`), so the line's single `added_by` actor is
+ * the buyer and the rep's units would be credited to nobody. Splits such a mixed line by
+ * quantity into the buyer's remainder plus one share per accepted proposal, attributed to
+ * the proposal's author. A line fully sourced from proposals, or with none, is not split.
+ */
+function splitLineByProposalContribution(
+  line: AssistedSellingAttributionLine,
+  proposalByCartId: Map<string, AssistedSellingProposal>,
+): AttributionShare[] | null {
+  const contributions = (line.proposalContributions ?? []).flatMap((contribution) => {
+    const proposal = proposalByCartId.get(contribution.proposalCartId)
+    const quantity = toAmountNumber(contribution.quantity)
+    return proposal && quantity > 0 ? [{ proposal, quantity }] : []
+  })
+  const lineQuantity = toAmountNumber(line.quantity ?? '0')
+  const contributedQuantity = contributions.reduce((sum, contribution) => sum + contribution.quantity, 0)
+  if (contributions.length === 0 || lineQuantity <= 0 || contributedQuantity >= lineQuantity) return null
+
+  const totalNet = toAmountNumber(line.netAmount)
+  const totalGross = toAmountNumber(line.grossAmount)
+  const shares: AttributionShare[] = contributions.map(({ proposal, quantity }) => ({
+    actorType: proposal.authoredByActorType as AssistedSellingAttributionActorType,
+    actorId: proposal.authoredByActorId,
+    threadId: proposal.threadId,
+    proposalId: proposal.id,
+    net: formatAmount((totalNet * quantity) / lineQuantity),
+    gross: formatAmount((totalGross * quantity) / lineQuantity),
+  }))
+  const allocatedNet = shares.reduce((sum, share) => sum + toAmountNumber(share.net), 0)
+  const allocatedGross = shares.reduce((sum, share) => sum + toAmountNumber(share.gross), 0)
+  return [
+    {
+      actorType: line.addedByActorType as AssistedSellingAttributionActorType,
+      actorId: line.addedByActorId,
+      threadId: null,
+      proposalId: null,
+      net: formatAmount(totalNet - allocatedNet),
+      gross: formatAmount(totalGross - allocatedGross),
+    },
+    ...shares,
+  ]
+}
+
 export async function handleCartConvertedForAttribution(
   payload: unknown,
   ctx: AssistedSellingAttributionSubscriberContext,
@@ -143,7 +198,7 @@ export async function handleCartConvertedForAttribution(
         const mapEntry = lineMap.get(line.id)
         if (!mapEntry) continue
         const proposal = line.proposalCartId ? proposalByCartId.get(line.proposalCartId) : undefined
-        const row = em.create(AssistedSellingAttribution, {
+        const baseRow = {
           tenantId,
           organizationId,
           cartId,
@@ -152,16 +207,37 @@ export async function handleCartConvertedForAttribution(
           salesOrderLineId: mapEntry.salesOrderLineId ?? null,
           salesQuoteId: salesQuoteId ?? null,
           salesQuoteLineId: mapEntry.salesQuoteLineId ?? null,
-          actorType: line.addedByActorType as AssistedSellingAttributionActorType,
-          actorId: line.addedByActorId,
-          threadId: proposal?.threadId ?? null,
-          proposalId: proposal?.id ?? null,
-          lineNetAmount: line.netAmount,
-          lineGrossAmount: line.grossAmount,
           currencyCode: detail.currencyCode,
           convertedAt: now,
-        })
-        rows.push(row)
+        }
+        const shares = splitLineByProposalContribution(line, proposalByCartId)
+        if (!shares) {
+          rows.push(
+            em.create(AssistedSellingAttribution, {
+              ...baseRow,
+              actorType: line.addedByActorType as AssistedSellingAttributionActorType,
+              actorId: line.addedByActorId,
+              threadId: proposal?.threadId ?? null,
+              proposalId: proposal?.id ?? null,
+              lineNetAmount: line.netAmount,
+              lineGrossAmount: line.grossAmount,
+            }),
+          )
+          continue
+        }
+        for (const share of shares) {
+          rows.push(
+            em.create(AssistedSellingAttribution, {
+              ...baseRow,
+              actorType: share.actorType,
+              actorId: share.actorId,
+              threadId: share.threadId,
+              proposalId: share.proposalId,
+              lineNetAmount: share.net,
+              lineGrossAmount: share.gross,
+            }),
+          )
+        }
       }
     } else {
       // §6.7's safety net: "the subscriber degrades to document-level attribution — the

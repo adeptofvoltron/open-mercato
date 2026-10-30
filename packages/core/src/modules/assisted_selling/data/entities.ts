@@ -464,14 +464,16 @@ export type AssistedSellingAttributionActorType = 'buyer' | 'rep' | 'ai_agent' |
 @Index({
   // Partial unique: NULL in the degraded case (§6.7), so multiple degraded rows for the
   // same cart never collide on this index.
+  // `proposal_id` is part of the key because a line the buyer held before accepting a proposal
+  // is split into the buyer's remainder (NULL) and one row per proposal's units (§6.7).
   name: 'assisted_selling_attributions_order_line_unique_idx',
   expression:
-    'create unique index "assisted_selling_attributions_order_line_unique_idx" on "assisted_selling_attributions" ("tenant_id", "sales_order_line_id") where "sales_order_line_id" is not null',
+    'create unique index "assisted_selling_attributions_order_line_unique_idx" on "assisted_selling_attributions" ("tenant_id", "sales_order_line_id", "proposal_id") nulls not distinct where "sales_order_line_id" is not null',
 })
 @Index({
   name: 'assisted_selling_attributions_quote_line_unique_idx',
   expression:
-    'create unique index "assisted_selling_attributions_quote_line_unique_idx" on "assisted_selling_attributions" ("tenant_id", "sales_quote_line_id") where "sales_quote_line_id" is not null',
+    'create unique index "assisted_selling_attributions_quote_line_unique_idx" on "assisted_selling_attributions" ("tenant_id", "sales_quote_line_id", "proposal_id") nulls not distinct where "sales_quote_line_id" is not null',
 })
 export class AssistedSellingAttribution {
   [OptionalProps]?: 'createdAt'

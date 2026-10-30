@@ -170,6 +170,12 @@ export type CartServiceAttributionLine = {
    * resolved via `CartMergeLog.outcome`, or `null` for a line the buyer added themselves
    * (no merge log entry at all — correct, not degraded, per §6.7). */
   proposalCartId: string | null
+  /** The units each accepted proposal contributed to this line, oldest first. A proposal
+   * line that summed into a line the buyer already held cannot become its own line (the
+   * `cart_lines_unique_line_key` index), so the split the commission report needs is
+   * recovered here from `CartMergeLog.outcome` instead of being overwritten. */
+  proposalContributions: Array<{ proposalCartId: string; quantity: string }>
+  quantity: string
 }
 
 export type CartServiceAttributionDetail = {
@@ -404,11 +410,15 @@ export class CartServiceImpl implements CartService {
       {},
       scope,
     )) as CartMergeLog[]
-    const targetLineProposalCartId = new Map<string, string>()
-    for (const log of mergeLogs) {
+    const orderedLogs = [...mergeLogs].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+    const mergedEntriesByLineId = new Map<string, Array<{ proposalCartId: string; previousQuantity: number }>>()
+    for (const log of orderedLogs) {
       if (!log.proposalCartId) continue
       for (const entry of log.outcome) {
-        if (entry.targetLineId) targetLineProposalCartId.set(entry.targetLineId, log.proposalCartId)
+        if (!entry.targetLineId) continue
+        const entries = mergedEntriesByLineId.get(entry.targetLineId) ?? []
+        entries.push({ proposalCartId: log.proposalCartId, previousQuantity: Number(entry.previousTargetQuantity ?? 0) || 0 })
+        mergedEntriesByLineId.set(entry.targetLineId, entries)
       }
     }
 
@@ -416,13 +426,23 @@ export class CartServiceImpl implements CartService {
       currencyCode: cart.currencyCode,
       lines: lines.map((line) => {
         const totals = (line.lineTotals ?? {}) as Record<string, unknown>
+        const entries = mergedEntriesByLineId.get(line.id) ?? []
+        let remaining = Number(line.quantity)
+        const proposalContributions = entries.flatMap((entry, index) => {
+          const quantityAfter = index + 1 < entries.length ? entries[index + 1].previousQuantity : Number(line.quantity)
+          const contributed = Math.min(Math.max(quantityAfter - entry.previousQuantity, 0), remaining)
+          remaining -= contributed
+          return contributed > 0 ? [{ proposalCartId: entry.proposalCartId, quantity: String(contributed) }] : []
+        })
         return {
           id: line.id,
           addedByActorType: line.addedByActorType,
           addedByActorId: line.addedByActorId ?? null,
           netAmount: toDecimalString(totals.netAmount),
           grossAmount: toDecimalString(totals.grossAmount),
-          proposalCartId: targetLineProposalCartId.get(line.id) ?? null,
+          proposalCartId: entries.length > 0 ? entries[entries.length - 1].proposalCartId : null,
+          proposalContributions,
+          quantity: String(line.quantity),
         }
       }),
     }

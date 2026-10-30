@@ -286,3 +286,94 @@ describe('handleCartConvertedForAttribution — §6.7 attribution subscriber', (
     expect(persisted).toHaveLength(1)
   })
 })
+
+describe('handleCartConvertedForAttribution — a proposal summed into a line the buyer already held', () => {
+  const proposal = {
+    id: 'proposal-1',
+    tenantId: TENANT_ID,
+    organizationId: ORG_ID,
+    proposalCartId: 'proposal-cart-1',
+    threadId: 'thread-1',
+    authoredByActorType: 'rep',
+    authoredByActorId: 'rep-1',
+    deletedAt: null,
+  }
+
+  async function convert(line: Row) {
+    const { em, persisted } = makeFakeEm({ proposals: [proposal] })
+    const cartService = makeCartService({ currencyCode: 'PLN', lines: [line] })
+    await handleCartConvertedForAttribution(
+      {
+        cartId: CART_ID,
+        tenantId: TENANT_ID,
+        organizationId: ORG_ID,
+        salesOrderId: 'order-1',
+        lineMap: [{ cartLineId: line.id, salesOrderLineId: 'order-line-1' }],
+      },
+      { resolve: makeContainer(em, cartService).resolve, container: makeContainer(em, cartService) },
+    )
+    return persisted
+  }
+
+  test('splits the line by quantity: the buyer keeps 2 units, the proposal author gets 3', async () => {
+    const persisted = await convert({
+      id: 'line-1',
+      addedByActorType: 'buyer',
+      addedByActorId: 'customer-user-1',
+      netAmount: '250.0000',
+      grossAmount: '300.0000',
+      quantity: '5',
+      proposalCartId: 'proposal-cart-1',
+      proposalContributions: [{ proposalCartId: 'proposal-cart-1', quantity: '3' }],
+    })
+
+    expect(persisted).toHaveLength(2)
+    expect(persisted.find((row) => row.actorType === 'buyer')).toMatchObject({
+      salesOrderLineId: 'order-line-1',
+      proposalId: null,
+      threadId: null,
+      lineNetAmount: '100.0000',
+      lineGrossAmount: '120.0000',
+    })
+    expect(persisted.find((row) => row.actorType === 'rep')).toMatchObject({
+      salesOrderLineId: 'order-line-1',
+      actorId: 'rep-1',
+      proposalId: 'proposal-1',
+      threadId: 'thread-1',
+      lineNetAmount: '150.0000',
+      lineGrossAmount: '180.0000',
+    })
+  })
+
+  test('keeps the split amounts summing to the line total when the share does not divide evenly', async () => {
+    const persisted = await convert({
+      id: 'line-1',
+      addedByActorType: 'buyer',
+      addedByActorId: 'customer-user-1',
+      netAmount: '100.0000',
+      grossAmount: '123.0000',
+      quantity: '3',
+      proposalCartId: 'proposal-cart-1',
+      proposalContributions: [{ proposalCartId: 'proposal-cart-1', quantity: '1' }],
+    })
+
+    const grossSum = persisted.reduce((sum, row) => sum + Number(row.lineGrossAmount), 0)
+    expect(grossSum).toBeCloseTo(123, 4)
+  })
+
+  test('does not split a line the proposal fully sourced', async () => {
+    const persisted = await convert({
+      id: 'line-1',
+      addedByActorType: 'merge',
+      addedByActorId: null,
+      netAmount: '150.0000',
+      grossAmount: '180.0000',
+      quantity: '3',
+      proposalCartId: 'proposal-cart-1',
+      proposalContributions: [{ proposalCartId: 'proposal-cart-1', quantity: '3' }],
+    })
+
+    expect(persisted).toHaveLength(1)
+    expect(persisted[0]).toMatchObject({ actorType: 'merge', proposalId: 'proposal-1', lineGrossAmount: '180.0000' })
+  })
+})

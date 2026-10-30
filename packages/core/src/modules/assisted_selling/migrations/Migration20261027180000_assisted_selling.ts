@@ -9,8 +9,8 @@ export class Migration20261027180000_assisted_selling extends Migration {
     this.addSql(`create index "assisted_selling_attributions_tenant_org_idx" on "assisted_selling_attributions" ("tenant_id", "organization_id");`);
     this.addSql(`create index "assisted_selling_attributions_tenant_cart_idx" on "assisted_selling_attributions" ("tenant_id", "cart_id");`);
     this.addSql(`create index "assisted_selling_attributions_tenant_actor_converted_idx" on "assisted_selling_attributions" ("tenant_id", "actor_type", "actor_id", "converted_at");`);
-    this.addSql(`create unique index "assisted_selling_attributions_order_line_unique_idx" on "assisted_selling_attributions" ("tenant_id", "sales_order_line_id") where "sales_order_line_id" is not null;`);
-    this.addSql(`create unique index "assisted_selling_attributions_quote_line_unique_idx" on "assisted_selling_attributions" ("tenant_id", "sales_quote_line_id") where "sales_quote_line_id" is not null;`);
+    this.addSql(`create unique index "assisted_selling_attributions_order_line_unique_idx" on "assisted_selling_attributions" ("tenant_id", "sales_order_line_id", "proposal_id") nulls not distinct where "sales_order_line_id" is not null;`);
+    this.addSql(`create unique index "assisted_selling_attributions_quote_line_unique_idx" on "assisted_selling_attributions" ("tenant_id", "sales_quote_line_id", "proposal_id") nulls not distinct where "sales_quote_line_id" is not null;`);
   }
 
 }
