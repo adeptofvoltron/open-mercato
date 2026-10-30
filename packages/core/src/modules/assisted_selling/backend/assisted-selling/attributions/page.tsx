@@ -37,6 +37,10 @@ type AttributionRow = {
   lineGrossAmount: string
   currencyCode: string
   convertedAt: string | null
+  orderNumber: string | null
+  quoteNumber: string | null
+  lineName: string | null
+  actorName: string | null
 }
 
 type AttributionListResponse = { items?: Array<Record<string, unknown>>; total?: number }
@@ -61,6 +65,10 @@ function mapApiAttribution(item: Record<string, unknown>): AttributionRow {
     lineGrossAmount: readString(item, 'lineGrossAmount') ?? '0',
     currencyCode: readString(item, 'currencyCode') ?? '',
     convertedAt: readString(item, 'convertedAt'),
+    orderNumber: readString(item, 'orderNumber'),
+    quoteNumber: readString(item, 'quoteNumber'),
+    lineName: readString(item, 'lineName'),
+    actorName: readString(item, 'actorName'),
   }
 }
 
@@ -175,7 +183,7 @@ export default function AssistedSellingAttributionsPage() {
         meta: { priority: 1 },
         cell: ({ row }) => {
           const kind = row.original.salesOrderId ? 'order' : 'quote'
-          const id = row.original.salesOrderId ?? row.original.salesQuoteId ?? '—'
+          const id = row.original.orderNumber ?? row.original.quoteNumber ?? row.original.salesOrderId ?? row.original.salesQuoteId ?? '—'
           return (
             <span className="flex items-center gap-2">
               <StatusBadge variant={OUTCOME_VARIANTS[kind] ?? 'neutral'} dot>
@@ -194,8 +202,8 @@ export default function AssistedSellingAttributionsPage() {
         meta: { priority: 2 },
         cell: ({ row }) => (
           <span className="truncate font-mono text-xs text-muted-foreground">
-            {row.original.actorType}
-            {row.original.actorId ? `:${row.original.actorId}` : ''}
+            {row.original.actorName ?? row.original.actorType}
+            {row.original.actorName || !row.original.actorId ? '' : `:${row.original.actorId}`}
           </span>
         ),
       },
@@ -207,7 +215,7 @@ export default function AssistedSellingAttributionsPage() {
         meta: { priority: 3 },
         cell: ({ row }) =>
           row.original.cartLineId ? (
-            <span className="truncate font-mono text-xs text-muted-foreground">{row.original.cartLineId}</span>
+            <span className="truncate font-mono text-xs text-muted-foreground">{row.original.lineName ?? row.original.cartLineId}</span>
           ) : (
             <StatusBadge variant="warning" dot>
               {labels.table.documentLevel}

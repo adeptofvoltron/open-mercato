@@ -10,6 +10,11 @@ jest.mock('@open-mercato/core/modules/directory/utils/organizationScope', () => 
   resolveOrganizationScopeForRequest: jest.fn(),
 }))
 
+const mockFindWithDecryption = jest.fn(async (..._args: unknown[]): Promise<Array<Record<string, unknown>>> => [])
+jest.mock('@open-mercato/shared/lib/encryption/find', () => ({
+  findWithDecryption: (...args: unknown[]) => mockFindWithDecryption(...args),
+}))
+
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import { resolveOrganizationScopeForRequest } from '@open-mercato/core/modules/directory/utils/organizationScope'
@@ -50,6 +55,7 @@ describe('GET /api/assisted_selling/attributions', () => {
 
   beforeEach(() => {
     jest.clearAllMocks()
+    mockFindWithDecryption.mockImplementation(async () => [])
     findAndCount = jest.fn(async () => [[makeRow()], 1])
     ;(getAuthFromRequest as jest.Mock).mockResolvedValue({ tenantId: TENANT_ID, orgId: ORG_ID })
     ;(resolveOrganizationScopeForRequest as jest.Mock).mockResolvedValue({ filterIds: null, allowedIds: null })
@@ -112,5 +118,28 @@ describe('GET /api/assisted_selling/attributions', () => {
 
     expect(body).toEqual({ items: [], total: 0, page: 1, pageSize: 25 })
     expect(findAndCount).not.toHaveBeenCalled()
+  })
+  it('resolves document numbers, product and actor names instead of leaving only raw ids', async () => {
+    findAndCount.mockResolvedValue([
+      [makeRow({ actorType: 'rep', actorId: 'rep-1', salesOrderId: 'order-1', salesOrderLineId: 'order-line-1' })],
+      1,
+    ])
+    mockFindWithDecryption.mockImplementation(async (_em, entity) => {
+      const name = (entity as { name: string }).name
+      if (name === 'SalesOrder') return [{ id: 'order-1', orderNumber: 'ORDER-20261030-00002' }]
+      if (name === 'SalesOrderLine') return [{ id: 'order-line-1', name: 'QA R5 Widget' }]
+      if (name === 'User') return [{ id: 'rep-1', name: 'Anna Rep', email: 'anna@example.com' }]
+      return []
+    })
+
+    const response = await GET(makeRequest())
+    const body = await response.json()
+
+    expect(body.items[0]).toMatchObject({
+      orderNumber: 'ORDER-20261030-00002',
+      quoteNumber: null,
+      lineName: 'QA R5 Widget',
+      actorName: 'Anna Rep',
+    })
   })
 })

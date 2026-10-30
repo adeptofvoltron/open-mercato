@@ -137,6 +137,18 @@ describe('customer_groups order-cancelled-credit-release subscriber', () => {
     expect(releaseEntries[0].relatedEntryId).toBe(entries.find((row) => row.entryType === 'reserve')?.id)
   })
 
+  it('records the order number, not the order id, as the release reason', async () => {
+    const { em, tables } = createFakeEm()
+    seedReservedOrder(tables)
+
+    await handle({ orderId: ORDER_ID, orderNumber: 'ORDER-20261030-00001', tenantId: TENANT, organizationId: ORG }, buildCtx(em))
+
+    const release = (tables.get(CustomerCreditLedgerEntry) ?? []).find((row) => row.entryType === 'release')
+    const stored = JSON.stringify(release)
+    expect(stored).toContain('sales.order.cancelled:ORDER-20261030-00001')
+    expect(stored).not.toContain(`sales.order.cancelled:${ORDER_ID}`)
+  })
+
   it('is idempotent on redelivery — a second cancellation event does not double-release', async () => {
     const { em, tables } = createFakeEm()
     seedReservedOrder(tables)

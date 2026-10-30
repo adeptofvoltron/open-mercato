@@ -50,6 +50,7 @@ export default async function handle(payload: unknown, ctx: SubscriberContext): 
   const orderId = readString(record, 'orderId') ?? readString(record, 'id')
   const tenantId = readString(record, 'tenantId') ?? ctx.tenantId ?? null
   const organizationId = readString(record, 'organizationId') ?? ctx.organizationId ?? null
+  const orderNumber = readString(record, 'orderNumber')
 
   if (!orderId || !tenantId || !organizationId) {
     logger.debug('[customer_groups:order-cancelled-credit-release] skipped incomplete payload', {
@@ -98,7 +99,7 @@ export default async function handle(payload: unknown, ctx: SubscriberContext): 
       await creditService.releaseCredit({
         scope: { tenantId, organizationId },
         reserveIdempotencyKey: reservation.idempotencyKey,
-        reason: `sales.order.cancelled:${orderId}`,
+        reason: `sales.order.cancelled:${orderNumber ?? orderId}`,
       })
     } catch (error) {
       logger.error('[customer_groups:order-cancelled-credit-release] release failed', {

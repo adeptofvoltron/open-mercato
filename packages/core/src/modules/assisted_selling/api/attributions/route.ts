@@ -5,6 +5,10 @@ import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import { resolveOrganizationScopeForRequest } from '@open-mercato/core/modules/directory/utils/organizationScope'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
+import { findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
+import { SalesOrder, SalesOrderLine, SalesQuote, SalesQuoteLine } from '@open-mercato/core/modules/sales/data/entities'
+import { User } from '@open-mercato/core/modules/auth/data/entities'
+import { CustomerUser } from '@open-mercato/core/modules/customer_accounts/data/entities'
 import { CrudHttpError, isCrudHttpError, translateCrudErrorBody } from '@open-mercato/shared/lib/crud/errors'
 import { createLogger } from '@open-mercato/shared/lib/logger'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
@@ -79,6 +83,44 @@ export async function GET(req: Request) {
       offset: (page - 1) * pageSize,
     })
 
+    // FK-id + fetch-separately (never a direct ORM relation, AGENTS.md § Architecture) —
+    // batched across the page so the commission report shows document numbers, product
+    // and people instead of the raw ids it stores.
+    const unique = (ids: Array<string | null | undefined>) => Array.from(new Set(ids.filter((id): id is string => !!id)))
+    const orderIds = unique(rows.map((row) => row.salesOrderId))
+    const quoteIds = unique(rows.map((row) => row.salesQuoteId))
+    const orderLineIds = unique(rows.map((row) => row.salesOrderLineId))
+    const quoteLineIds = unique(rows.map((row) => row.salesQuoteLineId))
+    const repIds = unique(rows.filter((row) => row.actorType === 'rep').map((row) => row.actorId))
+    const buyerIds = unique(rows.filter((row) => row.actorType === 'buyer').map((row) => row.actorId))
+    const scope = { tenantId }
+    const lookup = <Entity extends object>(entity: new () => Entity, ids: string[], fields: string[]) =>
+      ids.length
+        ? findWithDecryption(em, entity, { id: { $in: ids }, tenantId } as never, { fields: fields as never }, scope)
+        : Promise.resolve([] as Entity[])
+    const [orders, quotes, orderLines, quoteLines, reps, buyers] = await Promise.all([
+      lookup(SalesOrder, orderIds, ['id', 'orderNumber']),
+      lookup(SalesQuote, quoteIds, ['id', 'quoteNumber']),
+      lookup(SalesOrderLine, orderLineIds, ['id', 'name']),
+      lookup(SalesQuoteLine, quoteLineIds, ['id', 'name']),
+      repIds.length
+        ? findWithDecryption(em, User, { id: { $in: repIds } }, { fields: ['id', 'name', 'email'] as never }, scope)
+        : Promise.resolve([] as User[]),
+      buyerIds.length
+        ? findWithDecryption(em, CustomerUser, { id: { $in: buyerIds }, tenantId } as never, { fields: ['id', 'displayName'] as never }, scope)
+        : Promise.resolve([] as CustomerUser[]),
+    ])
+    const orderNumberById = new Map(orders.map((order) => [order.id, order.orderNumber]))
+    const quoteNumberById = new Map(quotes.map((quote) => [quote.id, quote.quoteNumber]))
+    const lineNameById = new Map<string, string | null>([
+      ...orderLines.map((line): [string, string | null] => [line.id, line.name ?? null]),
+      ...quoteLines.map((line): [string, string | null] => [line.id, line.name ?? null]),
+    ])
+    const actorNameById = new Map<string, string | null>([
+      ...reps.map((user): [string, string | null] => [user.id, user.name ?? user.email]),
+      ...buyers.map((buyer): [string, string | null] => [buyer.id, buyer.displayName]),
+    ])
+
     return NextResponse.json({
       items: rows.map((row) => ({
         id: row.id,
@@ -98,6 +140,10 @@ export async function GET(req: Request) {
         currencyCode: row.currencyCode,
         convertedAt: row.convertedAt.toISOString(),
         createdAt: row.createdAt.toISOString(),
+        orderNumber: row.salesOrderId ? orderNumberById.get(row.salesOrderId) ?? null : null,
+        quoteNumber: row.salesQuoteId ? quoteNumberById.get(row.salesQuoteId) ?? null : null,
+        lineName: lineNameById.get(row.salesOrderLineId ?? row.salesQuoteLineId ?? '') ?? null,
+        actorName: row.actorId ? actorNameById.get(row.actorId) ?? null : null,
       })),
       total,
       page,
@@ -131,6 +177,10 @@ const attributionRowSchema = z.object({
   currencyCode: z.string(),
   convertedAt: z.string(),
   createdAt: z.string(),
+  orderNumber: z.string().nullable(),
+  quoteNumber: z.string().nullable(),
+  lineName: z.string().nullable(),
+  actorName: z.string().nullable(),
 })
 
 export const openApi: OpenApiRouteDoc = {
