@@ -1,4 +1,5 @@
 import type { EntityManager } from '@mikro-orm/postgresql'
+import type { StoredMergeOutcomeEntry } from '../commands/merge'
 import type { CommandBus, CommandRuntimeContext } from '@open-mercato/shared/lib/commands'
 import { findOneWithDecryption, findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 import { lockCartCommand, markConvertedCommand, unlockCartCommand } from '../commands/lock'
@@ -414,7 +415,7 @@ export class CartServiceImpl implements CartService {
     const mergedEntriesByLineId = new Map<string, Array<{ proposalCartId: string; previousQuantity: number }>>()
     for (const log of orderedLogs) {
       if (!log.proposalCartId) continue
-      for (const entry of log.outcome) {
+      for (const entry of log.outcome as StoredMergeOutcomeEntry[]) {
         if (!entry.targetLineId) continue
         const entries = mergedEntriesByLineId.get(entry.targetLineId) ?? []
         entries.push({ proposalCartId: log.proposalCartId, previousQuantity: Number(entry.previousTargetQuantity ?? 0) || 0 })
