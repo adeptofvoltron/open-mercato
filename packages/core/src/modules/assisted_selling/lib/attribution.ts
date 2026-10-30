@@ -143,23 +143,24 @@ export async function handleCartConvertedForAttribution(
         const mapEntry = lineMap.get(line.id)
         if (!mapEntry) continue
         const proposal = line.proposalCartId ? proposalByCartId.get(line.proposalCartId) : undefined
-        const row = new AssistedSellingAttribution()
-        row.tenantId = tenantId
-        row.organizationId = organizationId
-        row.cartId = cartId
-        row.cartLineId = line.id
-        row.salesOrderId = salesOrderId ?? null
-        row.salesOrderLineId = mapEntry.salesOrderLineId ?? null
-        row.salesQuoteId = salesQuoteId ?? null
-        row.salesQuoteLineId = mapEntry.salesQuoteLineId ?? null
-        row.actorType = line.addedByActorType as AssistedSellingAttributionActorType
-        row.actorId = line.addedByActorId
-        row.threadId = proposal?.threadId ?? null
-        row.proposalId = proposal?.id ?? null
-        row.lineNetAmount = line.netAmount
-        row.lineGrossAmount = line.grossAmount
-        row.currencyCode = detail.currencyCode
-        row.convertedAt = now
+        const row = em.create(AssistedSellingAttribution, {
+          tenantId,
+          organizationId,
+          cartId,
+          cartLineId: line.id,
+          salesOrderId: salesOrderId ?? null,
+          salesOrderLineId: mapEntry.salesOrderLineId ?? null,
+          salesQuoteId: salesQuoteId ?? null,
+          salesQuoteLineId: mapEntry.salesQuoteLineId ?? null,
+          actorType: line.addedByActorType as AssistedSellingAttributionActorType,
+          actorId: line.addedByActorId,
+          threadId: proposal?.threadId ?? null,
+          proposalId: proposal?.id ?? null,
+          lineNetAmount: line.netAmount,
+          lineGrossAmount: line.grossAmount,
+          currencyCode: detail.currencyCode,
+          convertedAt: now,
+        })
         rows.push(row)
       }
     } else {
@@ -175,28 +176,28 @@ export async function handleCartConvertedForAttribution(
         groups.set(key, group)
       }
       for (const group of groups.values()) {
-        const row = new AssistedSellingAttribution()
-        row.tenantId = tenantId
-        row.organizationId = organizationId
-        row.cartId = cartId
-        row.cartLineId = null
-        row.salesOrderId = salesOrderId ?? null
-        row.salesOrderLineId = null
-        row.salesQuoteId = salesQuoteId ?? null
-        row.salesQuoteLineId = null
-        row.actorType = group.actorType as AssistedSellingAttributionActorType
-        row.actorId = group.actorId
-        row.threadId = null
-        row.proposalId = null
-        row.lineNetAmount = formatAmount(group.net)
-        row.lineGrossAmount = formatAmount(group.gross)
-        row.currencyCode = detail.currencyCode
-        row.convertedAt = now
+        const row = em.create(AssistedSellingAttribution, {
+          tenantId,
+          organizationId,
+          cartId,
+          cartLineId: null,
+          salesOrderId: salesOrderId ?? null,
+          salesOrderLineId: null,
+          salesQuoteId: salesQuoteId ?? null,
+          salesQuoteLineId: null,
+          actorType: group.actorType as AssistedSellingAttributionActorType,
+          actorId: group.actorId,
+          threadId: null,
+          proposalId: null,
+          lineNetAmount: formatAmount(group.net),
+          lineGrossAmount: formatAmount(group.gross),
+          currencyCode: detail.currencyCode,
+          convertedAt: now,
+        })
         rows.push(row)
       }
     }
 
-    for (const row of rows) em.persist(row)
     await em.flush()
 
     if (!lineMap) {

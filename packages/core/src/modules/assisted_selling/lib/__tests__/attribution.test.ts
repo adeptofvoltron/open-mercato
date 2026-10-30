@@ -31,6 +31,13 @@ function makeFakeEm(seed: { attributions?: Row[]; proposals?: Row[] } = {}) {
       const ids: string[] = where.proposalCartId?.$in ?? []
       return proposals.filter((row) => ids.includes(row.proposalCartId) && matches(row, { tenantId: where.tenantId, organizationId: where.organizationId, deletedAt: where.deletedAt }))
     }),
+    // Real MikroORM's `em.create` both builds the entity AND schedules it for persist —
+    // mirrored here so a caller that relies on `em.create` alone (never calling `em.persist`
+    // separately) still shows up in `persisted`, matching production behavior.
+    create: jest.fn((_Cls: unknown, data: Row) => {
+      persisted.push(data)
+      return data
+    }),
     persist: jest.fn((row: Row) => persisted.push(row)),
     flush: jest.fn(async () => undefined),
   }
