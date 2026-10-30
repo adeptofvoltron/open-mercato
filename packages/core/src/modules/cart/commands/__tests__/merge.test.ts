@@ -1428,6 +1428,55 @@ describe('cart.merge — §7a.4 proposal acceptance (manual strategy, Step 3.4)'
     )
   })
 
+  // §6.7: "added_by_actor_type/_id survive a merge unrewritten" — a rep's proposal line
+  // landing on a product the buyer already has in the basket must not fold into the
+  // buyer's own line and lose the rep's commission attribution (regression: the buyer's 2
+  // units and the rep's 3 units used to collapse into one line attributed entirely to the
+  // buyer).
+  it('keeps a rep-authored proposal line\'s own attribution as a separate line instead of folding it into the buyer\'s existing line', async () => {
+    seededCarts = [makeCartFixture({ id: 'cart-target' }), makeProposalFixture()]
+    seededCartLines = [
+      makeLineFixture({ id: 'line-target-1', cartId: 'cart-target', productId: 'product-1', quantity: '2', addedByActorType: 'buyer', addedByActorId: 'customer-user-1', lineNumber: 1 }),
+      makeLineFixture({ id: 'proposal-line-1', cartId: PROPOSAL_ID, productId: 'product-1', quantity: '3', addedByActorType: 'rep', addedByActorId: 'rep-1' }),
+    ]
+
+    const handler = getMergeHandler()
+    const em = makeEm()
+    const ctx = makeCtx({ em })
+
+    const result = await handler.execute(
+      {
+        targetCartId: 'cart-target',
+        tenantId: TENANT_ID,
+        organizationId: ORG_ID,
+        proposalCartId: PROPOSAL_ID,
+        lines: [{ proposalLineId: 'proposal-line-1', accepted: true }],
+        routeContext: makeRouteContext(),
+      } as CartMergeInput,
+      ctx,
+    )
+
+    expect(result.mergeSummary.counts).toMatchObject({ merged: 1, summed: 0, capped: 0 })
+
+    const buyerLine = seededCartLines.find((row) => row.id === 'line-target-1')!
+    expect(buyerLine.quantity).toBe('2')
+    expect(buyerLine.addedByActorType).toBe('buyer')
+
+    const repLine = seededCartLines.find((row) => row.cartId === 'cart-target' && row.id !== 'line-target-1')
+    expect(repLine).toBeDefined()
+    expect(repLine!.productId).toBe('product-1')
+    expect(repLine!.quantity).toBe('3')
+    expect(repLine!.addedByActorType).toBe('rep')
+    expect(repLine!.addedByActorId).toBe('rep-1')
+
+    const outcome = seededMergeLogs[0].outcome as Array<Record<string, unknown>>
+    expect(outcome).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ sourceLineId: 'proposal-line-1', targetLineId: null, disposition: 'merged' }),
+      ]),
+    )
+  })
+
   it('refuses a locked target with 423 cart_locked, carrying its checkoutSessionId (TC-CART-PROP-14)', async () => {
     seededCarts = [
       makeCartFixture({ id: 'cart-target', status: 'locked', checkoutSessionId: 'session-1' }),

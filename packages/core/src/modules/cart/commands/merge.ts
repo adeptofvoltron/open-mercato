@@ -422,6 +422,61 @@ function buildMergeOutcome(
     const maxOrderQuantity = maxQuantityBySourceLineId.get(sourceLine.id) ?? null
     const capped = maxOrderQuantity != null && summedQuantity > maxOrderQuantity
     const finalQuantity = capped ? maxOrderQuantity! : summedQuantity
+
+    // §6.7 (assisted_selling): "added_by_actor_type/_id survive a merge unrewritten" — a
+    // rep's proposal line landing on top of the buyer's own existing line must never fold
+    // silently into the target's attribution (the commission half needs no join at all, so
+    // a merged row can only ever belong to one actor). When the attributions differ, leave
+    // the target line's own quantity untouched and add the incoming quantity as its OWN new
+    // line instead, still respecting whatever headroom the quantity rule leaves.
+    const sameActor = matched.addedByActorType === sourceLine.addedByActorType
+      && (matched.addedByActorId ?? null) === (sourceLine.addedByActorId ?? null)
+    if (!sameActor) {
+      const allocatable = finalQuantity - Number(previousTargetQuantity)
+      if (allocatable <= 0) {
+        outcome.push({ sourceLineId: sourceLine.id, targetLineId: null, disposition: 'rejected', reason: 'quantity_rule_exceeded' })
+        continue
+      }
+      const splitLine = em.create(CartLine, {
+        organizationId: survivorCart.organizationId,
+        tenantId: survivorCart.tenantId,
+        cartId: survivorCart.id,
+        lineNumber: nextLineNumber,
+        productId: sourceLine.productId,
+        variantId: sourceLine.variantId ?? null,
+        sku: sourceLine.sku ?? null,
+        name: sourceLine.name,
+        optionValues: sourceLine.optionValues ?? null,
+        quantity: String(allocatable),
+        quantityUnit: sourceLine.quantityUnit ?? null,
+        uomSnapshot: sourceLine.uomSnapshot ?? null,
+        unitPriceNet: sourceLine.unitPriceNet ?? null,
+        unitPriceGross: sourceLine.unitPriceGross ?? null,
+        taxRate: sourceLine.taxRate ?? null,
+        priceKindId: sourceLine.priceKindId ?? null,
+        priceRowId: sourceLine.priceRowId ?? null,
+        priceTierMinQuantity: sourceLine.priceTierMinQuantity ?? null,
+        pricedAt: sourceLine.pricedAt,
+        lineTotals: sourceLine.lineTotals,
+        discountTotalNet: sourceLine.discountTotalNet ?? null,
+        promotionId: null,
+        origin: 'customer' as const,
+        flagState: sourceLine.flagState ?? null,
+        configuration: sourceLine.configuration ?? null,
+        addedByActorType: sourceLine.addedByActorType,
+        addedByActorId: sourceLine.addedByActorId ?? null,
+        metadata: sourceLine.metadata ?? null,
+      })
+      nextLineNumber += 1
+      newLines.push(splitLine)
+      outcome.push({
+        sourceLineId: sourceLine.id,
+        targetLineId: null,
+        disposition: allocatable < Number(sourceLine.quantity) ? 'capped' : 'merged',
+      })
+      continue
+    }
+
     matched.quantity = String(finalQuantity)
     updatedLineIds.push(matched.id)
     outcome.push({
