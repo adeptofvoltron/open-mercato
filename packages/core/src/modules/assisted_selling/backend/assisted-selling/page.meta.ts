@@ -4,7 +4,7 @@ export const metadata = {
   pageTitle: 'Selling conversations',
   pageTitleKey: 'assisted_selling.admin.inbox.pageTitle',
   pageGroup: 'Ecommerce',
-  pageGroupKey: 'assisted_selling.admin.nav.group',
+  pageGroupKey: 'cart.admin.nav.group',
   pageOrder: 20,
   icon: 'message-circle',
   breadcrumb: [{ label: 'Selling conversations', labelKey: 'assisted_selling.admin.inbox.pageTitle' }],
