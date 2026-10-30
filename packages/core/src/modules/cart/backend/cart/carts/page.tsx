@@ -37,6 +37,7 @@ type CartAdminRow = {
   channel: string
   storeId: string | null
   customerId: string | null
+  customerName: string | null
   customerUserId: string | null
   email: string | null
   currencyCode: string
@@ -84,6 +85,7 @@ function mapApiCart(item: Record<string, unknown>): CartAdminRow {
     channel: typeof item.channel === 'string' ? item.channel : 'storefront',
     storeId: readString(item, 'storeId', 'store_id'),
     customerId: readString(item, 'customerId', 'customer_id'),
+    customerName: readString(item, 'customerName', 'customer_name'),
     customerUserId: readString(item, 'customerUserId', 'customer_user_id'),
     email: readString(item, 'email', 'email'),
     currencyCode: readString(item, 'currencyCode', 'currency_code') ?? '',
@@ -261,9 +263,9 @@ export default function CartAdminListPage() {
         meta: { priority: 2 },
         cell: ({ row }) => (
           <div className="flex flex-col">
-            <span className="truncate text-sm text-foreground">{row.original.email ?? '—'}</span>
-            {row.original.customerId ? (
-              <span className="truncate font-mono text-xs text-muted-foreground">{row.original.customerId}</span>
+            <span className="truncate text-sm text-foreground">{row.original.customerName ?? row.original.email ?? '—'}</span>
+            {row.original.customerName && row.original.email ? (
+              <span className="truncate text-xs text-muted-foreground">{row.original.email}</span>
             ) : null}
           </div>
         ),

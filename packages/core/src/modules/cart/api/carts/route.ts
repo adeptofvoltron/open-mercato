@@ -6,6 +6,7 @@ import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import { E } from '#generated/entities.ids.generated'
 import { Cart, CartLine } from '../../data/entities'
 import { cartAdminListQuerySchema, type CartAdminListQuery } from '../../data/validators'
+import { CustomerEntity } from '@open-mercato/core/modules/customers/data/entities'
 
 export { cartAdminListQuerySchema }
 
@@ -119,6 +120,28 @@ export const cartAdminListCrud = makeCrudRoute<never, never, CartAdminListQuery>
         const cartId = typeof item.id === 'string' ? item.id : null
         item.lineCount = cartId ? countByCartId.get(cartId) ?? 0 : 0
       }
+
+      // FK-id + fetch-separately (never a direct ORM relation, AGENTS.md § Architecture) —
+      // batched the same way as `lineCount` above, resolving the raw `customer_id` the list
+      // otherwise shows verbatim into the display name admins actually need.
+      const tenantId = ctx.auth?.tenantId ?? null
+      const organizationId = ctx.selectedOrganizationId ?? ctx.auth?.orgId ?? null
+      if (!tenantId) return
+      const readCustomerId = (item: Record<string, unknown>): string | null =>
+        typeof item.customerId === 'string' ? item.customerId : (typeof item.customer_id === 'string' ? item.customer_id : null)
+      const customerIds = items.map(readCustomerId).filter((id): id is string => !!id)
+      if (!customerIds.length) return
+      const customers = await em.find(CustomerEntity, {
+        id: { $in: customerIds },
+        tenantId,
+        ...(organizationId ? { organizationId } : {}),
+        deletedAt: null,
+      }, { fields: ['id', 'displayName'] as const })
+      const nameByCustomerId = new Map(customers.map((customer) => [customer.id, customer.displayName]))
+      for (const item of items) {
+        const customerId = readCustomerId(item)
+        item.customerName = customerId ? nameByCustomerId.get(customerId) ?? null : null
+      }
     },
   },
 })
@@ -143,6 +166,7 @@ const cartAdminListRowSchema = z.object({
   expires_at: z.string(),
   updated_at: z.string(),
   lineCount: z.number().optional(),
+  customerName: z.string().nullable().optional(),
 })
 
 export const openApi: OpenApiRouteDoc = {

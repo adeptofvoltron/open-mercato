@@ -14,6 +14,7 @@ import { getTelemetryRuntime } from '@open-mercato/shared/lib/telemetry/runtime'
 import { Cart, CartMergeLog } from '../../../data/entities'
 import { buildCartResponseEnvelope } from '../../../lib/cartView'
 import { organizationIdsFromCartScope, tryResolveCustomerPurchaseApprovalService } from '../../../lib/adminCartScope'
+import { CustomerEntity } from '@open-mercato/core/modules/customers/data/entities'
 
 // Step 2.10 (K6, §10.2 rev 10) — `GET /api/cart/carts/:id`. Read-only: no `PATCH`/`PUT`/
 // `DELETE` export at all (the route-enumeration test asserts this). Reuses
@@ -95,6 +96,12 @@ export async function GET(req: Request, context: RouteContext) {
       proposalCartId: log.proposalCartId ?? null,
     }))
 
+    // FK-id + fetch-separately (never a direct ORM relation, AGENTS.md § Architecture) —
+    // the admin detail otherwise shows the raw `customer_id` verbatim.
+    const customer = cart.customerId
+      ? await em.findOne(CustomerEntity, { id: cart.customerId, tenantId: cart.tenantId, deletedAt: null }, { fields: ['id', 'displayName'] as const })
+      : null
+
     return NextResponse.json({
       cart: {
         ...envelope.cart,
@@ -103,6 +110,7 @@ export async function GET(req: Request, context: RouteContext) {
         channel: cart.channel,
         storeId: cart.storeId ?? null,
         customerId: cart.customerId ?? null,
+        customerName: customer?.displayName ?? null,
         customerUserId: cart.customerUserId ?? null,
         email: cart.email ?? null,
         note: cart.note ?? null,

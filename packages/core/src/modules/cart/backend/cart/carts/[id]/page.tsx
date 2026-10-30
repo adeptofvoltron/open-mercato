@@ -73,6 +73,7 @@ type CartAdminDetail = {
   locale: string
   storeId: string | null
   customerId: string | null
+  customerName: string | null
   customerUserId: string | null
   email: string | null
   note: string | null
@@ -254,7 +255,7 @@ export default function CartAdminDetailPage({ params }: { params?: { id?: string
           </div>
           <div>
             <p className="text-xs text-muted-foreground">{labels.fields.customer}</p>
-            <p className="truncate font-mono text-sm text-foreground">{cart.customerId ?? '—'}</p>
+            <p className="truncate text-sm text-foreground">{cart.customerName ?? cart.customerId ?? '—'}</p>
           </div>
           <div>
             <p className="text-xs text-muted-foreground">{labels.fields.email}</p>

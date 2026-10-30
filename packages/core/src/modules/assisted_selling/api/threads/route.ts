@@ -15,6 +15,8 @@ import { AssistedSellingThread } from '../../data/entities'
 import { assistedSellingThreadOpenRequestSchema } from '../../data/validators'
 import { organizationIdsFromAssistedSellingScope } from '../../lib/organizationScope'
 import { openThreadCommand, type AssistedSellingThreadOpenInput, type AssistedSellingThreadOpenResult } from '../../commands/threads'
+import { CustomerEntity } from '@open-mercato/core/modules/customers/data/entities'
+import { User } from '@open-mercato/core/modules/auth/data/entities'
 
 const logger = createLogger('assisted_selling').child({ component: 'api' })
 
@@ -83,6 +85,22 @@ export async function GET(req: Request) {
       offset: (page - 1) * pageSize,
     })
 
+    // FK-id + fetch-separately (never a direct ORM relation, AGENTS.md § Architecture) —
+    // batched across the page rather than N+1, resolving the raw ids the list would
+    // otherwise show verbatim into the buyer/rep display names staff actually need.
+    const customerIds = Array.from(new Set(rows.map((thread) => thread.customerId).filter((id): id is string => !!id)))
+    const assignedActorIds = Array.from(new Set(rows.map((thread) => thread.assignedActorId).filter((id): id is string => !!id)))
+    const [customers, assignees] = await Promise.all([
+      customerIds.length
+        ? em.find(CustomerEntity, { id: { $in: customerIds }, tenantId, deletedAt: null }, { fields: ['id', 'displayName'] as const })
+        : Promise.resolve([]),
+      assignedActorIds.length
+        ? em.find(User, { id: { $in: assignedActorIds } }, { fields: ['id', 'name', 'email'] as const })
+        : Promise.resolve([]),
+    ])
+    const customerNameById = new Map(customers.map((customer) => [customer.id, customer.displayName]))
+    const assigneeNameById = new Map(assignees.map((user) => [user.id, user.name ?? user.email]))
+
     return NextResponse.json({
       items: rows.map((thread) => ({
         id: thread.id,
@@ -90,10 +108,12 @@ export async function GET(req: Request) {
         storeId: thread.storeId,
         buyerCartId: thread.buyerCartId,
         customerId: thread.customerId ?? null,
+        customerName: thread.customerId ? customerNameById.get(thread.customerId) ?? null : null,
         customerUserId: thread.customerUserId ?? null,
         status: thread.status,
         modeSnapshot: thread.modeSnapshot,
         assignedActorId: thread.assignedActorId ?? null,
+        assignedActorName: thread.assignedActorId ? assigneeNameById.get(thread.assignedActorId) ?? null : null,
         liveProposalCount: thread.liveProposalCount,
         lastActivityAt: thread.lastActivityAt.toISOString(),
         closedAt: thread.closedAt ? thread.closedAt.toISOString() : null,
@@ -162,10 +182,12 @@ const threadRowSchema = z.object({
   storeId: z.string().uuid(),
   buyerCartId: z.string().uuid(),
   customerId: z.string().uuid().nullable(),
+  customerName: z.string().nullable().optional(),
   customerUserId: z.string().uuid().nullable(),
   status: z.enum(['open', 'closed']),
   modeSnapshot: z.string(),
   assignedActorId: z.string().uuid().nullable(),
+  assignedActorName: z.string().nullable().optional(),
   liveProposalCount: z.number(),
   lastActivityAt: z.string(),
   closedAt: z.string().nullable(),

@@ -35,9 +35,11 @@ type ThreadRow = {
   storeId: string
   buyerCartId: string
   customerId: string | null
+  customerName: string | null
   customerUserId: string | null
   status: string
   assignedActorId: string | null
+  assignedActorName: string | null
   liveProposalCount: number
   lastActivityAt: string | null
   updatedAt: string | null
@@ -56,9 +58,11 @@ function mapApiThread(item: Record<string, unknown>): ThreadRow {
     storeId: readString(item, 'storeId') ?? '',
     buyerCartId: readString(item, 'buyerCartId') ?? '',
     customerId: readString(item, 'customerId'),
+    customerName: readString(item, 'customerName'),
     customerUserId: readString(item, 'customerUserId'),
     status: typeof item.status === 'string' ? item.status : 'open',
     assignedActorId: readString(item, 'assignedActorId'),
+    assignedActorName: readString(item, 'assignedActorName'),
     liveProposalCount: typeof item.liveProposalCount === 'number' ? item.liveProposalCount : 0,
     lastActivityAt: readString(item, 'lastActivityAt'),
     updatedAt: readString(item, 'updatedAt'),
@@ -241,8 +245,8 @@ export default function AssistedSellingInboxPage() {
         enableSorting: false,
         meta: { priority: 1 },
         cell: ({ row }) => (
-          <span className="truncate font-mono text-xs text-muted-foreground">
-            {row.original.customerId ?? row.original.customerUserId ?? t('assisted_selling.admin.inbox.buyer.guest', 'Guest')}
+          <span className="truncate text-sm text-foreground">
+            {row.original.customerName ?? row.original.customerId ?? row.original.customerUserId ?? t('assisted_selling.admin.inbox.buyer.guest', 'Guest')}
           </span>
         ),
       },
@@ -253,8 +257,8 @@ export default function AssistedSellingInboxPage() {
         enableSorting: false,
         meta: { priority: 3 },
         cell: ({ row }) => (
-          <span className="truncate font-mono text-xs text-muted-foreground">
-            {row.original.assignedActorId ?? labels.assignees.unassigned}
+          <span className="truncate text-sm text-foreground">
+            {row.original.assignedActorName ?? row.original.assignedActorId ?? labels.assignees.unassigned}
           </span>
         ),
       },
