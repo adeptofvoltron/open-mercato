@@ -9,6 +9,7 @@ type FakeCartRow = Record<string, unknown>
 
 let seededCart: FakeCartRow | null = null
 let seededMergeLogs: FakeCartRow[] = []
+let seededCustomer: FakeCartRow | null = null
 
 function makeCartRow(overrides: FakeCartRow = {}): FakeCartRow {
   return {
@@ -30,7 +31,14 @@ function makeCartRow(overrides: FakeCartRow = {}): FakeCartRow {
   }
 }
 
-const mockFindOneWithDecryption = jest.fn(async (_em: unknown, _entity: unknown, where: Record<string, unknown>) => {
+const mockFindOneWithDecryption = jest.fn(async (_em: unknown, entity: unknown, where: Record<string, unknown>) => {
+  if (entity === CustomerEntity) {
+    if (!seededCustomer) return null
+    if (where.id !== seededCustomer.id) return null
+    if (where.tenantId !== seededCustomer.tenantId) return null
+    if (where.organizationId !== seededCustomer.organizationId) return null
+    return seededCustomer
+  }
   if (!seededCart) return null
   if (where.id !== seededCart.id) return null
   if (where.tenantId !== seededCart.tenantId) return null
@@ -96,6 +104,7 @@ jest.mock('../../../../lib/adminCartScope', () => {
 })
 
 import { GET } from '../route'
+import { CustomerEntity } from '@open-mercato/core/modules/customers/data/entities'
 
 // Step 2.10 (K6/§10.2) — `GET /api/cart/carts/:id`. Exercises tenant/org isolation, the
 // 404-on-unknown-cart posture, and BOTH `customer_groups` approval branches (present vs.
@@ -105,6 +114,7 @@ describe('admin cart detail route', () => {
     jest.clearAllMocks()
     seededCart = makeCartRow()
     seededMergeLogs = []
+    seededCustomer = null
     mockAuth = { sub: 'staff-1', tenantId: TENANT_ID, orgId: ORG_ID }
     mockOrgScope = { selectedId: ORG_ID, filterIds: [ORG_ID], allowedIds: [ORG_ID] }
     mockApprovalService = null
@@ -192,6 +202,26 @@ describe('admin cart detail route', () => {
     const body = await response.json()
     expect(body.approval).toBeNull()
     expect(mockApprovalService.getApproval).not.toHaveBeenCalled()
+  })
+
+  // Regression (bug 16, round-4 QA): customerName was resolved with a plain `em.findOne`
+  // against `CustomerEntity.displayName`, an encrypted column, so admins saw ciphertext;
+  // the lookup also had no organizationId filter at all. Must go through
+  // `findOneWithDecryption`, scoped to the cart's own organization.
+  it('resolves the decrypted customerName, scoped to the cart\'s own organization', async () => {
+    seededCart = makeCartRow({ customerId: 'customer-1' })
+    seededCustomer = { id: 'customer-1', tenantId: TENANT_ID, organizationId: ORG_ID, displayName: 'Alice Buyer' }
+    const response = await callGet()
+    const body = await response.json()
+    expect(body.cart.customerName).toBe('Alice Buyer')
+  })
+
+  it('does not resolve a customer from a different organization', async () => {
+    seededCart = makeCartRow({ customerId: 'customer-1' })
+    seededCustomer = { id: 'customer-1', tenantId: TENANT_ID, organizationId: OTHER_ORG_ID, displayName: 'Someone Else' }
+    const response = await callGet()
+    const body = await response.json()
+    expect(body.cart.customerName).toBeNull()
   })
 
   it('maps CartMergeLog rows into the response', async () => {

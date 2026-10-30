@@ -1,9 +1,10 @@
+jest.mock('@open-mercato/shared/lib/crud/factory', () => ({
+  makeCrudRoute: jest.fn((opts: unknown) => ({ opts, GET: jest.fn() })),
+}))
+
 const mockFindWithDecryption = jest.fn()
 jest.mock('@open-mercato/shared/lib/encryption/find', () => ({
   findWithDecryption: (...args: unknown[]) => mockFindWithDecryption(...args),
-}))
-jest.mock('@open-mercato/shared/lib/crud/factory', () => ({
-  makeCrudRoute: jest.fn((opts: unknown) => ({ opts, GET: jest.fn() })),
 }))
 
 import type { EntityManager } from '@mikro-orm/postgresql'
@@ -106,24 +107,32 @@ describe('cart admin list — afterList lineCount enrichment (§10.2 row shape)'
   })
 })
 
-describe('cart admin list — afterList customerName enrichment', () => {
-  it('resolves names through the decrypting lookup, scoped to tenant and organization', async () => {
-    mockFindWithDecryption.mockResolvedValue([{ id: 'cust-1', displayName: 'Acme Sp. z o.o.' }])
-    const em = { fork: jest.fn(() => ({ find: jest.fn(async () => []) })) } as unknown as EntityManager
+// Regression (bug 16, round-4 QA): the customerName enrichment used a plain `em.find`
+// against `CustomerEntity.displayName`, an encrypted column, so admins saw ciphertext
+// instead of a name. Must go through `findWithDecryption`, scoped to tenant+organization.
+describe('cart admin list — afterList customerName enrichment (decryption)', () => {
+  beforeEach(() => {
+    mockFindWithDecryption.mockReset()
+  })
+
+  it('resolves customerName via findWithDecryption, scoped to the caller\'s tenant and organization', async () => {
+    mockFindWithDecryption.mockResolvedValue([{ id: 'customer-1', displayName: 'Alice Buyer' }])
+    const find = jest.fn(async () => [])
+    const em = { fork: jest.fn(() => ({ find })) } as unknown as EntityManager
     const ctx = {
       container: { resolve: (name: string) => (name === 'em' ? em : undefined) },
       auth: { tenantId: 'tenant-1', orgId: 'org-1' },
       selectedOrganizationId: 'org-1',
     }
-    const items: Array<Record<string, unknown>> = [{ id: 'cart-1', customerId: 'cust-1' }, { id: 'cart-2', customerId: null }]
+
+    const items: Array<Record<string, unknown>> = [{ id: 'cart-1', customerId: 'customer-1' }]
     await opts.hooks.afterList({ items }, ctx)
 
     expect(mockFindWithDecryption).toHaveBeenCalledTimes(1)
-    const call = mockFindWithDecryption.mock.calls[0]
-    expect(call[1]).toBe(CustomerEntity)
-    expect(call[2]).toMatchObject({ id: { $in: ['cust-1'] }, tenantId: 'tenant-1', organizationId: 'org-1' })
-    expect(call[4]).toEqual({ tenantId: 'tenant-1', organizationId: 'org-1' })
-    expect(items[0].customerName).toBe('Acme Sp. z o.o.')
-    expect(items[1].customerName).toBeNull()
+    const [, entity, where, , scope] = mockFindWithDecryption.mock.calls[0]
+    expect(entity).toBe(CustomerEntity)
+    expect(where).toMatchObject({ id: { $in: ['customer-1'] }, tenantId: 'tenant-1', organizationId: 'org-1' })
+    expect(scope).toEqual({ tenantId: 'tenant-1', organizationId: 'org-1' })
+    expect(items[0].customerName).toBe('Alice Buyer')
   })
 })

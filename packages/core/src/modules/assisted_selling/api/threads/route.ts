@@ -8,7 +8,6 @@ import { resolveOrganizationScopeForRequest } from '@open-mercato/core/modules/d
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
 import { CrudHttpError, isCrudHttpError, translateCrudErrorBody } from '@open-mercato/shared/lib/crud/errors'
 import { getCommandInterceptorHttpRejection } from '@open-mercato/shared/lib/commands/errors'
-import { findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 import { readJsonSafe } from '@open-mercato/shared/lib/http/readJsonSafe'
 import { createLogger } from '@open-mercato/shared/lib/logger'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
@@ -18,6 +17,7 @@ import { organizationIdsFromAssistedSellingScope } from '../../lib/organizationS
 import { openThreadCommand, type AssistedSellingThreadOpenInput, type AssistedSellingThreadOpenResult } from '../../commands/threads'
 import { CustomerEntity } from '@open-mercato/core/modules/customers/data/entities'
 import { User } from '@open-mercato/core/modules/auth/data/entities'
+import { findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 
 const logger = createLogger('assisted_selling').child({ component: 'api' })
 
@@ -89,20 +89,29 @@ export async function GET(req: Request) {
     // FK-id + fetch-separately (never a direct ORM relation, AGENTS.md § Architecture) —
     // batched across the page rather than N+1, resolving the raw ids the list would
     // otherwise show verbatim into the buyer/rep display names staff actually need.
+    // `displayName` (customers:customer_entity) and `name`/`email` (auth:user) are both
+    // encrypted, so both lookups MUST go through findWithDecryption.
     const customerIds = Array.from(new Set(rows.map((thread) => thread.customerId).filter((id): id is string => !!id)))
     const assignedActorIds = Array.from(new Set(rows.map((thread) => thread.assignedActorId).filter((id): id is string => !!id)))
+    const decryptionFallbackOrgId = Array.isArray(organizationIds) && organizationIds.length === 1 ? organizationIds[0] : null
     const [customers, assignees] = await Promise.all([
       customerIds.length
         ? findWithDecryption(
             em,
             CustomerEntity,
-            { id: { $in: customerIds }, tenantId, ...(Array.isArray(organizationIds) ? { organizationId: { $in: organizationIds } } : {}), deletedAt: null },
-            { fields: ['id', 'displayName'] as const },
-            { tenantId },
+            { id: { $in: customerIds }, tenantId, deletedAt: null },
+            { fields: ['id', 'displayName', 'organizationId'] as const },
+            { tenantId, organizationId: decryptionFallbackOrgId },
           )
         : Promise.resolve([]),
       assignedActorIds.length
-        ? em.find(User, { id: { $in: assignedActorIds } }, { fields: ['id', 'name', 'email'] as const })
+        ? findWithDecryption(
+            em,
+            User,
+            { id: { $in: assignedActorIds } },
+            { fields: ['id', 'name', 'email', 'organizationId'] as const },
+            { tenantId, organizationId: decryptionFallbackOrgId },
+          )
         : Promise.resolve([]),
     ])
     const customerNameById = new Map(customers.map((customer) => [customer.id, customer.displayName]))

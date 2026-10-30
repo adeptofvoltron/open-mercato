@@ -97,15 +97,17 @@ export async function GET(req: Request, context: RouteContext) {
     }))
 
     // FK-id + fetch-separately (never a direct ORM relation, AGENTS.md § Architecture) —
-    // the admin detail otherwise shows the raw `customer_id` verbatim.
+    // the admin detail otherwise shows the raw `customer_id` verbatim. `displayName` is
+    // encrypted (customers:customer_entity), so this MUST go through findOneWithDecryption
+    // and stay scoped to the cart's own organization, not just its tenant.
     const customer = cart.customerId
       ? await findOneWithDecryption(
-        em,
-        CustomerEntity,
-        { id: cart.customerId, tenantId: cart.tenantId, organizationId: cart.organizationId, deletedAt: null },
-        { fields: ['id', 'displayName'] as const },
-        { tenantId: cart.tenantId, organizationId: cart.organizationId },
-      )
+          em,
+          CustomerEntity,
+          { id: cart.customerId, tenantId: cart.tenantId, organizationId: cart.organizationId, deletedAt: null },
+          { fields: ['id', 'displayName', 'organizationId'] as const },
+          { tenantId: cart.tenantId, organizationId: cart.organizationId },
+        )
       : null
 
     return NextResponse.json({
