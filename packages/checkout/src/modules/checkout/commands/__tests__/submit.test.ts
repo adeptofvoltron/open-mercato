@@ -464,6 +464,30 @@ describe('checkout.session.submit (B.4, steps 1-5 of §7.2/C19)', () => {
     expect(result.creditReservationKey).toBe('checkout:session-submit-1:1:credit')
   })
 
+  it('1c. full happy path (on_account method): a gross total that is not a whole number of cents does not false-positive 409 totals_mismatch', async () => {
+    // Round-3 QA repro (bug 13): gross-inclusive VAT pricing commonly leaves
+    // `grand_total_gross_amount` with more than 2 decimals (here 119.9988, from a
+    // `numeric(16,4)` column) — comparing the reservation's own rounded `125.00`-style
+    // amount against this UNROUNDED total with a 0.0005 epsilon always failed. Delivery is
+    // zeroed out here so the only source of sub-cent precision is the goods total itself.
+    const nonRoundTotals = { ...SNAPSHOT_TOTALS, grandTotalGrossAmount: '119.9988' }
+    const h = buildHarness({
+      session: makeSession({
+        shippingMethod: { deliveryMethodCode: 'acme:standard', price: '0.00', currencyCode: 'USD' },
+        quotedTotals: { deliveryMethodCode: 'acme:standard', deliveryCost: '0.00', deliveryDiscount: null, currencyCode: 'USD' },
+      }),
+      snapshot: makeSnapshot({ totals: nonRoundTotals }),
+      goodsCalcTotals: nonRoundTotals,
+    })
+
+    const result = await getHandler().execute({ ...BASE_INPUT, paymentMethodCode: 'on_account' }, h.ctx)
+
+    expect(h.customerCreditService?.reserveCredit).toHaveBeenCalledWith(expect.objectContaining({
+      amount: '120.00',
+    }))
+    expect(result.salesOrderId).toBeTruthy()
+  })
+
   it('2. idempotent document creation: reuses an existing quote/order found by external_reference, never duplicating sales.quotes.create', async () => {
     const h = buildHarness({
       session: makeSession({ submitAttempt: 0 }),
@@ -968,8 +992,10 @@ describe('approval resume -> resubmit (Step 5.2, C11/§8.2)', () => {
       body: expect.objectContaining({ code: 'cart_requires_approval' }),
     })
     expect(h.cartService.lock).toHaveBeenCalledWith(expect.objectContaining({ cartId: CART_ID, checkoutSessionId: SESSION_ID, purpose: 'order' }))
-    // The session is left `submitting` on this failure path (same as every other
-    // lock-time refusal) — not silently reverted, matching `compensate`'s own documented
-    // "leaked reservation... needs a human" posture for anything past the CAS.
+    // Nothing was reserved yet at this failure point (`cart.lock` is step 1, before
+    // availability/credit reservation) — `compensate`'s no-op release flags leave
+    // `failures` empty, so the session reverts to `open` immediately, same as any other
+    // lock-time refusal that attempts no release (price_changed, delivery changes).
+    expect(h.seededSessions[0].status).toBe('open')
   })
 })

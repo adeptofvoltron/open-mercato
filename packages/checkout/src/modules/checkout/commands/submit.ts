@@ -249,11 +249,19 @@ export async function compensate(
     return
   }
 
+  const revertedAt = new Date()
   await em.nativeUpdate(
     CheckoutSession,
     { id: session.id, tenantId: scope.tenantId, organizationId: scope.organizationId, status: 'submitting' },
-    { status: 'open', updatedAt: new Date() },
+    { status: 'open', updatedAt: revertedAt },
   )
+  // `nativeUpdate` bypasses the unit of work, so without this the `session` entity this
+  // function was handed stays dirty with its caller's in-memory `status: 'submitting'` —
+  // a later `em.flush()` anywhere in this em's lifetime (this function's own em is reused
+  // for the session-event write right below) would re-persist that stale value and silently
+  // undo the revert this call just made.
+  session.status = 'open'
+  session.updatedAt = revertedAt
   await writeSessionEvent(em, {
     tenantId: scope.tenantId,
     organizationId: scope.organizationId,
@@ -705,7 +713,13 @@ const submitSessionCommand: CommandHandler<CheckoutSessionSubmitCommandInput, Ch
       context: { tenantId: scope.tenantId, organizationId: scope.organizationId, currencyCode: session.currencyCode, metadata: { source: 'checkout', sessionId: session.id } },
     })
     const mismatchKey = findGoodsTotalsMismatch(snapshot.totals, goodsCalc.totals as unknown as Record<string, unknown>)
-    const payableMismatch = isOnAccount && !amountsEqual(toNumber(payableAmount), toNumber(goodsCalc.totals.grandTotalGrossAmount) + toNumber(freshDeliveryCost) - deliveryDiscountGrossAbs)
+    // `payableAmount` was already rounded to the reservation's own 2dp currency scale above
+    // (`roundTo2dp`), so the recomputed side must be rounded the same way before comparing —
+    // comparing a rounded cent amount against an unrounded `numeric(16,4)` total with a
+    // sub-cent epsilon fails on any gross total that isn't already a whole number of cents
+    // (common with gross-inclusive VAT pricing).
+    const payableFromGoodsCalc = roundTo2dp(toNumber(goodsCalc.totals.grandTotalGrossAmount) + toNumber(freshDeliveryCost) - deliveryDiscountGrossAbs)
+    const payableMismatch = isOnAccount && payableAmount !== payableFromGoodsCalc
     if (mismatchKey || payableMismatch) {
       logger.error('[internal] checkout submit: totals mismatch at document creation, raising an ops notification', {
         sessionId: session.id,
